@@ -1,10 +1,10 @@
-import { describe, it } from "node:test";
+import { describe, it } from "vitest";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmdirSync, unlinkSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtempSync } from "node:fs";
+import { fixtureTempRoot, trashFixture } from "./fixture/lifecycle.mjs";
 import { join } from "node:path";
 import { DatabaseSync as Database } from "node:sqlite";
-import { FlightyDatabase } from "../services/database.js";
+import { FlightyDatabase } from "../src/services/database.js";
 
 function createJwt(subject: string): string {
   const payload = Buffer.from(JSON.stringify({ sub: subject })).toString(
@@ -16,7 +16,7 @@ function createJwt(subject: string): string {
 function withDatabases(
   callback: (mainPath: string, legacyPath: string, db: Database) => void
 ): void {
-  const directory = mkdtempSync(join(tmpdir(), "flighty-database-test-"));
+  const directory = mkdtempSync(join(fixtureTempRoot(), "flighty-database-test-"));
   const mainPath = join(directory, "MainFlightyDatabase.db");
   const legacyPath = join(directory, "Flighty.sqlite");
   const db = new Database(mainPath);
@@ -36,9 +36,7 @@ function withDatabases(
     callback(mainPath, legacyPath, db);
   } finally {
     db.close();
-    unlinkSync(mainPath);
-    unlinkSync(legacyPath);
-    rmdirSync(directory);
+    trashFixture(directory);
   }
 }
 

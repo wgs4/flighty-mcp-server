@@ -1,10 +1,10 @@
-import { describe, it, mock } from "node:test";
+import { describe, it, vi } from "vitest";
 import assert from "node:assert/strict";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { registerWriteTools } from "../tools/write.js";
-import { parseFlightCode } from "../services/flighty-api.js";
-import type { FlightyDatabase } from "../services/database.js";
-import type { FlightyApi } from "../services/flighty-api.js";
+import { registerWriteTools } from "../src/tools/write.js";
+import { parseFlightCode } from "../src/services/flighty-api.js";
+import type { FlightyDatabase } from "../src/services/database.js";
+import type { FlightyApi } from "../src/services/flighty-api.js";
 
 type ToolResult = {
   content: Array<{ type: string; text: string }>;
@@ -79,7 +79,7 @@ describe("flighty_follow_flight", () => {
         iata: "UA",
       }],
     };
-    const followFlight = mock.fn(async () => {});
+    const followFlight = vi.fn(async () => {});
     const mockApi = {
       searchFlight: async () => "flight-server-uuid",
       followFlight,
@@ -96,7 +96,7 @@ describe("flighty_follow_flight", () => {
     assert.equal(body.airline, "United Airlines");
     assert.equal(body.flight_code, "UA194");
     assert.equal(followFlight.mock.calls.length, 1);
-    assert.equal(followFlight.mock.calls[0].arguments[0], "flight-server-uuid");
+    assert.equal(followFlight.mock.calls[0][0], "flight-server-uuid");
   });
 
   it("returns error when flight not found", async () => {
@@ -107,7 +107,7 @@ describe("flighty_follow_flight", () => {
         iata: "UA",
       }],
     };
-    const followFlight = mock.fn(async () => {});
+    const followFlight = vi.fn(async () => {});
     const mockApi = {
       searchFlight: async () => null,
       followFlight,
@@ -123,8 +123,8 @@ describe("flighty_follow_flight", () => {
   });
 
   it("returns error on invalid flight code", async () => {
-    const mockDb = { lookupAirlines: mock.fn() };
-    const mockApi = { searchFlight: mock.fn(), followFlight: mock.fn() };
+    const mockDb = { lookupAirlines: vi.fn() };
+    const mockApi = { searchFlight: vi.fn(), followFlight: vi.fn() };
 
     const tools = captureTools(mockDb, mockApi);
     const handler = tools.get("flighty_follow_flight")!;
@@ -164,10 +164,10 @@ describe("flighty_follow_flight", () => {
         { id: "second-airline", name: "Second Airline", iata: "ZZ" },
       ],
     };
-    const searchFlight = mock.fn(async (airlineId: string) =>
+    const searchFlight = vi.fn(async (airlineId: string) =>
       airlineId === "second-airline" ? "flight-server-uuid" : null
     );
-    const followFlight = mock.fn(async () => {});
+    const followFlight = vi.fn(async () => {});
 
     const tools = captureTools(mockDb, { searchFlight, followFlight });
     const result = await tools.get("flighty_follow_flight")!({
@@ -177,8 +177,8 @@ describe("flighty_follow_flight", () => {
 
     assert.equal(result.isError, undefined);
     assert.equal(searchFlight.mock.calls.length, 2);
-    assert.equal(searchFlight.mock.calls[0].arguments[0], "first-airline");
-    assert.equal(searchFlight.mock.calls[1].arguments[0], "second-airline");
+    assert.equal(searchFlight.mock.calls[0][0], "first-airline");
+    assert.equal(searchFlight.mock.calls[1][0], "second-airline");
     assert.equal(followFlight.mock.calls.length, 1);
     assert.equal(JSON.parse(result.content[0].text).airline, "Second Airline");
   });
@@ -193,7 +193,7 @@ describe("flighty_add_flight", () => {
         iata: "DL",
       }],
     };
-    const subscribeFlight = mock.fn(async () => {});
+    const subscribeFlight = vi.fn(async () => {});
     const mockApi = {
       searchFlight: async () => "flight-uuid-123",
       subscribeFlight,
@@ -210,7 +210,7 @@ describe("flighty_add_flight", () => {
     assert.equal(body.airline, "Delta Air Lines");
     assert.equal(subscribeFlight.mock.calls.length, 1);
     assert.equal(
-      subscribeFlight.mock.calls[0].arguments[0],
+      subscribeFlight.mock.calls[0][0],
       "flight-uuid-123"
     );
   });
@@ -223,7 +223,7 @@ describe("flighty_add_flight", () => {
         iata: "DL",
       }],
     };
-    const subscribeFlight = mock.fn(async () => {});
+    const subscribeFlight = vi.fn(async () => {});
     const mockApi = {
       searchFlight: async () => null,
       subscribeFlight,
@@ -245,10 +245,10 @@ describe("flighty_add_flight", () => {
         { id: "second-airline", name: "Second Airline", iata: "ZZ" },
       ],
     };
-    const searchFlight = mock.fn(async (airlineId: string) =>
+    const searchFlight = vi.fn(async (airlineId: string) =>
       airlineId === "second-airline" ? "flight-uuid-123" : null
     );
-    const subscribeFlight = mock.fn(async () => {});
+    const subscribeFlight = vi.fn(async () => {});
 
     const tools = captureTools(mockDb, { searchFlight, subscribeFlight });
     const result = await tools.get("flighty_add_flight")!({
@@ -258,8 +258,8 @@ describe("flighty_add_flight", () => {
 
     assert.equal(result.isError, undefined);
     assert.equal(searchFlight.mock.calls.length, 2);
-    assert.equal(searchFlight.mock.calls[0].arguments[0], "first-airline");
-    assert.equal(searchFlight.mock.calls[1].arguments[0], "second-airline");
+    assert.equal(searchFlight.mock.calls[0][0], "first-airline");
+    assert.equal(searchFlight.mock.calls[1][0], "second-airline");
     assert.equal(subscribeFlight.mock.calls.length, 1);
     assert.equal(JSON.parse(result.content[0].text).airline, "Second Airline");
   });

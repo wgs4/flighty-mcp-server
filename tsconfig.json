@@ -13,8 +13,9 @@
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
-    "allowSyntheticDefaultImports": true
+    "allowSyntheticDefaultImports": true,
+    "noEmitOnError": true
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "build", "src/__tests__"]
+  "exclude": ["node_modules", "build"]
 }
