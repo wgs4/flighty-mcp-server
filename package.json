@@ -7,9 +7,14 @@
   "scripts": {
     "start": "node build/index.js",
     "dev": "tsx watch src/index.ts",
-    "build": "tsc",
-    "test": "node --import tsx/esm --test src/__tests__/*.test.ts",
-    "clean": "rm -rf build"
+    "build": "node scripts/build.mjs",
+    "test": "node scripts/build.mjs && vitest run",
+    "clean": "node scripts/clean.mjs",
+    "test:watch": "vitest",
+    "bundle": "bash scripts/build-extension.sh",
+    "fixture": "node tests/fixture/create.mjs",
+    "verify:stdio": "node tests/verify-stdio.mjs",
+    "prepack": "node scripts/build.mjs"
   },
   "engines": {
     "node": ">=24.0.0"
@@ -21,6 +26,15 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
-  }
+    "typescript": "^5.7.2",
+    "vitest": "5.1.0"
+  },
+  "license": "MIT",
+  "files": [
+    "build/**/*.js",
+    "build/**/*.js.map",
+    "build/**/*.d.ts",
+    "build/**/*.d.ts.map",
+    "LICENSE"
+  ]
 }

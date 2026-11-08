@@ -1,13 +1,13 @@
-import { describe, it } from "node:test";
+import { describe, it } from "vitest";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmdirSync, unlinkSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtempSync } from "node:fs";
+import { fixtureTempRoot, trashFixture } from "./fixture/lifecycle.mjs";
 import { join } from "node:path";
 import { DatabaseSync as Database } from "node:sqlite";
 import {
   readFlightyAuthToken,
   readJwtSubject,
-} from "../services/auth-token.js";
+} from "../src/services/auth-token.js";
 
 function createJwt(subject: string): string {
   const payload = Buffer.from(JSON.stringify({ sub: subject })).toString(
@@ -21,7 +21,7 @@ function withTokenDatabases(
   legacyToken: string | null,
   callback: (mainPath: string, legacyPath: string) => void
 ): void {
-  const directory = mkdtempSync(join(tmpdir(), "flighty-auth-test-"));
+  const directory = mkdtempSync(join(fixtureTempRoot(), "flighty-auth-test-"));
   const mainPath = join(directory, "MainFlightyDatabase.db");
   const legacyPath = join(directory, "Flighty.sqlite");
 
@@ -42,9 +42,7 @@ function withTokenDatabases(
   try {
     callback(mainPath, legacyPath);
   } finally {
-    unlinkSync(mainPath);
-    unlinkSync(legacyPath);
-    rmdirSync(directory);
+    trashFixture(directory);
   }
 }
 

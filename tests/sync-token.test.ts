@@ -1,16 +1,16 @@
-import { describe, it } from "node:test";
+import { describe, it } from "vitest";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmdirSync, unlinkSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtempSync } from "node:fs";
+import { fixtureTempRoot, trashFixture } from "./fixture/lifecycle.mjs";
 import { join } from "node:path";
 import { DatabaseSync as Database } from "node:sqlite";
-import { readFlightySyncUrl } from "../services/sync-token.js";
+import { readFlightySyncUrl } from "../src/services/sync-token.js";
 
 function withSyncDatabase(
   rows: Array<{ nextURL: string | null; lastSync: number }>,
   callback: (dbPath: string) => void
 ): void {
-  const directory = mkdtempSync(join(tmpdir(), "flighty-sync-test-"));
+  const directory = mkdtempSync(join(fixtureTempRoot(), "flighty-sync-test-"));
   const dbPath = join(directory, "MainFlightyDatabase.db");
   const db = new Database(dbPath);
   db.exec("CREATE TABLE SyncInfo (nextURL TEXT, lastSync INTEGER)");
@@ -23,8 +23,7 @@ function withSyncDatabase(
   try {
     callback(dbPath);
   } finally {
-    unlinkSync(dbPath);
-    rmdirSync(directory);
+    trashFixture(directory);
   }
 }
 
