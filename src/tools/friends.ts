@@ -1,11 +1,20 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { FlightyDatabase } from "../services/database.js";
+import { installToolSafety } from "../services/tool-safety.js";
+import {
+  boundedQuerySchema,
+  pageLimitSchema,
+  pageOffsetSchema,
+  yearSchema,
+} from "../services/validation.js";
 
 export function registerFriendTools(
   server: McpServer,
   db: FlightyDatabase
 ): void {
+  installToolSafety(server, db);
+
   server.registerTool(
     "flighty_list_friend_flights",
     {
@@ -21,8 +30,7 @@ All timestamps are UTC. Returns the same flight schema as flighty_list_flights, 
 
 IMPORTANT: Always present results as a formatted markdown table or bulleted list — never paste the raw JSON into your response.`,
       inputSchema: {
-        friend_name: z
-          .string()
+        friend_name: boundedQuerySchema
           .optional()
           .describe(
             "Filter by friend's name (partial, case-insensitive match on full name or first name)"
@@ -31,24 +39,11 @@ IMPORTANT: Always present results as a formatted markdown table or bulleted list
           .boolean()
           .default(false)
           .describe("Only future flights (sorted soonest first)"),
-        year: z
-          .number()
-          .int()
+        year: yearSchema
           .optional()
           .describe("Filter to a specific year (e.g. 2025)"),
-        limit: z
-          .number()
-          .int()
-          .min(1)
-          .max(200)
-          .default(50)
-          .describe("Maximum results"),
-        offset: z
-          .number()
-          .int()
-          .min(0)
-          .default(0)
-          .describe("Pagination offset"),
+        limit: pageLimitSchema.describe("Maximum results"),
+        offset: pageOffsetSchema.describe("Pagination offset"),
       },
       annotations: {
         readOnlyHint: true,

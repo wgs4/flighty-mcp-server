@@ -1,6 +1,11 @@
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { DatabaseSync as Database } from "node:sqlite";
-import { MAIN_DB_PATH, PREFS_PLIST_PATH } from "../constants.js";
+import {
+  MAIN_DB_PATH,
+  PLUTIL_PATH,
+  PREFS_PLIST_PATH,
+  type PlutilExecFileSync,
+} from "../constants.js";
 
 function readSyncUrlFromDatabase(dbPath: string): string | null {
   let db: InstanceType<typeof Database> | undefined;
@@ -19,10 +24,14 @@ function readSyncUrlFromDatabase(dbPath: string): string | null {
   }
 }
 
-function readLegacySyncUrl(): string | null {
+export function readLegacySyncUrl(
+  prefsPlistPath: string = PREFS_PLIST_PATH,
+  execFileImpl: PlutilExecFileSync = execFileSync
+): string | null {
   try {
-    const raw = execSync(
-      `plutil -extract syncInfoV2 raw "${PREFS_PLIST_PATH}"`,
+    const raw = execFileImpl(
+      PLUTIL_PATH,
+      ["-extract", "syncInfoV2", "raw", prefsPlistPath],
       { encoding: "utf-8" }
     ).trim();
     const decoded = Buffer.from(raw, "base64").toString("utf-8");

@@ -1,11 +1,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
 import type { FlightyDatabase } from "../services/database.js";
+import { installToolSafety } from "../services/tool-safety.js";
+import { flightNumberSchema } from "../services/validation.js";
 
 export function registerFlightStatusTools(
   server: McpServer,
   db: FlightyDatabase
 ): void {
+  installToolSafety(server, db);
+
   server.registerTool(
     "flighty_get_flight_status",
     {
@@ -18,9 +21,9 @@ Data freshness depends on the Flighty app's last sync — this does NOT make liv
 
 Returns: flight_number, status, is_cancelled, departure/arrival airports, scheduled/estimated/actual times, delay minutes, gate info, weather, aircraft.`,
       inputSchema: {
-        flight_number: z
-          .string()
-          .describe('Flight number, e.g. "UA194", "BA930"'),
+        flight_number: flightNumberSchema.describe(
+          'Flight number, e.g. "UA194", "BA930"'
+        ),
       },
       annotations: {
         readOnlyHint: true,
@@ -61,9 +64,9 @@ Looks up the MOST RECENT instance of the flight to retrieve its stored delay for
 
 Returns: flight_number, route (e.g. "SFO -> EWR"), observations (sample size), mean_delay_minutes, and percentage breakdowns (early_pct, ontime_pct, late_15/30/45_pct, cancelled_pct, diverted_pct). Returns null if no forecast data is available.`,
       inputSchema: {
-        flight_number: z
-          .string()
-          .describe('Flight number, e.g. "UA194"'),
+        flight_number: flightNumberSchema.describe(
+          'Flight number, e.g. "UA194"'
+        ),
       },
       annotations: {
         readOnlyHint: true,
