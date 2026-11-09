@@ -15,7 +15,7 @@ export function registerFlightStatusTools(
       title: "Get Flight Status",
       description: `Get the current operational status of a flight already in the user's Flighty database, including delay information, gate assignments, weather, and aircraft details. This only works for flights the user has added to Flighty. Looks up the MOST RECENT instance of the given flight number.
 
-Status values: "scheduled", "delayed" (departure delay > 15 min), "in_air" (departed but not arrived), "landed", or "cancelled".
+Status values: "scheduled", "delayed" (scheduled with departure delay > 15 min), "taxi_out" (gate departure only), "in_air" (actual runway departure), "landed" (actual runway or gate arrival), "cancelled", or "unknown" (missing/inconsistent milestones). The added phase field distinguishes taxi_in from at_gate. Existing actual_departure/arrival fields remain gate times. Use flighty_get_tracking_status for exact UUID tracking, runway landing countdown and taxi-in timing.
 
 Data freshness depends on the Flighty app's last sync — this does NOT make live API calls. All timestamps are UTC.
 

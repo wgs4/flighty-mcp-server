@@ -14,6 +14,16 @@ export const READ_CASES = [
   }],
   ["flighty_search_flights", { airline: "ZZ", departure_airport: "AAA" }, (body) => assert.equal(body.count, 1)],
   ["flighty_get_flight_status", { flight_number: "ZZ101" }, (body) => assert.equal(body.result.departure_gate, "A1")],
+  ["flighty_get_tracking_status", { flight_id: IDS.followed }, (body) => {
+    assert.equal(body.result.flight.id, IDS.followed);
+    assert.equal(body.result.associations[0].tracking_source, "owner_followed");
+    assert.equal(body.result.associations[0].passenger_name, null);
+  }],
+  ["flighty_check_connection", { inbound_flight_id: IDS.flight, outbound_flight_id: IDS.manual }, (body) => {
+    assert.equal(body.result.layover_minutes, 120);
+    assert.equal(body.result.same_tail, null);
+    assert.equal(body.result.min_connection_time_minutes, 30);
+  }],
   ["flighty_get_delay_forecast", { flight_number: "ZZ101" }, (body) => assert.equal(body.observations, 100)],
   ["flighty_get_flight_stats", {}, (body) => assert.equal(body.total_flights, 2)],
   ["flighty_get_connections", {}, (body) => {

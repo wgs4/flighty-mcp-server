@@ -9,6 +9,7 @@ import {
   EARTH_CIRCUMFERENCE_KM,
 } from "../constants.js";
 import { readFlightyAuthToken, readJwtSubject } from "./auth-token.js";
+import { airportContinuity, deriveConnectionCheck, deriveTrackingTiming } from "./tracking.js";
 import {
   DEFAULT_PAGE_LIMIT,
   DEFAULT_REFERENCE_LIMIT,
@@ -34,6 +35,9 @@ import type {
   ListFriendFlightsParams,
   GetFlightParams,
   SearchFlightsParams,
+  TrackedFlight,
+  TrackingAssociation,
+  CachedConnectionMinimum,
 } from "../types.js";
 
 export type OwnerIdentitySource =
@@ -61,6 +65,11 @@ export interface RemovalLocalRecord {
   identity: OwnerIdentity;
 }
 
+export interface TrackingLocalRecord {
+  tracked: TrackedFlight;
+  identity: OwnerIdentity;
+}
+
 export interface PaginationParams {
   limit?: number;
   offset?: number;
@@ -83,6 +92,12 @@ export function getScopedOwnerIdentity(): OwnerIdentity | null {
 function tsToIso(ts: number | null | undefined): string | null {
   if (ts == null || ts <= 0) return null;
   return new Date(ts * 1000).toISOString();
+}
+
+function trackingTsToIso(ts: unknown): string | null {
+  if (typeof ts !== "number" || !Number.isFinite(ts) || ts <= 0) return null;
+  const date = new Date(ts * 1000);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
 }
 
 function buildFlightDict(row: Record<string, unknown>): FlightRecord {
@@ -454,7 +469,14 @@ export class FlightyDatabase {
       // Add friend_name to SELECT — null for owner's own tracked flights (isMyFlight=0)
       query = query.replace(
         "SELECT\n    f.id,",
-        "SELECT\n    CASE WHEN uf.isMyFlight = 1 THEN p.fullName END AS friend_name,\n    f.id,"
+        `SELECT
+    CASE WHEN uf.isMyFlight = 1 AND NULLIF(TRIM(p.fullName), '') IS NOT NULL THEN p.fullName END AS friend_name,
+    CASE WHEN uf.isMyFlight = 0 THEN 'owner_followed' ELSE 'cached_shared_passenger' END AS tracking_source,
+    'unverified' AS friendship_status,
+    CASE WHEN uf.isMyFlight = 1 AND NULLIF(TRIM(p.fullName), '') IS NOT NULL THEN 'profile' ELSE 'unknown' END AS passenger_name_source,
+    CASE WHEN uf.isMyFlight = 0 THEN 'followed_row_does_not_identify_passenger'
+         WHEN NULLIF(TRIM(p.fullName), '') IS NULL THEN 'profile_name_missing' END AS passenger_name_unknown_reason,
+    f.id,`
       );
 
       // Include friend's passenger flights (isMyFlight=1, userId != owner) AND
@@ -470,7 +492,7 @@ export class FlightyDatabase {
       if (params.friend_name) {
         const friendName = params.friend_name.trim();
         query +=
-          " AND (UPPER(p.fullName) LIKE UPPER(?) OR UPPER(p.firstName) LIKE UPPER(?))";
+          " AND uf.isMyFlight = 1 AND (UPPER(p.fullName) LIKE UPPER(?) OR UPPER(p.firstName) LIKE UPPER(?))";
         binds.push(`%${friendName}%`, `%${friendName}%`);
       }
 
@@ -491,6 +513,140 @@ export class FlightyDatabase {
 
       const rows = db.prepare(query).all(...binds) as Record<string, unknown>[];
       return rows.map(buildFlightDict);
+    } finally {
+      db.close();
+    }
+  }
+
+  private readTrackingFlight(db: Database, ownerId: string, flightId: string): TrackedFlight | null {
+    // Keep the existing owner/passenger and cached friend/followed membership
+    // boundary. Exact UUID predicates and owner IDs are always bound values.
+    const query = FLIGHT_BASE_QUERY
+      .replace("SELECT\n    f.id,", `SELECT
+    uf.userId AS association_user_id,
+    uf.isMyFlight AS association_is_passenger,
+    p.fullName AS association_name,
+    f.departureAirportId AS departure_airport_id,
+    f.scheduledArrivalAirportId AS arrival_airport_id,
+    (SELECT COUNT(DISTINCT a.id) FROM Airport a WHERE UPPER(TRIM(a.iata)) = UPPER(TRIM(dep.iata))) = 1 AS departure_code_unambiguous,
+    (SELECT COUNT(DISTINCT a.id) FROM Airport a WHERE UPPER(TRIM(a.iata)) = UPPER(TRIM(arr.iata))) = 1 AS arrival_code_unambiguous,
+    f.id,`)
+      .replace("JOIN Airport dep", "LEFT JOIN Airport dep")
+      .replace("JOIN Airport arr", "LEFT JOIN Airport arr")
+      .replace("JOIN Airline al", "LEFT JOIN Airline al")
+      .replace("LEFT JOIN Ticket t ON f.id = t.flightId AND uf.userId = t.userId",
+        "LEFT JOIN Ticket t ON f.id = t.flightId AND uf.userId = t.userId\nLEFT JOIN Profile p ON uf.userId = p.userId")
+      .replace("AND uf.isMyFlight = 1",
+        "AND ((uf.userId = ? AND uf.isMyFlight IN (0, 1)) OR (uf.userId != ? AND uf.isMyFlight = 1))") +
+      " AND f.id = ? COLLATE NOCASE";
+    const rows = db.prepare(query).all(ownerId, ownerId, flightId) as Record<string, unknown>[];
+    if (rows.length === 0) return null;
+
+    const associationKeys = ["seat_number", "seat_position", "cabin_class", "booking_reference", "flight_reason", "import_source"] as const;
+    const associations = new Map<string, TrackingAssociation>();
+    const operationalRows = new Map<string, Record<string, unknown>>();
+    for (const row of rows) {
+      const isOwner = row.association_user_id === ownerId;
+      const followed = isOwner && row.association_is_passenger === 0;
+      const name = !followed && typeof row.association_name === "string" && row.association_name.trim() ? row.association_name : null;
+      const association: TrackingAssociation = {
+        user_id: row.association_user_id as string,
+        tracking_source: followed ? "owner_followed" : isOwner ? "owner_passenger" : "cached_shared_passenger",
+        friendship_status: "unverified",
+        passenger_name: name,
+        passenger_name_source: name === null ? "unknown" : "profile",
+        passenger_name_unknown_reason: followed ? "followed_row_does_not_identify_passenger" : name === null ? "profile_name_missing" : null,
+        seat_number: row.seat_number as string | null,
+        seat_position: row.seat_position as string | null,
+        cabin_class: row.cabin_class as string | null,
+        booking_reference: row.booking_reference as string | null,
+        flight_reason: row.flight_reason as string | null,
+        import_source: row.import_source as string | null,
+      };
+      associations.set(JSON.stringify(association), association);
+      const operational = { ...row };
+      delete operational.association_user_id;
+      delete operational.association_is_passenger;
+      delete operational.association_name;
+      for (const key of associationKeys) delete operational[key];
+      operationalRows.set(JSON.stringify(operational), operational);
+    }
+    // A corrupt cache containing conflicting records for one UUID must not pick
+    // an arbitrary Flight/ManualFlight row.
+    if (operationalRows.size !== 1) throw new Error("Conflicting cached flight records for this UUID; tracking is ambiguous.");
+    const row = [...operationalRows.values()][0];
+    const ordered = [...associations.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, value]) => value);
+    const timestampIssues: Record<string, string> = {};
+    for (const key of TIMESTAMP_COLUMNS) {
+      if (row[key] != null && trackingTsToIso(row[key]) === null) timestampIssues[key] = "invalid_timestamp";
+    }
+    const { departure_airport_id, arrival_airport_id, departure_code_unambiguous, arrival_code_unambiguous, ...flightRow } = row;
+    for (const key of associationKeys) flightRow[key] = ordered.length === 1 ? ordered[0][key] : null;
+    for (const key of TIMESTAMP_COLUMNS) {
+      if (key in flightRow) flightRow[key] = trackingTsToIso(flightRow[key]);
+    }
+    return {
+      flight: flightRow as unknown as FlightRecord,
+      associations: ordered,
+      identity_ambiguous: ordered.length > 1,
+      attribution_notice: "Each association identifies its own cached source only. Membership and Profile names do not verify friendship. A followed owner row does not identify its passenger. With multiple associations, booking fields are supplied per association rather than choosing one traveler.",
+      departure_airport_id: departure_airport_id as string | null,
+      arrival_airport_id: arrival_airport_id as string | null,
+      departure_code_unambiguous: Boolean(departure_code_unambiguous),
+      arrival_code_unambiguous: Boolean(arrival_code_unambiguous),
+      timestamp_issues: timestampIssues,
+    };
+  }
+
+  getTrackingFlight(flightId: string): TrackingLocalRecord | null {
+    if (!isValidUuid(flightId)) throw new Error("Invalid flight_id: expected UUID format.");
+    const db = this.getDb();
+    try {
+      const identity = this.resolveOwnerIdentity(db);
+      const tracked = this.readTrackingFlight(db, identity.userId, flightId.trim());
+      return tracked ? { tracked, identity } : null;
+    } finally {
+      db.close();
+    }
+  }
+
+  private readConnectionMinimum(db: Database, inbound: TrackedFlight, outbound: TrackedFlight): CachedConnectionMinimum {
+    const rows = db.prepare(`SELECT mctMinutes, waitingAirportId FROM Connection
+      WHERE deleted IS NULL AND arrivingFlightId = ? COLLATE NOCASE AND departingFlightId = ? COLLATE NOCASE`)
+      .all(inbound.flight.id, outbound.flight.id) as Array<{ mctMinutes: unknown; waitingAirportId: unknown }>;
+    if (rows.length === 0) return { minutes: null, basis: null, reason: "no_cached_connection_for_exact_pair" };
+    const normalizeId = (id: unknown) => typeof id === "string" && id.trim() ? id.trim().toLowerCase() : null;
+    const continuity = airportContinuity(inbound, outbound);
+    const transferId = normalizeId(inbound.arrival_airport_id) ?? normalizeId(outbound.departure_airport_id);
+    const contexts = rows.map(({ waitingAirportId }) => normalizeId(waitingAirportId));
+    if (continuity.matches !== true || transferId === null || contexts.some((id) => id === null)) {
+      return { minutes: null, basis: null, reason: "unknown_cached_minimum_airport_context" };
+    }
+    if (new Set(contexts).size !== 1) return { minutes: null, basis: null, reason: "conflicting_cached_minimum_airport_contexts" };
+    if (contexts[0] !== transferId) return { minutes: null, basis: null, reason: "cached_minimum_airport_context_mismatch" };
+    // An MCT is a duration in minutes, not a date or a default threshold. A
+    // value above a full day is outside this tool's supported cache semantics.
+    const valid = rows.every(({ mctMinutes }) => typeof mctMinutes === "number" && Number.isFinite(mctMinutes) && mctMinutes >= 0 && mctMinutes <= 1440);
+    const values = new Set(rows.map(({ mctMinutes }) => mctMinutes));
+    if (!valid || values.size !== 1) return { minutes: null, basis: null, reason: "invalid_or_conflicting_cached_minimum" };
+    return { minutes: rows[0].mctMinutes as number, basis: "cached_exact_pair", reason: null };
+  }
+
+  checkConnection(inboundId: string, outboundId: string) {
+    if (!isValidUuid(inboundId) || !isValidUuid(outboundId)) throw new Error("Invalid flight IDs: expected UUID format.");
+    inboundId = inboundId.trim();
+    outboundId = outboundId.trim();
+    if (inboundId.toLowerCase() === outboundId.toLowerCase()) throw new Error("Connection requires two distinct flight UUIDs.");
+    const db = this.getDb();
+    try {
+      // Read both legs, their associations, and MCT in one SQLite snapshot.
+      db.exec("BEGIN");
+      const identity = this.resolveOwnerIdentity(db);
+      const inbound = this.readTrackingFlight(db, identity.userId, inboundId);
+      const outbound = this.readTrackingFlight(db, identity.userId, outboundId);
+      if (!inbound || !outbound) return null;
+      const minimum = this.readConnectionMinimum(db, inbound, outbound);
+      return { result: deriveConnectionCheck(inbound, outbound, minimum), identity };
     } finally {
       db.close();
     }
@@ -522,6 +678,10 @@ export class FlightyDatabase {
   }
 
   getFlight(params: GetFlightParams): FlightRecord | null {
+    return this.readFlight(params)?.flight ?? null;
+  }
+
+  private readFlight(params: GetFlightParams, forTracking = false): { flight: FlightRecord; timestampIssues: Record<string, string> } | null {
     const hasId = params.flight_id !== undefined && params.flight_id !== "";
     const hasNumber =
       params.flight_number !== undefined && params.flight_number !== "";
@@ -568,7 +728,15 @@ export class FlightyDatabase {
       const row = db.prepare(query).get(...binds) as
         | Record<string, unknown>
         | undefined;
-      return row ? buildFlightDict(row) : null;
+      if (!row) return null;
+      const timestampIssues: Record<string, string> = {};
+      if (!forTracking) return { flight: buildFlightDict(row), timestampIssues };
+      const normalized = { ...row };
+      for (const key of TIMESTAMP_COLUMNS) {
+        if (row[key] != null && trackingTsToIso(row[key]) === null) timestampIssues[key] = "invalid_timestamp";
+        if (key in normalized) normalized[key] = trackingTsToIso(row[key]);
+      }
+      return { flight: normalized as unknown as FlightRecord, timestampIssues };
     } finally {
       db.close();
     }
@@ -640,8 +808,9 @@ export class FlightyDatabase {
 
   getFlightStatus(flightNumber: string): FlightStatusRecord | null {
     assertValidFlightNumber(flightNumber);
-    const flight = this.getFlight({ flight_number: flightNumber.trim() });
-    if (!flight) return null;
+    const record = this.readFlight({ flight_number: flightNumber.trim() }, true);
+    if (!record) return null;
+    const { flight, timestampIssues } = record;
 
     let depDelayMin: number | null = null;
     let arrDelayMin: number | null = null;
@@ -661,25 +830,18 @@ export class FlightyDatabase {
       }
     }
 
-    let status: FlightStatusRecord["status"];
-    if (flight.is_cancelled) {
-      status = "cancelled";
-    } else if (
-      flight.departureScheduleGateActual &&
-      flight.arrivalScheduleGateActual
-    ) {
-      status = "landed";
-    } else if (flight.departureScheduleGateActual) {
-      status = "in_air";
-    } else if (depDelayMin != null && depDelayMin > 15) {
-      status = "delayed";
-    } else {
-      status = "scheduled";
-    }
+    const timing = deriveTrackingTiming(flight, Date.now(), timestampIssues);
+    const status: FlightStatusRecord["status"] =
+      timing.phase === "airborne" ? "in_air" :
+      timing.phase === "taxi_in" || timing.phase === "at_gate" ? "landed" :
+      timing.phase === "scheduled" && depDelayMin != null && depDelayMin > 15 ? "delayed" :
+      timing.phase;
 
     return {
       flight_number: flight.flight_number,
       status,
+      phase: timing.phase,
+      phase_reason: timing.phase_reason,
       is_cancelled: Boolean(flight.is_cancelled),
       departure_airport: flight.departure_airport_iata,
       arrival_airport: flight.arrival_airport_iata,
