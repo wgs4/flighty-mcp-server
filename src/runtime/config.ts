@@ -111,7 +111,11 @@ export function validateConfig(config: Config): void {
   const artifacts = artifactRoots(config);
   if (artifacts.some((a, i) => artifacts.some((b, j) => i !== j && (a === b || a.startsWith(b + "/")))) || privateFiles.some(p => artifacts.some(root => p === root || p.startsWith(root + "/")))) throw new ProtocolError("Artifact and authority paths must be disjoint.");
   checkStorage(config, artifacts);
-  if (config.kind === "mac" && Object.entries(config.source).some(([name, p]) => name.endsWith("Path") && typeof p === "string" && artifacts.some(root => p === root || p.startsWith(root + "/")))) throw new ProtocolError("Source files cannot live in retireable artifact storage.");
+  const authorityFiles = [...privateFiles, ...(config.retirementCommand ? [config.retirementCommand] : []),
+    ...(config.kind === "mac" ? [config.ssh.identityFile, config.ssh.knownHostsFile,
+      config.source.dbPath, config.source.authDbPath, config.source.prefsPlistPath, config.source.infoPlistPath, config.source.sessionPath] : [])];
+  if (authorityFiles.some(p => artifacts.some(root => p === root || p.startsWith(root + "/") || root.startsWith(p + "/"))))
+    throw new ProtocolError("Configured inputs and helper authority must be disjoint from retireable artifact storage.");
   const callers = config.kind === "linux" ? [config.caller] : config.callers;
   if (new Set(callers.map(c => c.id)).size !== callers.length || callers.some(c => c.account !== config.pins.accountId)) throw new ProtocolError();
   callersFor(config);

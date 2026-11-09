@@ -6,11 +6,11 @@ import { PrivateStore, type StoreOptions } from "../remote/store.js";
 import { verifyAttestation, verifyAudit } from "../remote/recovery.js";
 import { callersFor, type LinuxConfig } from "./config.js";
 import { verifyClientResolution, type ClientRow } from "./client-state.js";
-import { digest, ProtocolError } from "../remote/protocol.js";
+import { canonical, digest, ProtocolError } from "../remote/protocol.js";
 import { linuxStoreOptions, linuxClientStoreOptions, openLinux } from "./linux.js";
 import { macStoreOptions, sequenceStoreOptions, openMac } from "./mac.js";
 import { checkStorage, validateConfig, publicKey, type Config } from "./config.js";
-import { assertNoSymlinkChain, assertPrivatePath, measureStorage } from "../replica/cleanup.js";
+import { assertNoSymlinkChain, assertPrivatePath } from "../replica/cleanup.js";
 
 export const storeRole = z.enum(["linux-mailbox", "linux-client", "mac-executor", "mac-sequence"]);
 export type StoreRole = z.infer<typeof storeRole>;
@@ -60,25 +60,70 @@ export function archiveResolvedClient(config: LinuxConfig, input: unknown): void
     });
   } finally { store.close(); }
 }
+/** A failed batch reports completed moves without exposing configured paths. */
+export class RetirementError extends ProtocolError {
+  constructor(readonly retired: number) { super("Retirement helper or validation stopped the batch; completed moves remain recoverable. Inspect private evidence before retrying."); }
+}
+function treeSnapshot(config: Config, path: string) {
+  let bytes = 0, entries = 0, newest = 0;
+  const nodes: { relative: string; directory: boolean }[] = [];
+  const identities: unknown[] = [];
+  const visit = (target: string, relative: string) => {
+    const st = lstatSync(target);
+    if (st.isSymbolicLink() || (!st.isDirectory() && (!st.isFile() || st.nlink !== 1)) || st.dev !== config.storage.expectedDevice ||
+      (st.mode & 0o077) || (process.getuid && st.uid !== process.getuid())) throw new ProtocolError("Unsafe artifact ownership, device or type.");
+    bytes += st.isFile() ? st.size : 0; entries++;
+    if (bytes > config.budget.maxBytes || entries > config.budget.maxEntries) throw new ProtocolError("Artifact storage budget exceeded.");
+    newest = Math.max(newest, st.mtimeMs);
+    nodes.push({ relative, directory: st.isDirectory() });
+    identities.push({ relative, dev: st.dev, ino: st.ino, uid: st.uid, mode: st.mode, nlink: st.nlink, size: st.size, mtime: st.mtimeMs, ctime: st.ctimeMs });
+    if (st.isDirectory()) for (const name of readdirSync(target).sort()) visit(join(target, name), relative ? relative + "/" + name : name);
+  };
+  visit(path, ""); return { identity: canonical(identities), nodes, newest };
+}
 function retirementHelper(config: Config, trash?: (path: string) => void): (path: string) => void {
-  return trash ?? ((path: string) => {
+  return path => {
+    const before = treeSnapshot(config, path);
     const command = config.retirementCommand;
-    if (!command || !command.endsWith("/trash")) throw new ProtocolError("Explicit approved recoverable trash helper required.");
-    assertNoSymlinkChain(command, "retirement helper");
-    for (let parent = dirname(command);; parent = dirname(parent)) {
-      const entry = lstatSync(parent);
-      if (!entry.isDirectory() || (entry.uid !== 0 && (!process.getuid || entry.uid !== process.getuid())) || ((entry.mode & 0o022) && !(entry.mode & 0o1000))) throw new ProtocolError("Retirement helper ancestors permit replacement.");
-      if (dirname(parent) === parent) break;
+    if (!trash) {
+      if (!command || !command.endsWith("/trash")) throw new ProtocolError("Explicit approved recoverable trash helper required.");
+      assertNoSymlinkChain(command, "retirement helper");
+      for (let parent = dirname(command);; parent = dirname(parent)) {
+        const entry = lstatSync(parent);
+        if (!entry.isDirectory() || (entry.uid !== 0 && (!process.getuid || entry.uid !== process.getuid())) || ((entry.mode & 0o022) && !(entry.mode & 0o1000))) throw new ProtocolError("Retirement helper ancestors permit replacement.");
+        if (dirname(parent) === parent) break;
+      }
+      const info = lstatSync(command);
+      if (!info.isFile() || info.nlink !== 1 || (info.mode & 0o022) || !(info.mode & 0o111) ||
+        (process.getuid && info.uid !== process.getuid() && info.uid !== 0)) throw new ProtocolError("Retirement helper ownership/type rejected.");
     }
-    const info = lstatSync(command);
-    if (!info.isFile() || info.nlink !== 1 || (info.mode & 0o022) || !(info.mode & 0o111) ||
-      (process.getuid && info.uid !== process.getuid() && info.uid !== 0)) throw new ProtocolError("Retirement helper ownership/type rejected.");
-    execFileSync(command, [path], { timeout: 10_000, maxBuffer: 4096, stdio: "pipe" });
-  });
+    assertNoSymlinkChain(path, "retirement");
+    assertPrivatePath(path, config.storage.privateRootDir, config.storage.expectedDevice);
+    if (treeSnapshot(config, path).identity !== before.identity) throw new ProtocolError("Artifact changed during retirement validation.");
+    // Recheck AFTER blocking tree/helper validation, immediately before the trusted side effect.
+    checkStorage(config, [dirname(path)]);
+    if (trash) trash(path);
+    else execFileSync(command!, [path], { timeout: 10_000, maxBuffer: 4096, stdio: "pipe" });
+  };
+}
+function retirementBatch(config: Config, trash: ((path: string) => void) | undefined,
+  work: (retire: (path: string) => void) => void): number {
+  let retired = 0;
+  const helper = retirementHelper(config, trash);
+  try {
+    work(path => {
+      try { helper(path); }
+      catch (error) { if (!existsSync(path)) retired++; throw error; }
+      if (existsSync(path)) throw new ProtocolError("Retirement helper did not move the artifact.");
+      retired++;
+    });
+    return retired;
+  } catch { throw new RetirementError(retired); }
 }
 export function retireRecovery(config: Config, role: StoreRole, limit: number, trash?: (path: string) => void): number {
   if (!config.operatorPublicKey) throw new ProtocolError("Independent operator verification key required.");
-  return PrivateStore.retireRecoveryAudits(roleOptions(config, role), { key: publicKey(config.operatorPublicKey), role }, limit, retirementHelper(config, trash));
+  return retirementBatch(config, trash, retire => { PrivateStore.retireRecoveryAudits(roleOptions(config, role),
+    { key: publicKey(config.operatorPublicKey!), role }, limit, retire); });
 }
 const artifactUuid = "[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}";
 const generatedQuarantineName = new RegExp(`^(?:incoming-${artifactUuid}-${artifactUuid}|gen-e[1-9][0-9]*-s[1-9][0-9]*-[a-f0-9]{12}-${artifactUuid}|(?:state\\.json\\.tmp\\.|stage-)[0-9]+-${artifactUuid}-${artifactUuid}|\\.flighty-replica-export-[A-Za-z0-9]{6}-${artifactUuid}|raw-backup-${artifactUuid}|copy-e[1-9][0-9]*-s[1-9][0-9]*-${artifactUuid})$`);
@@ -89,30 +134,53 @@ export function retireArtifacts(config: Config, category: ArtifactCategory, limi
   trash?: (path: string) => void): number {
   if (!Number.isInteger(limit) || limit < 1 || limit > 16) throw new ProtocolError();
   checkStorage(config); validateConfig(config);
-  const retire = retirementHelper(config, trash);
-  const roles: StoreRole[] = config.kind === "linux" ? ["linux-mailbox", "linux-client"] : ["mac-executor", "mac-sequence"];
-  const stores: PrivateStore[] = [];
-  try {
-    for (const role of roles) stores.push(new PrivateStore(roleOptions(config, role)));
-    if (category === "history") return stores.reduce((n, store) => n + (n < limit ? store.retireArchive(limit - n, retire) : 0), 0);
-    const roots = category === "copies" ? (config.kind === "mac" ? [config.transferParent] : []) :
-      config.kind === "mac" ? [config.rawQuarantine] : [config.quarantine, join(config.receiverRoot, ".trash")];
-    let retired = 0;
-    for (const root of roots) {
-      checkStorage(config, [root]); if (!existsSync(root)) continue;
-      // Full private traversal/byte/entry bounds precede touching a candidate. Symlinks/links reject.
-      measureStorage(root, config.budget);
-      for (const name of readdirSync(root)) {
-        if (retired >= limit) break;
-        const allowed = category === "copies" ? /^copy-e[1-9][0-9]*-s[1-9][0-9]*$/.test(name) :
-          generatedQuarantineName.test(name);
-        if (!allowed) throw new ProtocolError("Unrecognized application artifact; operator inspection required.");
-        const path = join(root, name); assertNoSymlinkChain(path, "retirement"); assertPrivatePath(path, root);
-        // Never retire an active operation's in-process artifact: all stores are exclusively held above.
-        if (Date.now() - lstatSync(path).mtimeMs < 86_400_000) continue;
-        retire(path); retired++;
+  return retirementBatch(config, trash, retire => {
+    const roles: StoreRole[] = config.kind === "linux" ? ["linux-mailbox", "linux-client"] : ["mac-executor", "mac-sequence"];
+    const stores: PrivateStore[] = [];
+    let failure: unknown;
+    try {
+      for (const role of roles) stores.push(new PrivateStore(roleOptions(config, role)));
+      if (category === "history") {
+        let count = 0;
+        for (const store of stores) if (count < limit) count += store.retireArchive(limit - count, retire);
+      } else {
+        const roots = category === "copies" ? (config.kind === "mac" ? [config.transferParent] : []) :
+          config.kind === "mac" ? [config.rawQuarantine] : [config.quarantine, join(config.receiverRoot, ".trash")];
+        let retired = 0;
+        for (const root of roots) {
+          checkStorage(config, [root]); if (!existsSync(root)) continue;
+          treeSnapshot(config, root); // Whole-root ownership/device and aggregate storage bounds.
+          for (const name of readdirSync(root).sort()) {
+            if (retired >= limit) break;
+            const allowed = category === "copies" ? /^copy-e[1-9][0-9]*-s[1-9][0-9]*$/.test(name) : generatedQuarantineName.test(name);
+            if (!allowed) throw new ProtocolError("Unrecognized application artifact; operator inspection required.");
+            const path = join(root, name), snapshot = treeSnapshot(config, path);
+            validateArtifactLayout(name, snapshot.nodes);
+            // The complete artifact must be aged, including every descendant.
+            if (Date.now() - snapshot.newest < 86_400_000) continue;
+            if (treeSnapshot(config, path).identity !== snapshot.identity) throw new ProtocolError("Artifact changed during selection.");
+            retire(path); retired++;
+          }
+        }
       }
-    }
-    return retired;
-  } finally { for (const store of stores.reverse()) store.close(); }
+    } catch (error) { failure = error; }
+    finally { for (const store of stores.reverse()) { try { store.close(); } catch (error) { failure ??= error; } } }
+    if (failure) throw failure;
+  });
+}
+function validateArtifactLayout(name: string, nodes: { relative: string; directory: boolean }[]): void {
+  const raw = name.startsWith("raw-backup-"), work = name.startsWith(".flighty-replica-export-");
+  const state = name.startsWith("state.json.tmp.");
+  const rawFile = /^(?:source-snapshot\.db(?:-wal|-shm|-journal)?)$/;
+  const bundleFile = /^(?:manifest\.json|replica\.db(?:-wal|-shm|-journal)?)$/;
+  for (const node of nodes) {
+    if (!node.relative) { if (node.directory === state) throw new ProtocolError("Artifact root type rejected."); continue; }
+    let allowed = false;
+    if (raw) allowed = !node.directory && rawFile.test(node.relative);
+    else if (work) allowed = node.directory ? ["raw-backup", "bundle"].includes(node.relative) :
+      (node.relative.startsWith("raw-backup/") && rawFile.test(node.relative.slice(11))) ||
+      (node.relative.startsWith("bundle/") && bundleFile.test(node.relative.slice(7)));
+    else if (!state) allowed = !node.directory && bundleFile.test(node.relative);
+    if (!allowed) throw new ProtocolError("Artifact contains an unrecognized layout; operator inspection required.");
+  }
 }

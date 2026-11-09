@@ -38,7 +38,7 @@ it("post-export context rotation quarantines the signed copy; explicit bounded r
   await expect(m.snapshot(context!, signal)).rejects.toThrow(); expect(upload).not.toHaveBeenCalled(); m.close();
   expect(readdirSync(f.macConfig.transferParent)).toEqual([]); expect(readdirSync(f.macConfig.rawQuarantine).some(n => n.startsWith("copy-e1-s1-"))).toBe(true);
   const source = readFileSync(f.fixture.mainPath), owned = join(f.macConfig.rawQuarantine, "raw-backup-11111111-1111-4111-8111-111111111111");
-  mkdirSync(owned, { mode: 0o700 }); writeFileSync(join(owned, "source-snapshot.db"), "synthetic-private-raw", { mode: 0o600 }); const old = new Date(Date.now() - 3 * 86400000); utimesSync(owned, old, old);
+  mkdirSync(owned, { mode: 0o700 }); writeFileSync(join(owned, "source-snapshot.db"), "synthetic-private-raw", { mode: 0o600 }); const old = new Date(Date.now() - 3 * 86400000); utimesSync(join(owned, "source-snapshot.db"), old, old); utimesSync(owned, old, old);
   f.macConfig.budget.maxBytes = measureStorage(f.macConfig.rawQuarantine).bytes;
   const count = retireArtifacts(f.macConfig, "quarantine", 1, path => { expect(path).toBe(owned); renameSync(path, join(f.root, "recoverable-raw")); });
   expect(count).toBe(1); expect(readFileSync(f.fixture.mainPath)).toEqual(source); expect(readFileSync(join(f.root, "recoverable-raw", "source-snapshot.db"), "utf8")).toBe("synthetic-private-raw");

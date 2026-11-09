@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { inspectStore, recoverStore, archiveResolvedClient, retireRecovery, maintain, retireArtifacts, storeRole } from "./maintenance.js";
+import { RetirementError, inspectStore, recoverStore, archiveResolvedClient, retireRecovery, maintain, retireArtifacts, storeRole } from "./maintenance.js";
 import { readConfig, privateRead, publicKey } from "./config.js";
 import { provisionLinux } from "./linux.js";
 import { provisionMac, macContextCapture, macStoreOptions } from "./mac.js";
@@ -62,4 +62,4 @@ async function main() {
   }
   throw new Error();
 }
-main().catch(() => { console.error("Flighty offline adapter command unavailable or rejected. Check explicit private configuration, provisioning and continuity. No automatic reset or retry."); process.exitCode = 1; });
+main().catch(error => { if (error instanceof RetirementError) console.error(JSON.stringify({ retired: error.retired, stopped: true })); console.error("Flighty offline adapter command unavailable or rejected. Check explicit private configuration, provisioning and continuity. No automatic reset or retry."); process.exitCode = 1; });

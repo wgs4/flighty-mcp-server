@@ -1,6 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { closeSync, constants, existsSync, fsyncSync, lstatSync, openSync, readSync, realpathSync, renameSync, writeFileSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { createHash, createHmac, randomUUID, timingSafeEqual, verify, type KeyObject } from "node:crypto";
 import { z } from "zod";
 import { boundedJson, canonical, MAX_WIRE_BYTES, ProtocolError } from "./protocol.js";
@@ -59,6 +59,19 @@ function privateFile(path: string, maxBytes: number, minBytes = 1): void {
 function syncParent(path: string): void {
   const fd = openSync(dirname(path), constants.O_RDONLY);
   try { fsyncSync(fd); } finally { closeSync(fd); }
+}
+
+function retirementIdentity(path: string): string {
+  const st = lstatSync(path), parent = lstatSync(dirname(path));
+  if (!st.isFile() || st.nlink !== 1 || st.dev !== parent.dev || (st.mode & 0o077) ||
+    (process.getuid && st.uid !== process.getuid())) fail();
+  return canonical({ dev: st.dev, ino: st.ino, uid: st.uid, mode: st.mode, nlink: st.nlink, size: st.size, mtime: st.mtimeMs, ctime: st.ctimeMs });
+}
+function recheckRetirementFile(options: StoreOptions, path: string, identity: string, bytes: string): void {
+  privateParent(path); privateFile(path, MAX_WIRE_BYTES + 4096);
+  if (readFileSync(path, "utf8") !== bytes || retirementIdentity(path) !== identity) fail();
+  // Blocking validation above is not preemptible. Re-establish storage authority on return.
+  options.checkLocation();
 }
 
 /** Explicit initialization and authenticated, externally anchored recovery. Local filesystem only. */
@@ -204,11 +217,13 @@ export class PrivateStore {
       for (const name of entries) {
         if (retired >= limit) break;
         if (!/^[A-Za-z0-9_-]{1,80}\.json$/.test(name)) fail(); const path = root + "/" + name; privateFile(path, 16384);
-        const signed = continuityAttestationSchema.parse(JSON.parse(readFileSync(path, "utf8"))), body = signed.body;
+        const identity = retirementIdentity(path), bytes = readFileSync(path, "utf8");
+        const signed = continuityAttestationSchema.parse(JSON.parse(bytes)), body = signed.body;
         if (body.role !== authority.role || body.observation.identity !== options.identity || name !== body.nonce + ".json" ||
           !verify(null, Buffer.from("flighty-continuity-recovery-v1:" + canonical(body)), authority.key, Buffer.from(signed.signature, "base64"))) fail();
         if (body.expiresAt + 86_400_000 > Date.now() || current.anchorRevision < body.observation.revision ||
           current.anchorDevice !== current.device || current.anchorInode !== current.inode) continue;
+        recheckRetirementFile(options, path, identity, bytes);
         trash(path); retired++;
       }
       return retired;
@@ -395,45 +410,68 @@ export class PrivateStore {
     const fd = openSync(stage, constants.O_RDONLY | constants.O_NOFOLLOW); try { fsyncSync(fd); } finally { closeSync(fd); }
     renameSync(stage, path); syncParent(path);
   }
+  private archiveCandidate(path: string) {
+    privateParent(path); privateFile(path, MAX_WIRE_BYTES + 4096);
+    const before = retirementIdentity(path), bytes = readFileSync(path, "utf8");
+    if (retirementIdentity(path) !== before) fail();
+    const body = z.object({ version: z.literal(1), identity: z.literal(this.options.identity),
+      kind: z.string().regex(/^[a-z][a-z-]{0,39}$/), id: z.string().regex(/^[A-Za-z0-9_-]{1,80}$/),
+      value: z.unknown(), tag: hex }).strict().parse(JSON.parse(bytes));
+    const { tag, ...unsigned } = body;
+    const name = createHash("sha256").update(body.kind + "\0" + body.id).digest("hex") + ".json";
+    if (basename(path) !== name || !equal(tag, PrivateStore.mac(this.options, "archive", canonical(unsigned)))) fail();
+    this.validateState!([{ kind: body.kind, id: body.id, value: body.value }]);
+    return { ...unsigned, bytes, fileIdentity: before };
+  }
   archived<T>(kind: string, id: string): T | undefined {
     this.ready();
     if (!/^[a-z][a-z-]{0,39}$/.test(kind) || !/^[A-Za-z0-9_-]{1,80}$/.test(id)) throw new ProtocolError();
     const path = this.options.path + ".archive/" + createHash("sha256").update(kind + "\0" + id).digest("hex") + ".json";
     if (!existsSync(path)) return undefined;
-    privateParent(path); privateFile(path, MAX_WIRE_BYTES + 4096);
-    const parsed = JSON.parse(readFileSync(path, "utf8")), { tag, ...body } = parsed;
-    if (body.version !== 1 || body.identity !== this.options.identity || body.kind !== kind || body.id !== id ||
-      !equal(tag, PrivateStore.mac(this.options, "archive", canonical(body)))) fail();
-    this.validateState?.([{ kind, id, value: body.value }]);
-    return structuredClone(body.value) as T;
+    return structuredClone(this.archiveCandidate(path).value) as T;
   }
 
   retireArchive(limit: number, trash: (path: string) => void): number {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 16) throw new ProtocolError();
     this.ready(); const root = this.options.path + ".archive";
     if (!existsSync(root)) return 0;
     privateParent(root + "/entry"); const entries = readdirSync(root);
     if (entries.length > 4096) fail();
-    const resolved = new Set<string>();
-    for (const name of entries) {
-      if (/^\.partial-[a-f0-9-]{36}$/.test(name)) { privateFile(root + "/" + name, MAX_WIRE_BYTES + 4096); continue; }
-      if (!/^[a-f0-9]{64}\.json$/.test(name)) fail(); privateFile(root + "/" + name, MAX_WIRE_BYTES + 4096);
-      const body = JSON.parse(readFileSync(root + "/" + name, "utf8")); this.archived(body.kind, body.id);
-      if (["reconciliation", "client-resolution"].includes(body.kind)) resolved.add(body.value.request.body.operationId);
-    }
-    let retired = 0;
-    for (const name of entries) {
-      if (retired >= limit) break;
-      if (/^\.partial-[a-f0-9-]{36}$/.test(name)) { const path = root + "/" + name; if (Date.now() - lstatSync(path).mtimeMs >= 86_400_000) { trash(path); retired++; } continue; }
+    const candidates = entries.map(name => {
+      const path = root + "/" + name;
+      if (/^\.partial-[a-f0-9-]{36}$/.test(name)) {
+        privateFile(path, MAX_WIRE_BYTES + 4096);
+        return { path, identity: retirementIdentity(path), bytes: readFileSync(path, "utf8"), body: undefined };
+      }
       if (!/^[a-f0-9]{64}\.json$/.test(name)) fail();
-      const path = root + "/" + name; privateFile(path, MAX_WIRE_BYTES + 4096);
-      const body = JSON.parse(readFileSync(path, "utf8"));
-      this.archived(body.kind, body.id);
-      const value = body.value, request = value?.request?.body;
-      if (!request || request.expiresAt + 86_400_000 > Date.now()) continue;
-      const state = value.receipt?.body?.state ?? value.status?.receipt?.body?.state;
-      // UNKNOWN is retired only with independently authenticated resolution evidence in this archive.
-      if (state !== "succeeded" && state !== "failed" && !resolved.has(request.operationId)) continue;
-      trash(path); retired++;
+      const body = this.archiveCandidate(path);
+      return { path, identity: body.fileIdentity, bytes: body.bytes, body };
+    });
+    const proof = (c: typeof candidates[number]) => c.body && ["reconciliation", "client-resolution"].includes(c.body.kind);
+    const requestKey = (c: typeof candidates[number]) => {
+      const request = (c.body?.value as any)?.request;
+      return request ? createHash("sha256").update(canonical(request)).digest("hex") : undefined;
+    };
+    const resolved = new Set(candidates.filter(proof).map(requestKey));
+    // Dependents go first. A retained proof cannot leave until every dependent has moved,
+    // including across limit boundaries, helper failures and process restarts.
+    candidates.sort((a, b) => Number(!!proof(a)) - Number(!!proof(b)) || a.path.localeCompare(b.path));
+    const remaining = new Set(candidates);
+    let retired = 0;
+    for (const candidate of candidates) {
+      if (retired >= limit) break;
+      const { path, body } = candidate;
+      if (!body) { if (Date.now() - lstatSync(path).mtimeMs < 86_400_000) continue; }
+      else {
+        const value = body.value as any, request = value?.request?.body;
+        if (!request || request.expiresAt + 86_400_000 > Date.now()) continue;
+        const key = requestKey(candidate), state = value.receipt?.body?.state ?? value.status?.receipt?.body?.state;
+        if (proof(candidate)) {
+          if ([...remaining].some(other => other !== candidate && !proof(other) && requestKey(other) === key)) continue;
+        } else if (state !== "succeeded" && state !== "failed" && !resolved.has(key)) continue;
+      }
+      recheckRetirementFile(this.options, path, candidate.identity, candidate.bytes);
+      trash(path); retired++; remaining.delete(candidate);
     }
     return retired;
   }
