@@ -164,6 +164,13 @@ export function sanitizeToolErrorMessage(rawMessage: string): string {
   return msg || "Tool execution failed.";
 }
 
+function unavailableReplicaResult(now?: NowInput): McpToolResult {
+  const freshness = createErrorFreshness({ now });
+  const value = { status: "unavailable", message: "Replica storage or continuity became unavailable. No result is verified.",
+    freshness, queried_at: freshness.queried_at, untrusted_data: true, data_trust_label: DATA_TRUST_LABEL };
+  return { isError: true, content: [{ type: "text", text: JSON.stringify(value) }], freshness, queried_at: freshness.queried_at };
+}
+
 export interface WrapToolResultOptions {
   toolName?: string;
   isOwnerScoped?: boolean;
@@ -240,7 +247,9 @@ export function wrapToolResult(
   const effectiveNow =
     options.now !== undefined ? options.now : invocationStore?.nowMs;
 
-  const replica = getActiveReplicaLease()?.computeFreshness({ now: effectiveNow, toolName: effectiveToolName, isError });
+  let replica;
+  try { replica = getActiveReplicaLease()?.computeFreshness({ now: effectiveNow, toolName: effectiveToolName, isError }); }
+  catch { return unavailableReplicaResult(effectiveNow); }
   const freshness =
     options.freshness ?? replica?.app_sync ??
     readDatabaseFreshness({
@@ -612,6 +621,7 @@ export function installToolSafety(
         return createSanitizedToolError(new Error("Replica unavailable. No verified generation for configured account."), { toolName: name, now: state.now });
       }
       try { return await runWithReplicaLeaseContext(lease, () => wrappedHandler(args, extra)); }
+      catch { return unavailableReplicaResult(state.now); }
       finally { lease.release(); }
     };
     return originalRegisterTool(name, safeConfig, completeHandler);

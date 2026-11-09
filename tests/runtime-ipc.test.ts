@@ -7,7 +7,7 @@ import { trashFixture } from "./fixture/lifecycle.mjs";
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) trashFixture(root); });
 async function scenario(name: string, bundle = true) {
-  const f = runtimeFixture(); roots.push(f.root); f.linux.budget.transportMs = 300;
+  const f = runtimeFixture(); roots.push(f.root); f.linux.budget.transportMs = 300; if (name === "reservation") f.linux.budget.maxBytes = 20 * 1024 * 1024;
   provisionLinux(f.linux);
   const exported = bundle ? await f.bundle() : null;
   const child = spawnSync(process.execPath, [fileURLToPath(new URL("./runtime-ipc-harness.mjs", import.meta.url)), f.configFile("linux"), exported?.bundleDir ?? "-", name], { encoding: "utf8", timeout: 12_000, maxBuffer: 128 * 1024 });
@@ -37,5 +37,13 @@ it("an existing socket is never unlinked or taken over", async () => {
 });
 
 it("admits only one upload and does not queue unbounded transport work", async () => {
-  const result = await scenario("concurrency", false); expect(result.second).toBe(""); expect(result.highwater).toBe(0);
+  const result = await scenario("concurrency", false); expect(JSON.parse(result.second).requests).toEqual([]); expect(result.highwater).toBe(0);
+});
+
+it.each(["reservation", "mkdir-fault"])("%s rejection releases upload admission and preserves future mailbox/upload", async name => {
+  const r = await scenario(name); expect(JSON.parse(r.rejected).error).toBeTruthy(); expect(JSON.parse(r.mailbox).requests).toEqual([]);
+  expect(JSON.parse(r.accepted).accepted).toBe(true); expect(r.highwater).toBe(1);
+});
+it("closing the original owner leaves a replacement live published socket reachable", async () => {
+  const r = await scenario("replacement", false); expect(r.exists).toBe(true); expect(r.response).toBe("replacement");
 });

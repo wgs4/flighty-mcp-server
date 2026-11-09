@@ -420,11 +420,13 @@ export class ReplicaReceiver {
       writeFileSync(tmpPath, serialized, { encoding: "utf8", mode: 0o600, flag: "wx" });
       flushPath(tmpPath, this.config.faultHooks?.onFsync, "state-temp-file");
       flushPath(this.stagingDir, this.config.faultHooks?.onFsync, "state-staging-dir");
+      assertSqliteBudget();
       renameSync(tmpPath, this.stateFilePath);
       renamed = true;
       this.config.faultHooks?.afterStateRename?.();
       flushPath(this.stateRootDir, this.config.faultHooks?.onFsync, "state-root-dir");
       flushPath(this.stagingDir, this.config.faultHooks?.onFsync, "state-source-dir");
+      assertSqliteBudget();
     } catch (error) {
       if (renamed) {
         this.state = nextState;
@@ -892,7 +894,7 @@ export class ReplicaReceiver {
         } else {
           this.leaseCounts.set(genId, cur - 1);
         }
-        this.cleanupOldGenerations();
+        try { this.cleanupOldGenerations(); } catch { /* Release owns only this lease; defer cleanup until storage is ready. */ }
       },
     };
 

@@ -1,6 +1,8 @@
 // Synthetic subprocess harness: no preload/network guard is bypassed in the MCP process.
 // Only private AF_UNIX sockets below the supplied synthetic configuration are opened.
-import { createConnection } from 'node:net';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { createServer, createConnection } from 'node:net';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -41,6 +43,24 @@ try {
     await forcedIpcClient({socketPath:config.socketPath,endpoint:'upload',input:Readable.from([JSON.stringify(header)+'\n',manifest,db]),
       output:new Writable({write(c,_e,cb){output+=c;cb();}}),maxDbBytes:config.budget.maxDbBytes, acceptanceMs:config.budget.acceptanceMs, checkLocation(){} });
     result = {first:output, highwater:runtime.receiver.getStateSnapshot().highwaterSequence};
+  } else if(scenario === 'reservation' || scenario === 'mkdir-fault') {
+    if(scenario === 'mkdir-fault') {
+      const original=fs.mkdirSync; let failed=false;
+      fs.mkdirSync=(path,...args)=>{if(!failed&&String(path).startsWith(config.inbox+'/incoming-')){failed=true;throw Object.assign(new Error('synthetic mkdir EIO'),{code:'EIO'});}return original(path,...args);}; syncBuiltinESMExports();
+    }
+    const large={verb:'upload',manifestBytes:manifest.length,dbBytes:scenario==='reservation'?7*1024*1024:db.length,manifestSha256:hash(manifest),dbSha256:hash(db)};
+    const rejected=await raw([JSON.stringify({endpoint:'upload',header:large})+'\n']);
+    const mailbox=await raw(['{"endpoint":"mailbox"}\n','{"verb":"lease","limit":1}']);
+    const small={...large,dbBytes:db.length};
+    const accepted=await raw([JSON.stringify({endpoint:'upload',header:small})+'\n',manifest,db]);
+    result={rejected,mailbox,accepted,highwater:runtime.receiver.getStateSnapshot().highwaterSequence};
+  } else if(scenario === 'replacement') {
+    fs.renameSync(config.socketPath, config.socketPath+'.moved');
+    const replacement=createServer(s=>s.end('replacement'));
+    await new Promise(resolve=>replacement.listen(config.socketPath,resolve));
+    await listener.close();
+    const response=await raw([]); result={response,exists:fs.existsSync(config.socketPath)};
+    await new Promise(resolve=>replacement.close(resolve));
   } else if(scenario === 'roles') {
     result = [];
     for (const [prefix, command] of [

@@ -1,6 +1,6 @@
 import { createServer, createConnection, type Socket } from "node:net";
 import { createHash, randomUUID } from "node:crypto";
-import { constants, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, writeSync, chmodSync, unlinkSync } from "node:fs";
+import { constants, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, writeSync, chmodSync, unlinkSync, linkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { z } from "zod";
@@ -27,16 +27,18 @@ export async function startIpcServer(config: LinuxConfig, receiver: ReplicaRecei
   assertNoSymlinkChain(path, "socket");
   // Fail closed on ANY stale path; operator must investigate the exact socket. Never unlink another listener.
   if (existsSync(path)) throw new ProtocolError("IPC socket path exists. Inspect owner/process; explicit stale-socket recovery required.");
+  const bindPath = join(dirname(path), ".flighty-" + randomUUID().slice(0, 12));
+  if (Buffer.byteLength(path) > 100 || Buffer.byteLength(bindPath) > 100) throw rejected();
   const sockets = new Set<Socket>();
   let accepting = false, closing = false;
   const server = createServer({ allowHalfOpen: true }, socket => {
-    if (closing || sockets.size >= 2 || accepting) { socket.destroy(); return; }
+    if (closing || sockets.size >= 2) { socket.destroy(); return; }
     sockets.add(socket);
     socket.on("error", () => {});
     void handle(socket).finally(() => { sockets.delete(socket); socket.destroy(); });
   });
   async function handle(socket: Socket) {
-    let staged: string | undefined, fd: number | undefined;
+    let staged: string | undefined, fd: number | undefined, ownsUpload = false;
     // Total upload/command input deadline, not an idle timeout reset by trickles.
     const timer = setTimeout(() => socket.destroy(rejected()), config.budget.transportMs);
     try {
@@ -58,9 +60,9 @@ export async function startIpcServer(config: LinuxConfig, receiver: ReplicaRecei
           else if (first.endpoint === "upload") {
             endpoint = "upload"; header = headerSchema.parse(first.header);
             if (header.dbBytes > config.budget.maxDbBytes || accepting) throw rejected();
-            accepting = true;
+            accepting = true; ownsUpload = true;
             measureStorageGroups([config.inbox, config.quarantine, config.receiverRoot], config.budget, 3 * (header.dbBytes + header.manifestBytes), 8);
-            staged = join(config.inbox, "incoming-" + randomUUID()); mkdirSync(staged, { mode: 0o700 });
+            const stage = join(config.inbox, "incoming-" + randomUUID()); mkdirSync(stage, { mode: 0o700 }); staged = stage;
             manifestLeft = header.manifestBytes; dbLeft = header.dbBytes;
             fd = openSync(join(staged, "manifest.json"), constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
           } else throw rejected();
@@ -106,16 +108,17 @@ export async function startIpcServer(config: LinuxConfig, receiver: ReplicaRecei
     }
     finally {
       clearTimeout(timer);
-      if (fd !== undefined) closeSync(fd);
+      if (ownsUpload) accepting = false;
+      if (fd !== undefined) { try { closeSync(fd); } catch { /* Preserve admission/error result; staging remains private. */ } }
       if (staged) {
-        try { retirePath(staged, config.quarantine); } catch { closing = true; server.close(); }
-        accepting = false;
+        try { retirePath(staged, config.quarantine); } catch { /* Retained bounded staging is recovered by the single owner on restart. */ }
       }
     }
   }
-  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(path, resolve); });
-  chmodSync(path, 0o600);
-  const own = lstatSync(path);
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(bindPath, resolve); });
+  chmodSync(bindPath, 0o600);
+  const own = lstatSync(bindPath);
+  try { linkSync(bindPath, path); } catch (error) { await new Promise<void>(resolve => server.close(() => resolve())); throw error; }
   return { async close() {
     closing = true; for (const socket of sockets) socket.destroy();
     await new Promise<void>(resolve => server.close(() => resolve()));
