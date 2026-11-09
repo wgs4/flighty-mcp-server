@@ -699,7 +699,11 @@ export class FlightyDatabase {
         .replace("SELECT\n    f.id,", "SELECT\n    uf.isMyFlight AS is_passenger,\n    f.id,")
         .replace("AND uf.isMyFlight = 1", "AND uf.isMyFlight IN (0, 1)") +
         " AND uf.userId = ? AND f.id = ? COLLATE NOCASE";
-      const rows = db.prepare(query).all(identity.userId, flightId) as Record<string, unknown>[];
+      const rows: Record<string, unknown>[] = [];
+      // Any second candidate proves ambiguity. Stop accumulating before an adversarial join expands memory.
+      for (const row of db.prepare(query).iterate(identity.userId, flightId)) {
+        rows.push(row); if (rows.length === 2) break;
+      }
       return rows.map(({ is_passenger, ...flight }) => ({ flight: buildFlightDict(flight),
         record: is_passenger === 1 ? "passenger" : "followed", identity }));
     } finally { db.close(); }

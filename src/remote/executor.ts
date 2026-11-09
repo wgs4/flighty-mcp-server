@@ -15,6 +15,8 @@ export type StepActivity = { retain(): () => void; assertActive(): void };
 class AuthorizationExpiredError extends ProtocolError {}
 export type ExecutorDeps = {
   store: PrivateStore; callers: Callers; receiptKey: KeyObject; bindingKey: Buffer;
+  operatorKey?: KeyObject;
+  cancellation?: AbortSignal;
   captureContext: (signal: AbortSignal) => Promise<CredentialContext | null>;
   createApi: (context: CredentialContext, signal: AbortSignal, activity: StepActivity) => WriteApi;
   /** Reopen current local source per call. The adapter must bind owner to context.account. */
@@ -83,7 +85,7 @@ export class MacExecutor {
     if (deps.bindingKey.length < 32) throw new ProtocolError("Private binding key is too short.");
     this.now = deps.now ?? Date.now;
     deps.store.claimConsumer("mac-executor");
-    deps.store.setValidator(executorStateValidator(pinnedCallers(deps.callers), createPublicKey(deps.receiptKey), this.now));
+    deps.store.setValidator(executorStateValidator(pinnedCallers(deps.callers), createPublicKey(deps.receiptKey), this.now, deps.operatorKey));
     // Establish unresolved authority before any age-based cleanup.
     deps.store.transaction(() => { this.recoverInterrupted(); this.prune(); });
   }
@@ -93,6 +95,7 @@ export class MacExecutor {
     this.maintenance();
     const saved = this.deps.store.get<StoredOperation>("operation", req.operationId);
     if (saved) {
+      if (saved.receipt.body.state === "unknown" && req.expiresAt + RETENTION_MS <= this.now()) throw new ProtocolError("Operation outcome unavailable through resubmission; inspect retained status. No retry.");
       if (digest(saved.request.body) !== digest(req)) throw new ProtocolError("Operation ID conflicts with its durable binding.");
       return ["not-dispatched", "dispatched"].includes(saved.receipt.body.state) ? this.run(req.operationId) : saved.receipt;
     }
@@ -342,10 +345,15 @@ export class MacExecutor {
       },
     };
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let cancel = () => {};
     const deadline = new Promise<never>((_, reject) => {
       timer = setTimeout(() => { controller.abort(); reject(new ProtocolError("Executor step timed out.")); }, remaining);
       timer.unref?.();
+      cancel = () => { controller.abort(); reject(new ProtocolError("Executor cycle cancelled; inspect original operation status.")); };
+      this.deps.cancellation?.addEventListener("abort", cancel, { once: true });
+      if (this.deps.cancellation?.aborted) cancel();
     });
+    void deadline.catch(() => {});
     const release = activity.retain();
     let operation: Promise<T>, invoked = false;
     const failure = () => {
@@ -356,12 +364,12 @@ export class MacExecutor {
       }
     };
     try { activity.assertActive(); invoked = true; operation = Promise.resolve(fn(controller.signal, activity)); }
-    catch (error) { release(); clearTimeout(timer); if (invoked) failure(); throw error; }
+    catch (error) { release(); clearTimeout(timer); this.deps.cancellation?.removeEventListener("abort", cancel); if (invoked) failure(); throw error; }
     operation = operation.then(value => { release(); return value; }, error => { release(); throw error; });
     try { return await Promise.race([operation, deadline]); }
     catch (error) {
       failure(); throw error;
-    } finally { clearTimeout(timer); }
+    } finally { clearTimeout(timer); this.deps.cancellation?.removeEventListener("abort", cancel); }
   }
   private fence(request: SignedRequest): void {
     this.unresolvedAccounts.add(request.body.account);
@@ -371,7 +379,7 @@ export class MacExecutor {
   }
   private async context(req: Request): Promise<CredentialContext> {
     this.deps.checkSource();
-    assertWritesEnabled(this.deps.policy);
+    if (req.operation.kind !== "request-snapshot") assertWritesEnabled(this.deps.policy);
     const ctx = await this.step(signal => this.deps.captureContext(signal), { account: req.account, expiresAt: req.expiresAt });
     if (!ctx || !ctx.account || !ctx.session || !ctx.authToken || !ctx.buildToken ||
         [ctx.account, ctx.session, ctx.authToken, ctx.buildToken].some(v => typeof v !== "string" || v.length > 16_384) ||
@@ -441,7 +449,7 @@ export class MacExecutor {
   }
   private prune(): void {
     const now = this.now();
-    for (const { id, value } of this.deps.store.list<StoredOperation>("operation")) if (value.receipt.body.state !== "dispatched" && !this.activeOperations.has(id) && value.request.body.expiresAt + RETENTION_MS <= now) this.deps.store.delete("operation", id);
+    for (const { id, value } of this.deps.store.list<StoredOperation>("operation")) if (!["dispatched", "unknown"].includes(value.receipt.body.state) && !this.activeOperations.has(id) && value.request.body.expiresAt + RETENTION_MS <= now) this.deps.store.delete("operation", id);
     for (const { id, value } of this.deps.store.list<Preview>("preview")) if (value.expiresAt <= now) this.deps.store.delete("preview", id);
   }
 }

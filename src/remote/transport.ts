@@ -5,10 +5,12 @@ import { boundedJson, MAX_WIRE_BYTES, parseWire, ProtocolError } from "./protoco
 import type { Mailbox, MailboxPrincipal, MailboxTransport } from "./mailbox.js";
 
 /** Staged adapter only: constructing it launches nothing. Each explicit call spawns one bounded SSH. */
-export function sshTransport(inputConfig: {
+export type SshConfig = {
   enabled: true; host: string; port: number; user: string; identityFile: string; knownHostsFile: string;
   checkConfiguration: () => void;
-}, spawnImpl: typeof spawn = spawn): MailboxTransport {
+  signal?: AbortSignal;
+};
+export function sshTransport(inputConfig: SshConfig, spawnImpl: typeof spawn = spawn): MailboxTransport {
   const config = Object.freeze({ ...inputConfig });
   if (![config.identityFile, config.knownHostsFile].every(path => typeof path === "string" && isAbsolute(path) && /^[A-Za-z0-9._/-]+$/.test(path))) {
     throw new ProtocolError("SSH paths must be absolute and use only letters, digits, '.', '_', '-' or '/'.");
@@ -18,22 +20,20 @@ export function sshTransport(inputConfig: {
       !isAbsolute(config.identityFile) || !isAbsolute(config.knownHostsFile) ||
       /[\r\n\0]/.test(config.identityFile + config.knownHostsFile)) throw new ProtocolError("SSH configuration rejected.");
   return async command => {
-    boundedJson(parseWire(command)); config.checkConfiguration();
-    const args = ["-F", "/dev/null", "-T", "-p", String(config.port),
-      "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", `UserKnownHostsFile=${config.knownHostsFile}`,
-      "-o", "GlobalKnownHostsFile=/dev/null", "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
-      "-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes", "-o", "PermitLocalCommand=no",
-      "-o", "ProxyCommand=none", "-o", "ProxyJump=none", "-o", "ConnectTimeout=10",
-      "-i", config.identityFile, `${config.user}@${config.host}`, "flighty-mailbox-v1"];
+    boundedJson(parseWire(command)); config.signal?.throwIfAborted(); config.checkConfiguration();
+    const args = sshArguments(config, "flighty-mailbox-v1");
     return new Promise<string>((resolve, reject) => {
       const child = spawnImpl("/usr/bin/ssh", args, { shell: false, stdio: ["pipe", "pipe", "pipe"] });
       const chunks: Buffer[] = [];
       let total = 0, finished = false;
       const finish = (error?: Error) => {
-        if (finished) return; finished = true; clearTimeout(timer);
+        if (finished) return; finished = true; clearTimeout(timer); config.signal?.removeEventListener("abort", abort);
         if (error) { child.kill("SIGKILL"); reject(error); } else resolve(Buffer.concat(chunks).toString("utf8"));
       };
+      const abort = () => finish(new ProtocolError("Mailbox transport cancelled; inspect original operation status."));
       const timer = setTimeout(() => finish(new ProtocolError("Mailbox transport unavailable; inspect operation status before retrying.")), 20_000);
+      config.signal?.addEventListener("abort", abort, { once: true });
+      if (config.signal?.aborted) { abort(); return; }
       child.stdout.on("data", (chunk: Buffer) => {
         if (finished) return;
         total += chunk.length;
@@ -70,4 +70,15 @@ export async function serveMailboxStdin(input: Readable, output: Writable, mailb
   } catch {
     output.write('{"error":"Mailbox request rejected."}\n');
   } finally { clearTimeout(timeout); }
+}
+
+export function sshArguments(config: SshConfig, command: "flighty-mailbox-v1" | "flighty-upload-v1"): string[] {
+  return ["-F", "/dev/null", "-T", "-p", String(config.port),
+      "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", `UserKnownHostsFile=${config.knownHostsFile}`,
+      "-o", "GlobalKnownHostsFile=/dev/null", "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
+      "-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes", "-o", "PermitLocalCommand=no",
+      "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "ControlPersist=no",
+      "-o", "UpdateHostKeys=no", "-o", "ForwardX11=no", "-o", "RequestTTY=no",
+      "-o", "ProxyCommand=none", "-o", "ProxyJump=none", "-o", "ConnectTimeout=10",
+      "-i", config.identityFile, `${config.user}@${config.host}`, command];
 }

@@ -1,3 +1,4 @@
+import { verifyAudit } from "./recovery.js";
 import { z } from "zod";
 import type { KeyObject } from "node:crypto";
 import { digest, idSchema, parseSchema, ProtocolError, timeSchema, verifyReceipt, verifyRequest, type Callers, type Receipt, type Signed, type SignedRequest } from "./protocol.js";
@@ -55,12 +56,16 @@ function retainedProofs(callers: Callers, macKey: KeyObject, now: () => number) 
     },
   };
 }
-export function executorStateValidator(callers: Callers, macKey: KeyObject, now: () => number): (rows: readonly StateRow[]) => void {
+export function executorStateValidator(callers: Callers, macKey: KeyObject, now: () => number, operatorKey?: KeyObject): (rows: readonly StateRow[]) => void {
   const proofs = retainedProofs(callers, macKey, now);
   return rows => {
     const operations = new Map<string, StoredOperation>();
     for (const row of rows) {
       if (row.kind === "preview") continue;
+      if (row.kind === "reconciliation") {
+        if (!operatorKey) throw new ProtocolError("Operator trust is required for retained reconciliation audits.");
+        verifyAudit(row.value, row.id, callers, macKey, operatorKey); continue;
+      }
       if (row.kind === "fence") {
         const fence = parseSchema(fenceSchema, row.value), request = proofs.request(fence.request);
         if (row.id !== request.account) throw new ProtocolError("Durable unresolved account fence rejected.");

@@ -115,10 +115,10 @@ export function validateStorage(authority: ReplicaStorageAuthority, paths: reado
     }
   }
 }
-export function verifyMountAndSource(params: { requiredMountPath: string; sourceDbPath: string; outputDir: string; mountCheck?: MountCheckFn; storage?: ReplicaStorageAuthority }): void {
+export function verifyMountAndSource(params: { requiredMountPath: string; sourceDbPath: string; approvedSourceDbPath?: string; outputDir: string; mountCheck?: MountCheckFn; storage?: ReplicaStorageAuthority }): void {
   const source = assertSafeAbsolutePath(params.sourceDbPath, "source");
   const output = assertSafeAbsolutePath(params.outputDir, "output");
-  if (source.includes("Library/Containers/com.flightyapp.flighty")) throw createReplicaError("INVALID_CONFIG", "Real application source paths remain gated.");
+  if (source.includes("Library/Containers/com.flightyapp.flighty") && params.approvedSourceDbPath !== source) throw createReplicaError("INVALID_CONFIG", "Real application source paths remain gated.");
   if (isWithin(source, output) || isWithin(output, source)) throw createReplicaError("INVALID_PATH", "Invalid source or output scope.");
   if (!params.storage || resolve(params.requiredMountPath) !== resolve(params.storage.mountPath)) throw createReplicaError("MOUNT_UNAVAILABLE", "Explicit matching storage mount authority is required.");
   validateStorage(params.storage, [dirname(output)], false);

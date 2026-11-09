@@ -133,6 +133,8 @@ export type MountCheckFn = (params: {
 export type CleanupPathFn = (targetPath: string) => void;
 
 export interface ExportReplicaBundleOptions {
+  /** Inactive adapter only: explicit configured source, separately consented before real invocation. */
+  readonly approvedSourceDbPath?: string;
   /** Explicit absolute path to source SQLite database. Never defaults to real app path. */
   readonly sourceDbPath: string;
   readonly storage: ReplicaStorageAuthority;

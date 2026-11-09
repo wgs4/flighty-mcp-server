@@ -255,6 +255,7 @@ export async function constructReplicaBundle(
   verifyMountAndSource({
     requiredMountPath,
     sourceDbPath,
+    approvedSourceDbPath: options.approvedSourceDbPath,
     outputDir: outputBundleDir,
     mountCheck: options.mountCheck,
     storage: options.storage,
@@ -744,7 +745,7 @@ export async function constructReplicaBundle(
 export async function exportReplicaBundle(options: ExportReplicaBundleOptions): Promise<ExportReplicaBundleResult> {
   try {
     validateLimits(options?.limits ?? {});
-    verifyMountAndSource({ requiredMountPath: options.requiredMountPath, sourceDbPath: options.sourceDbPath, outputDir: options.outputBundleDir, mountCheck: options.mountCheck, storage: options.storage });
+    verifyMountAndSource({ requiredMountPath: options.requiredMountPath, sourceDbPath: options.sourceDbPath, approvedSourceDbPath: options.approvedSourceDbPath, outputDir: options.outputBundleDir, mountCheck: options.mountCheck, storage: options.storage });
     if (options.cleanupPath || options.onAfterBackup) throw createReplicaError("INVALID_CONFIG", "Custom cleanup and in-process backup hooks are unsupported by bounded export.");
     const maxSourceBytes = options.limits?.maxSourceDbBytes ?? options.limits?.maxDbBytes ?? DEFAULT_MAX_DB_BYTES;
     let inputBytes = assertRegularFileNoSymlink(options.sourceDbPath, "source").size;
