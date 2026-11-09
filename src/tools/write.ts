@@ -28,9 +28,17 @@ import { buildOwnerIdentityEnvelope, wrapToolResult } from "../services/tool-saf
 
 type Airline = { id: string; name: string; iata: string };
 
-type ToolResult = {
+export type WriteToolResult = {
   content: Array<{ type: "text"; text: string }>;
   isError?: boolean;
+};
+
+export type WriteDatabase = Pick<FlightyDatabase, "lookupAirlines" | "getRemovalFlight">;
+export type WriteApi = Pick<FlightyApi, "searchFlight" | "subscribeFlight" | "followFlight" | "deleteFlight">;
+export type WriteToolHandlers = {
+  add(params: { flight_code: string; date: string }): Promise<WriteToolResult>;
+  follow(params: { flight_code: string; date: string }): Promise<WriteToolResult>;
+  remove(params: { flight_id: string; confirm_code?: string }): Promise<WriteToolResult>;
 };
 
 export type WriteToolDeps = {
@@ -63,9 +71,9 @@ const flightIdSchema = z
     "Flight UUID. Local passenger or followed details are included when that exact id is stored. Any other valid UUID can still be confirmed for deletion."
   );
 
-async function findFlight(
-  db: FlightyDatabase,
-  api: FlightyApi,
+export async function findFlight(
+  db: WriteDatabase,
+  api: WriteApi,
   airlineIata: string,
   flightNumber: string,
   date: string
@@ -81,7 +89,7 @@ async function findFlight(
   return { candidates, match: null };
 }
 
-function notFoundMessage(
+export function notFoundMessage(
   flightCode: string,
   date: string,
   candidates: Airline[]
@@ -90,7 +98,7 @@ function notFoundMessage(
   return `No flight found for ${flightCode} on ${date} (tried ${airlineNames}). Check the flight number and date.`;
 }
 
-function textResult(text: string, isError = false): ToolResult {
+function textResult(text: string, isError = false): WriteToolResult {
   return {
     content: [{ type: "text", text }],
     ...(isError ? { isError: true } : {}),
@@ -126,36 +134,15 @@ function removalFailure(reason: ConsumeReason): string {
 
 export function registerWriteTools(
   server: McpServer,
-  db: FlightyDatabase,
-  api: FlightyApi,
+  db: WriteDatabase,
+  api: WriteApi,
   deps: WriteToolDeps = {}
 ): void {
   const removals =
     deps.removals ?? new RemovalConfirmStore(deps.now ? { now: deps.now } : undefined);
 
-  server.registerTool(
-    "flighty_add_flight",
-    {
-      title: "Add Flight",
-      description: `Add a flight to the user's Flighty account by flight code and date. The flight is registered with Flighty's server and syncs to all devices (phone, watch, etc.) within seconds.
-
-The airline is detected from the flight code prefix (e.g. "DL" from "DL10"). The Flighty API provides full enrichment: gate assignments, weather, equipment, delay forecast, codeshare partners.
-
-This tool calls the Flighty API — it requires the Flighty app to be installed and signed in.
-
-Returns the server-side flight UUID on success.`,
-      inputSchema: {
-        flight_code: flightCodeSchema,
-        date: isoDateSchema,
-      },
-      annotations: {
-        readOnlyHint: false,
-        destructiveHint: false,
-        idempotentHint: false,
-        openWorldHint: true,
-      },
-    },
-    async (params) => {
+  registerWriteToolFacade(server, {
+    add: async (params) => {
       try {
         const flightCode = assertFlightCode(params.flight_code);
         const date = assertIsoDate(params.date);
@@ -189,32 +176,8 @@ Returns the server-side flight UUID on success.`,
       } catch (error) {
         return textResult(`Error adding flight: ${toolErrorText(error)}`, true);
       }
-    }
-  );
-
-  server.registerTool(
-    "flighty_follow_flight",
-    {
-      title: "Follow Flight",
-      description: `Follow a flight without being a passenger — use this to track someone else's flight (e.g., a family member or friend). The flight is registered with Flighty's server and syncs to all devices within seconds. It will appear in flighty_list_friend_flights results (with friend_name as null, since no Flighty friend connection is involved).
-
-The airline is detected from the flight code prefix (e.g. "DL" from "DL10"). The Flighty API provides full enrichment: gate assignments, weather, equipment, delay forecast, codeshare partners.
-
-This tool calls the Flighty API — it requires the Flighty app to be installed and signed in.
-
-Returns the server-side flight UUID on success.`,
-      inputSchema: {
-        flight_code: flightCodeSchema,
-        date: isoDateSchema,
-      },
-      annotations: {
-        readOnlyHint: false,
-        destructiveHint: false,
-        idempotentHint: false,
-        openWorldHint: true,
-      },
     },
-    async (params) => {
+    follow: async (params) => {
       try {
         const flightCode = assertFlightCode(params.flight_code);
         const date = assertIsoDate(params.date);
@@ -248,9 +211,77 @@ Returns the server-side flight UUID on success.`,
       } catch (error) {
         return textResult(`Error following flight: ${toolErrorText(error)}`, true);
       }
-    }
-  );
+    },
+    remove: async (params) => {
+      try {
+        const requestedId = assertUuid(params.flight_id, "Flight id");
+        const rawCode =
+          typeof params.confirm_code === "string" ? params.confirm_code.trim() : "";
+        if (!rawCode) return previewRemoval(db, removals, requestedId);
+        return await confirmRemoval(
+          db,
+          api,
+          removals,
+          requestedId,
+          assertConfirmCodeShape(rawCode)
+        );
+      } catch (error) {
+        return textResult(`Error removing flight: ${toolErrorText(error)}`, true);
+      }
+    },
+  });
+}
 
+/** Shared public registration: local and remote facades keep identical tool contracts. */
+export function registerWriteToolFacade(server: McpServer, handlers: WriteToolHandlers): void {
+  server.registerTool(
+    "flighty_add_flight",
+    {
+      title: "Add Flight",
+      description: `Add a flight to the user's Flighty account by flight code and date. The flight is registered with Flighty's server and syncs to all devices (phone, watch, etc.) within seconds.
+
+The airline is detected from the flight code prefix (e.g. "DL" from "DL10"). The Flighty API provides full enrichment: gate assignments, weather, equipment, delay forecast, codeshare partners.
+
+This tool calls the Flighty API — it requires the Flighty app to be installed and signed in.
+
+Returns the server-side flight UUID on success.`,
+      inputSchema: {
+        flight_code: flightCodeSchema,
+        date: isoDateSchema,
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    handlers.add
+  );
+  server.registerTool(
+    "flighty_follow_flight",
+    {
+      title: "Follow Flight",
+      description: `Follow a flight without being a passenger — use this to track someone else's flight (e.g., a family member or friend). The flight is registered with Flighty's server and syncs to all devices within seconds. It will appear in flighty_list_friend_flights results (with friend_name as null, since no Flighty friend connection is involved).
+
+The airline is detected from the flight code prefix (e.g. "DL" from "DL10"). The Flighty API provides full enrichment: gate assignments, weather, equipment, delay forecast, codeshare partners.
+
+This tool calls the Flighty API — it requires the Flighty app to be installed and signed in.
+
+Returns the server-side flight UUID on success.`,
+      inputSchema: {
+        flight_code: flightCodeSchema,
+        date: isoDateSchema,
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    handlers.follow
+  );
   server.registerTool(
     "flighty_remove_flight",
     {
@@ -281,23 +312,7 @@ Deletion syncs to all devices.`,
         openWorldHint: true,
       },
     },
-    async (params) => {
-      try {
-        const requestedId = assertUuid(params.flight_id, "Flight id");
-        const rawCode =
-          typeof params.confirm_code === "string" ? params.confirm_code.trim() : "";
-        if (!rawCode) return previewRemoval(db, removals, requestedId);
-        return await confirmRemoval(
-          db,
-          api,
-          removals,
-          requestedId,
-          assertConfirmCodeShape(rawCode)
-        );
-      } catch (error) {
-        return textResult(`Error removing flight: ${toolErrorText(error)}`, true);
-      }
-    }
+    handlers.remove
   );
 }
 
@@ -307,7 +322,7 @@ type ResolvedRemoval =
   | ({ kind: "local" } & RemovalLocalRecord)
   | { kind: "unavailable" };
 
-function resolveRemoval(db: FlightyDatabase, requestedId: string): ResolvedRemoval {
+export function resolveRemoval(db: WriteDatabase, requestedId: string): ResolvedRemoval {
   try {
     const local = db.getRemovalFlight(requestedId);
     if (
@@ -322,7 +337,7 @@ function resolveRemoval(db: FlightyDatabase, requestedId: string): ResolvedRemov
   return { kind: "unavailable" };
 }
 
-function removalTarget(resolved: ResolvedRemoval, requestedId: string): {
+export function removalTarget(resolved: ResolvedRemoval, requestedId: string): {
   flightId: string;
   preview: RemovalPreview;
   localDetails: "available" | "unavailable";
@@ -356,10 +371,10 @@ function removalTarget(resolved: ResolvedRemoval, requestedId: string): {
 }
 
 function previewRemoval(
-  db: FlightyDatabase,
+  db: WriteDatabase,
   removals: RemovalConfirmStore,
   requestedId: string
-): ToolResult {
+): WriteToolResult {
   const resolved = resolveRemoval(db, requestedId);
   const target = removalTarget(resolved, requestedId);
   const issued = removals.issue(target.flightId, target.preview);
@@ -387,16 +402,16 @@ function previewRemoval(
       isOwnerScoped: resolved.kind === "local",
       ownerIdentity: resolved.kind === "local" ? resolved.identity : null,
     }
-  ) as ToolResult;
+  ) as WriteToolResult;
 }
 
 async function confirmRemoval(
-  db: FlightyDatabase,
-  api: FlightyApi,
+  db: WriteDatabase,
+  api: WriteApi,
   removals: RemovalConfirmStore,
   requestedId: string,
   confirmCode: string
-): Promise<ToolResult> {
+): Promise<WriteToolResult> {
   const target = removalTarget(resolveRemoval(db, requestedId), requestedId);
   // Consume before the request so a concurrent call cannot reuse this code.
   const decision = removals.consume(confirmCode, target.flightId, target.preview);
