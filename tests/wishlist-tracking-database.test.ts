@@ -273,6 +273,60 @@ describe("connection lookup and tool integration", () => {
   });
 });
 
+describe("R2-M1: original departure contradiction through both database unions", () => {
+  it.each([
+    ["Flight", null], ["Flight", "invalid"], ["Flight", at(50)],
+    ["ManualFlight", null],
+  ] as const)("keeps arrivals unknown with a rejected original gate in %s (ETA %j)", async (table, eta) => {
+    const incoming = table === "Flight" ? IDS.flight : IDS.manual;
+    const outgoing = table === "Flight" ? IDS.manual : IDS.flight;
+    const outTable = table === "Flight" ? "ManualFlight" : "Flight";
+    update(incoming, {
+      departureAirportId: "airport-a", scheduledArrivalAirportId: "airport-b",
+      departureScheduleGateOriginal: at(80), departureScheduleRunwayOriginal: at(30),
+      arrivalScheduleRunwayOriginal: at(40), arrivalScheduleGateOriginal: at(50),
+      arrivalScheduleGateEstimated: eta,
+    }, table);
+    update(outgoing, {
+      departureAirportId: "airport-b", scheduledArrivalAirportId: "airport-c",
+      departureScheduleGateOriginal: at(100), departureScheduleRunwayOriginal: at(110),
+      arrivalScheduleRunwayOriginal: at(200), arrivalScheduleGateOriginal: at(210),
+    }, outTable);
+    sql.prepare("UPDATE Connection SET arrivingFlightId = ?, departingFlightId = ?, waitingAirportId = 'airport-b'").run(incoming, outgoing);
+    const registered = tools();
+    for (const runway of [null, at(30)]) {
+      update(incoming, { departureScheduleRunwayOriginal: runway }, table);
+      const timing = body(await registered.get("flighty_get_tracking_status")!.handler({ flight_id: incoming })).result.timing;
+      const result = db.checkConnection(incoming, outgoing)!.result;
+      expect(timing).toMatchObject({ minutes_to_landing: null, landing_at: null, landing_time_basis: null,
+        landing_countdown_state: "unknown", minutes_to_gate: null, gate_arrival_at: null, gate_time_basis: null, gate_eta: null });
+      expect(result).toMatchObject({ arrival_gate_at: null, arrival_gate_time_basis: null, layover_minutes: null, risk: "unknown",
+        min_connection_time_minutes: 30, min_connection_time_basis: "cached_exact_pair" });
+      expect(result.airport_continuity.matches).toBe(true);
+      expect(timing.timestamp_conflicts.arrivalScheduleRunwayOriginal).toEqual(["departureScheduleGateOriginal"]);
+      expect(timing.timestamp_conflicts.arrivalScheduleGateOriginal).toEqual(["departureScheduleGateOriginal"]);
+      expect(result.timestamp_issues.inbound).toEqual(timing.timestamp_issues);
+      if (runway !== null) expect(timing.timestamp_issues.departureScheduleGateOriginal).toBe("gate_departure_follows_runway_or_arrival");
+      if (eta === "invalid") expect(timing.timestamp_issues.arrivalScheduleGateEstimated).toBe("invalid_timestamp");
+    }
+    // ManualFlight projects estimates as NULL; both unions support coherent
+    // schedules and actuals, while Flight also supports current estimates.
+    for (const departure of [
+      { departureScheduleGateOriginal: at(20), departureScheduleGateEstimated: null, departureScheduleGateActual: null, departureScheduleRunwayActual: null },
+      ...(table === "Flight" ? [{ departureScheduleGateOriginal: at(80), departureScheduleGateEstimated: at(20), departureScheduleGateActual: null, departureScheduleRunwayActual: null }] : []),
+      { departureScheduleGateOriginal: at(80), departureScheduleGateEstimated: null, departureScheduleGateActual: at(-20), departureScheduleRunwayActual: at(-10) },
+    ]) {
+      update(incoming, departure, table);
+      const timing = body(await registered.get("flighty_get_tracking_status")!.handler({ flight_id: incoming })).result.timing;
+      const result = db.checkConnection(incoming, outgoing)!.result;
+      expect(timing.minutes_to_landing).toBe(40);
+      expect(timing.minutes_to_gate).toBe(50);
+      expect(timing.gate_time_basis).toBe(eta === at(50) ? "arrivalScheduleGateEstimated" : "arrivalScheduleGateOriginal");
+      expect(result).toMatchObject({ arrival_gate_at: new Date(at(50) * 1000).toISOString(), layover_minutes: 50, risk: "meets_cached_minimum" });
+    }
+  });
+});
+
 describe("review regressions: cache provenance, MCT and raw status evidence", () => {
   it.each([false, true])("M3 labels non-owner membership with Profile=%s as cached sharing, friendship unverified", (withProfile) => {
     sql.prepare("UPDATE UserFlight SET userId = ? WHERE flightId = ?").run(OTHER, IDS.friendFlight);

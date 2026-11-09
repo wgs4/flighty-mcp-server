@@ -91,6 +91,12 @@ function validatedTimeline(flight: FlightRecord, now: number, timestampIssues: R
   // A new gate departure estimate supersedes an old runway departure schedule.
   const currentGateDeparture = candidate("departureScheduleGateEstimated");
   const currentRunwayDeparture = candidate("departureScheduleRunwayEstimated");
+  // Snapshot the active evidence before selection rejects contradictions. A
+  // rejected prediction still constrains later milestones until superseded.
+  const predictedDepartureBounds = [
+    currentGateDeparture ?? candidate("departureScheduleGateOriginal"),
+    currentRunwayDeparture ?? (currentGateDeparture ? null : candidate("departureScheduleRunwayOriginal")),
+  ];
   const runwayDepartureBound = takeoff ?? candidate("departureScheduleRunwayEstimated") ??
     (candidate("departureScheduleGateEstimated") ? null : candidate("departureScheduleRunwayOriginal"));
   for (const field of gateDepartureFields.slice(1)) {
@@ -105,11 +111,10 @@ function validatedTimeline(flight: FlightRecord, now: number, timestampIssues: R
   }
   const runwayDeparture = choose(runwayDepartureFields);
   const departureBounds = [takeoff ?? runwayDeparture, pushback ?? departure,
-    // Rejection against another prediction must not erase a current departure
-    // estimate and accidentally validate an even earlier arrival.
-    ...(!pushback && !takeoff && !touchdown && !atGate ? [currentGateDeparture, currentRunwayDeparture] : [])
+    ...(!pushback && !takeoff && !touchdown && !atGate ? predictedDepartureBounds : [])
   ].filter((v): v is Candidate => v !== null);
   const runwayArrivalFields = ["arrivalScheduleRunwayActual", "arrivalScheduleRunwayEstimated", "arrivalScheduleRunwayOriginal"] as const;
+  const runwayArrivalBound = touchdown ?? candidate("arrivalScheduleRunwayEstimated") ?? candidate("arrivalScheduleRunwayOriginal");
   for (const field of runwayArrivalFields.slice(1)) {
     const value = candidate(field);
     // Once actual touchdown/at-gate is known, stale predictions are not bounds.
@@ -124,7 +129,7 @@ function validatedTimeline(flight: FlightRecord, now: number, timestampIssues: R
     const lowerDeparture = departureBounds.find((bound) => value.ms < bound.ms);
     if (touchdown && value.ms < touchdown.ms) reject(field, "gate_arrival_precedes_touchdown", touchdown);
     else if (lowerDeparture) reject(field, "gate_arrival_precedes_departure", lowerDeparture);
-    else if (landing && value.ms < landing.ms) reject(field, "gate_arrival_precedes_runway_arrival", landing);
+    else if (runwayArrivalBound && value.ms < runwayArrivalBound.ms) reject(field, "gate_arrival_precedes_runway_arrival", runwayArrivalBound);
   }
   const gate = choose(gateArrivalFields);
   // Check every departure fallback against the established arrival evidence too.
