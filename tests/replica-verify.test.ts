@@ -1,3 +1,4 @@
+import { exportSyntheticBundle as exportReplicaBundle, receiverStorage } from "./replica-support.js";
 import { generateKeyPairSync } from "node:crypto";
 import {
   chmodSync,
@@ -14,7 +15,6 @@ import {
   REPLICA_DB_FILENAME,
   REPLICA_MANIFEST_FILENAME,
   computeFileSha256,
-  exportReplicaBundle,
   signReplicaManifest,
   verifyReplicaBundle,
   type ReplicaManifest,

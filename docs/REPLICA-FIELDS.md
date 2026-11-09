@@ -9,7 +9,7 @@
 To prevent credential leakage, schema injection, or SQLite free-page slack disclosure, replica generation never copies a raw `.db` file and never copies-then-deletes secret tables:
 
 1. **Consistent WAL-Aware Source Capture:** The exporter opens the explicitly specified source database in read-only mode and invokes Node's built-in `node:sqlite` `backup()` API into an isolated temporary staging file (`0700` directory). This captures a cross-table consistent snapshot including committed Write-Ahead Log (WAL) frames while excluding uncommitted writer transactions.
-2. **Brand-New Allowlist Construction:** The exporter opens the consistent backup inside a read transaction, validates that all required source tables and columns exist, and creates a **brand-new** SQLite file (`replica.db`) initialized from static DDL (`REPLICA_SCHEMA_VERSION = "flighty-replica-schema-v1"`). Only allowlisted columns and scope-filtered rows are inserted via parameterized statements, followed by `VACUUM` and immediate retirement of the temporary raw backup.
+2. **Brand-New Allowlist Construction:** The exporter opens the consistent backup inside a read transaction, validates that all required source tables and columns exist, and creates a **brand-new** SQLite file (`replica.db`) initialized from static DDL (`REPLICA_SCHEMA_VERSION = "flighty-replica-schema-v1"`). Only allowlisted columns and scope-filtered rows are inserted via parameterized statements, followed by `VACUUM`. Raw snapshots remain fully recoverable in explicit bounded private quarantine outside the transferable export parent. They contain the complete source, including credentials and deleted pages; moving them is not secure erasure. The core never spills them into system Trash or silently deletes history.
 
 ---
 
@@ -112,7 +112,7 @@ The replica schema (`flighty-replica-schema-v1`) contains **only** the following
 
 ### 2.6 `Airport` (13 columns) and `Airline` (10 columns)
 
-Reference catalogs exported with `deleted IS NULL`:
+Bounded reference catalogs retain deletion markers, including tombstones, because existing flight joins and IATA ambiguity checks see these rows:
 - **`Airport`**: `id`, `name`, `iata`, `icao`, `city`, `country`, `countryCode`, `timeZoneIdentifier`, `latitude`, `longitude`, `website`, `relevance`, `deleted`.
 - **`Airline`**: `id`, `name`, `iata`, `icao`, `alliance`, `website`, `callsign`, `formattedPhone`, `relevance`, `deleted`.
 
@@ -134,7 +134,7 @@ The following tables, columns, files, and SQLite structures are **never** read f
 - **`com.flightyapp.flighty.plist` (`syncInfoV2`)**: Legacy preferences plist containing sync URLs.
 - **`/Applications/Flighty.app/Contents/Info.plist` (`FlightyBuildToken`)**: App build token used only for write RPCs.
 - **Source schema SQL, views, triggers, virtual tables, and unknown tables/columns**: The receiver inspects `sqlite_master` and `PRAGMA table_info` and rejects any database containing views, triggers, extra indexes, or unallowlisted tables/columns.
-- **Soft-deleted records (`deleted IS NOT NULL`) and SQLite free-list pages**: Because `replica.db` is created afresh from static DDL and `VACUUM`ed, deleted rows and residual free pages from the source database never enter the output file.
+- **Soft-deleted itinerary/person records and source SQLite free-list pages**: Because `replica.db` is created afresh from static DDL and `VACUUM`ed, deleted itinerary/person rows and residual free pages from the source database never enter the output file. Airport/Airline reference tombstones are the deliberate exception.
 
 ---
 
@@ -153,7 +153,7 @@ The following tables, columns, files, and SQLite structures are **never** read f
    - **Privacy boundary on connected legs:** Exporting a referenced `departingFlightId` operational `Flight`/`ManualFlight` row for an owner-passenger connection **never** exports any unrelated friend-followed `UserFlight`, `UserManualFlight`, `Ticket`, or `Profile` row attached to that flight.
 4. **`Ticket` and `Profile` Filtering:**
    - `Ticket` rows are exported **only** when `(flightId, userId)` matches an exported `UserFlight` or `UserManualFlight` row.
-   - `Profile` rows are exported **only** when `userId` belongs to the pinned owner or an exported `isMyFlight = 1` shared passenger association.
+   - `Profile` rows are exported **only** for a user with an exported `isMyFlight = 1` passenger association; an owner-followed association alone does not justify a Profile.
 
 ---
 
@@ -164,3 +164,13 @@ All replica unit and integration tests (`tests/replica-*.test.ts`) build synthet
 - **Committed WAL vs. Uncommitted Transaction Exclusion:** A writer connection in `PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0` commits a flight row into the `-wal` file and opens an uncommitted transaction inserting a secret sentinel row. `exportReplicaBundle` captures the committed WAL row via `node:sqlite` `backup()` and excludes the uncommitted row.
 - **Byte-Level Secret and Deleted-Row Sentinel Absence:** Synthetic sources are seeded with `Account.authToken`, `SyncInfo.nextURL`, unknown columns, triggers/views, unrelated friend-followed rows, and hard-deleted/soft-deleted sentinel strings (`PRAGMA secure_delete = OFF`). Tests verify that the raw bytes of `replica.db` contain zero occurrences of any secret or deleted sentinel.
 - **Cached Read Handler Compatibility:** All cached read queries (`READ_CASES` and `FlightyDatabase` methods) execute directly against the exported `replica.db` fixture path and return identical results.
+
+## Storage and bounded native work contract
+
+`ExportReplicaBundleOptions` now requires `storage: ReplicaStorageAuthority`, `quarantineDir`, and an optional `storageBudget`. The authority supplies `mountPath`, `privateRootDir`, `expectedDevice`, explicit `approvedPaths`, and `validateMount(mountPath)`. The caller must establish actual volume identity; checking an ordinary directory is insufficient. There is no default host discovery or internal disk fallback. Every write path must be private and owned, with no symlink ancestor, and be within the approved root/device/paths. The receiver requires the same authority for its own private filesystem. Mount validation is repeated on public mutations.
+
+Raw quarantine must be outside the output parent, not merely outside the bundle. Transfer **exactly** `replica.db` and `manifest.json`; never copy a parent, staging, quarantine or source directory. Quarantine is recoverable full secret-bearing history. Default storage budgets are 512 MiB and 2,048 entries. When full, operations refuse until an operator retires data through an approved recoverable process. No background deletion or secure-erase claim exists. Custom cleanup callbacks and in-process backup callbacks are rejected by the bounded exporter.
+
+Native SQLite export and receiver validation execute in a separate process with a hard execution deadline (default 30 seconds, killed on expiry). The source snapshot is capped before backup (default 64 MiB); source rows are scanned incrementally with per-table and total limits before selection, and cells are capped in SQL before JavaScript materialization (default 16 KiB). Limits must be positive safe integers. Source schemas permit only ordinary allowlisted tables with plain columns, rejecting virtual/shadow/generated/CHECK/default-expression/collation/foreign-reference substitutions before content reads. Unknown ordinary source columns/tables are not exported. Stricter schemas can refuse an unsupported future app schema rather than evaluate it. SyncInfo overflow refuses export instead of hiding ambiguous freshness. UUID identities are canonical lowercase; non-UUID reference keys retain exact case. Nullable Connection IDs are supported with unambiguous leg keys.
+
+The receiver independently verifies logical keys, uniqueness, typed associations, selected tickets/passenger names, connection-leg closure and required references. A signature establishes pinned producer provenance, never proof of a Flighty login. A valid signed zero-flight account is supported; missing/empty/partial source files are errors.

@@ -1,3 +1,4 @@
+import { exportSyntheticBundle as exportReplicaBundle, receiverStorage } from "./replica-support.js";
 import { generateKeyPairSync } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -7,7 +8,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   REPLICA_TABLE_NAMES,
   ReplicaError,
-  exportReplicaBundle,
 } from "../src/replica/index.js";
 import { FlightyDatabase } from "../src/services/database.js";
 import { readDatabaseFreshness } from "../src/services/freshness.js";

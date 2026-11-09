@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import { isValidUuid } from "../services/validation.js";
 import { MAX_SYNC_INFO_ROWS } from "../services/freshness.js";
 import { createReplicaError } from "./cleanup.js";
 import type {
@@ -365,32 +366,20 @@ export interface SourceSchemaInspection {
 export function validateSourceDatabaseSchema(
   sourceDb: DatabaseSync
 ): SourceSchemaInspection {
-  let masterRows: Array<{ name?: unknown; type?: unknown }>;
-  try {
-    masterRows = sourceDb
-      .prepare(
-        "SELECT name, type FROM sqlite_master WHERE type = 'table'"
-      )
-      .all() as Array<{ name?: unknown; type?: unknown }>;
-  } catch {
-    throw createReplicaError(
-      "SOURCE_READ_ERROR",
-      "Could not inspect source SQLite database schema."
-    );
-  }
-
   const existingTables = new Set<string>();
-  for (const row of masterRows) {
-    if (typeof row.name === "string") {
-      existingTables.add(row.name);
+  let objects = 0;
+  for (const row of sourceDb.prepare("PRAGMA table_list").iterate()) {
+    if (++objects > 1024) throw createReplicaError("SOURCE_SCHEMA_INVALID", "Source schema object budget exceeded.");
+    if ((REPLICA_TABLE_NAMES as readonly unknown[]).includes(row.name)) {
+      if (row.type !== "table" || row.schema !== "main") throw createReplicaError("SOURCE_SCHEMA_INVALID", "Source allowlist requires ordinary main tables.");
+      existingTables.add(row.name as string);
     }
   }
-
-  if (existingTables.size === 0) {
-    throw createReplicaError(
-      "SOURCE_SCHEMA_INVALID",
-      "Source database schema validation failed: database contains no tables."
-    );
+  for (const name of REPLICA_TABLE_NAMES) {
+    const ddl = sourceDb.prepare("SELECT substr(sql, 1, 65537) AS sql FROM sqlite_master WHERE name = ? AND type = 'table'").get(name)?.sql;
+    if (typeof ddl !== "string" || ddl.length > 65536 || !/^CREATE\s+TABLE\b/i.test(ddl) || /\b(?:CHECK|GENERATED|VIRTUAL|REFERENCES|COLLATE|DEFAULT|AS)\b|--|\/\*/i.test(ddl)) {
+      throw createReplicaError("SOURCE_SCHEMA_INVALID", "Source missing required ordinary table or contains unsafe schema expressions.");
+    }
   }
 
   let ticketHasDeletedColumn = false;
@@ -405,10 +394,10 @@ export function validateSourceDatabaseSchema(
     }
 
     const spec = REPLICA_TABLES[tableName];
-    let tableInfo: Array<{ name?: unknown }>;
+    let tableInfo: Array<{ name?: unknown; hidden?: unknown }>;
     try {
       tableInfo = sourceDb
-        .prepare(`PRAGMA table_info(${tableName})`)
+        .prepare(`PRAGMA table_xinfo(${tableName})`)
         .all() as Array<{ name?: unknown }>;
     } catch {
       throw createReplicaError(
@@ -419,6 +408,7 @@ export function validateSourceDatabaseSchema(
 
     const colSet = new Set<string>();
     for (const colRow of tableInfo) {
+      if (colRow.hidden !== 0) throw createReplicaError("SOURCE_SCHEMA_INVALID", "Generated or hidden source columns are forbidden.");
       if (typeof colRow.name === "string") {
         colSet.add(colRow.name);
       }
@@ -464,28 +454,9 @@ export function validateReplicaDatabaseSchemaAndContents(
   const maxStringLength =
     limits.maxStringLength ?? DEFAULT_MAX_STRING_LENGTH;
 
-  // 1. SQLite integrity check
-  let integrityRow: { quick_check?: unknown } | undefined;
-  try {
-    integrityRow = db.prepare("PRAGMA quick_check(1)").get() as
-      | { quick_check?: unknown }
-      | undefined;
-  } catch {
-    throw createReplicaError(
-      "DB_INTEGRITY_FAILED",
-      "Replica SQLite database failed PRAGMA quick_check."
-    );
-  }
-  if (!integrityRow || integrityRow.quick_check !== "ok") {
-    throw createReplicaError(
-      "DB_INTEGRITY_FAILED",
-      "Replica SQLite database failed integrity verification."
-    );
-  }
-
   // 2. Inspect sqlite_master: reject any views, triggers, indexes, virtual tables, or unknown tables.
   const schemaObjects = db
-    .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master")
+    .prepare("SELECT type, name, tbl_name, substr(sql, 1, 65537) AS sql FROM sqlite_master LIMIT 11")
     .all() as Array<{
     type?: unknown;
     name?: unknown;
@@ -584,9 +555,29 @@ export function validateReplicaDatabaseSchemaAndContents(
     }
   }
 
+  // 1. SQLite integrity check
+  let integrityRow: { quick_check?: unknown } | undefined;
+  try {
+    integrityRow = db.prepare("PRAGMA quick_check(1)").get() as
+      | { quick_check?: unknown }
+      | undefined;
+  } catch {
+    throw createReplicaError(
+      "DB_INTEGRITY_FAILED",
+      "Replica SQLite database failed PRAGMA quick_check."
+    );
+  }
+  if (!integrityRow || integrityRow.quick_check !== "ok") {
+    throw createReplicaError(
+      "DB_INTEGRITY_FAILED",
+      "Replica SQLite database failed integrity verification."
+    );
+  }
+
   // 4. Verify row counts and row contents for each table.
   let totalRows = 0;
 
+  const content = {} as Record<ReplicaTableName, Record<string, unknown>[]>;
   for (const tableName of REPLICA_TABLE_NAMES) {
     const spec = REPLICA_TABLES[tableName];
     const expectedCount = manifest.rowCounts[tableName];
@@ -615,28 +606,12 @@ export function validateReplicaDatabaseSchemaAndContents(
       );
     }
 
-    const countRow = db
-      .prepare(`SELECT COUNT(*) AS cnt FROM ${tableName}`)
-      .get() as { cnt?: number } | undefined;
-    const actualCount = Number(countRow?.cnt ?? -1);
-    if (actualCount !== expectedCount) {
-      throw createReplicaError(
-        "DB_CONTENT_INVALID",
-        `Table '${tableName}' actual row count (${actualCount}) does not match signed manifest (${expectedCount}).`
-      );
-    }
-
+    const rows = readBoundedRows(db, tableName, spec.columns, "", limits);
+    const actualCount = rows.length;
+    content[tableName] = rows;
+    if (actualCount !== expectedCount) throw createReplicaError("DB_CONTENT_INVALID", "Replica row count disagrees with signed manifest.");
     totalRows += actualCount;
-    if (totalRows > maxTotalRows) {
-      throw createReplicaError(
-        "DB_CONTENT_INVALID",
-        `Total replica row count (${totalRows}) exceeds maximum allowed (${maxTotalRows}).`
-      );
-    }
-
-    const rows = db.prepare(`SELECT * FROM ${tableName}`).all() as Array<
-      Record<string, unknown>
-    >;
+    if (totalRows > maxTotalRows) throw createReplicaError("DB_CONTENT_INVALID", "Replica total row budget exceeded.");
 
     for (const row of rows) {
       for (const colSpec of spec.columns) {
@@ -645,7 +620,7 @@ export function validateReplicaDatabaseSchemaAndContents(
           continue;
         }
 
-        if (colSpec.name === "deleted") {
+        if (colSpec.name === "deleted" && tableName !== "Airport" && tableName !== "Airline") {
           throw createReplicaError(
             "DB_CONTENT_INVALID",
             `Replica table '${tableName}' contains a soft-deleted row (deleted IS NOT NULL).`
@@ -725,4 +700,85 @@ export function validateReplicaDatabaseSchemaAndContents(
       }
     }
   }
+  validateLogicalScope(content, manifest);
+}
+
+export function normalizeLogicalId(value: unknown): unknown {
+  return typeof value === "string" && isValidUuid(value) ? value.toLowerCase() : value;
+}
+
+/** Fixed ordinary-table scans bound JS allocations before any cell crosses the boundary. */
+export function readBoundedRows(db: DatabaseSync, table: ReplicaTableName, columns: readonly ReplicaColumnSpec[], where = "", limits: ReplicaValidationLimits = {}, normalizeIds = false): Record<string, unknown>[] {
+  const maxRows = table === "SyncInfo" ? Math.min(MAX_SYNC_INFO_ROWS, limits.maxRowsPerTable ?? DEFAULT_MAX_ROWS_PER_TABLE) : limits.maxRowsPerTable ?? DEFAULT_MAX_ROWS_PER_TABLE;
+  const maxCell = limits.maxCellBytes ?? 16384;
+  const maxBytes = limits.maxSourceDbBytes ?? limits.maxDbBytes ?? DEFAULT_MAX_DB_BYTES;
+  const maxMs = limits.maxOperationDurationMs ?? 30000;
+  const start = performance.now();
+  const oversized = columns.map(c => `length(CAST(${c.name} AS BLOB)) > ${maxCell}`).join(" OR ");
+  const selected = columns.map(c => `CASE WHEN length(CAST(${c.name} AS BLOB)) > ${maxCell} THEN NULL ELSE ${c.name} END AS ${c.name}`).join(", ");
+  const rows: Record<string, unknown>[] = [];
+  let bytes = 0;
+  for (const row of db.prepare(`SELECT ${selected}, (${oversized}) AS __oversize FROM ${table} NOT INDEXED ${where} LIMIT ${maxRows + 1}`).iterate()) {
+    if (row.__oversize || rows.length >= maxRows || performance.now() - start > maxMs) throw createReplicaError("EXPORT_BOUNDS_EXCEEDED", "SQLite row, cell, or work budget exceeded.");
+    delete row.__oversize;
+    for (const [key, value] of Object.entries(row)) {
+      bytes += typeof value === "string" ? Buffer.byteLength(value) : 8;
+      if (key === "id" || key.endsWith("Id")) {
+        if (!normalizeIds && normalizeLogicalId(value) !== value) throw createReplicaError("DB_CONTENT_INVALID", "Replica identifiers must use canonical UUID case.");
+        if (normalizeIds) row[key] = normalizeLogicalId(value) as never;
+      }
+    }
+    if (bytes > maxBytes) throw createReplicaError("EXPORT_BOUNDS_EXCEEDED", "SQLite materialization byte budget exceeded.");
+    rows.push(row);
+  }
+  return rows;
+}
+
+function validateLogicalScope(content: Record<ReplicaTableName, Record<string, unknown>[]>, manifest: ReplicaManifest): void {
+  const fail = () => { throw createReplicaError("DB_CONTENT_INVALID", "Replica logical keys or selection closure are invalid."); };
+  const key = (v: unknown): string => {
+    if (typeof v !== "string" || !v.trim() || v.includes("\0") || normalizeLogicalId(v) !== v) fail();
+    return v as string;
+  };
+  const pair = (a: unknown, b: unknown) => JSON.stringify([key(a), key(b)]);
+  const unique = (rows: Record<string, unknown>[], get: (r: Record<string, unknown>) => string) => {
+    const keys = new Set<string>();
+    for (const row of rows) { const k = get(row); if (keys.has(k)) fail(); keys.add(k); }
+    return keys;
+  };
+  const flights = unique([...content.Flight, ...content.ManualFlight], r => key(r.id));
+  const airports = unique(content.Airport, r => key(r.id));
+  const airlines = unique(content.Airline, r => key(r.id));
+  const tracked = new Set<string>(), owners = new Set<string>(), passengers = new Set<string>();
+  const associations = new Set<string>();
+  for (const [table, flightTable] of [["UserFlight", "Flight"], ["UserManualFlight", "ManualFlight"]] as const) {
+    const typed = new Set(content[flightTable].map(r => key(r.id)));
+    unique(content[table], r => pair(r.flightId, r.userId));
+    for (const row of content[table]) {
+      const fid = key(row.flightId), uid = key(row.userId);
+      if (!typed.has(fid)) fail();
+      if (!(uid === manifest.ownerUserId && (row.isMyFlight === 0 || row.isMyFlight === 1)) && !(manifest.includeSharedPassengers && uid !== manifest.ownerUserId && row.isMyFlight === 1)) fail();
+      tracked.add(fid); associations.add(pair(fid, uid));
+      if (row.isMyFlight === 1) { passengers.add(uid); if (uid === manifest.ownerUserId) owners.add(fid); }
+    }
+  }
+  const needed = new Set(tracked);
+  unique(content.Connection, r => r.id === null ? JSON.stringify([key(r.arrivingFlightId), key(r.departingFlightId), r.waitingAirportId]) : key(r.id));
+  for (const row of content.Connection) {
+    const a = key(row.arrivingFlightId), b = key(row.departingFlightId);
+    if (!flights.has(a) || !flights.has(b) || !(owners.has(a) || (tracked.has(a) && tracked.has(b)))) fail();
+    if (row.waitingAirportId !== null && !airports.has(key(row.waitingAirportId))) fail();
+    needed.add(a); needed.add(b);
+  }
+  for (const row of [...content.Flight, ...content.ManualFlight]) {
+    if (!needed.has(key(row.id)) || !airlines.has(key(row.airlineId)) || !airports.has(key(row.departureAirportId)) || !airports.has(key(row.scheduledArrivalAirportId))) fail();
+  }
+  unique(content.Ticket, r => pair(r.flightId, r.userId));
+  for (const row of content.Ticket) if (!associations.has(pair(row.flightId, row.userId))) fail();
+  unique(content.Profile, r => key(r.userId));
+  for (const row of content.Profile) if (!passengers.has(key(row.userId))) fail();
+}
+
+export function validateLimits(limits: ReplicaValidationLimits): void {
+  for (const value of Object.values(limits)) if (!Number.isSafeInteger(value) || value < 1 || value > 1024 * 1024 * 1024) throw createReplicaError("INVALID_CONFIG", "Replica limits must be bounded positive safe integers.");
 }

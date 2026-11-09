@@ -61,7 +61,10 @@ export type ReplicaErrorCode =
   | "ACCOUNT_TRANSITION_REQUIRED"
   | "NO_ACTIVE_GENERATION"
   | "ACTIVE_GENERATION_DAMAGED"
-  | "STORAGE_WRITE_FAILED";
+  | "STORAGE_WRITE_FAILED"
+  | "COMMIT_UNCERTAIN"
+  | "STORAGE_BUDGET_EXCEEDED"
+  | "OPERATION_TIMEOUT";
 
 export class ReplicaError extends Error {
   readonly code: ReplicaErrorCode;
@@ -97,11 +100,28 @@ export interface ReplicaManifest {
 
 export interface ReplicaValidationLimits {
   readonly maxDbBytes?: number;
+  readonly maxSourceDbBytes?: number;
+  readonly maxCellBytes?: number;
+  readonly maxOperationDurationMs?: number;
   readonly maxRowsPerTable?: number;
   readonly maxTotalRows?: number;
   readonly maxStringLength?: number;
   readonly maxCaptureDurationMs?: number;
   readonly maxFutureSkewMs?: number;
+}
+
+/** Caller-owned authority: must verify the mounted volume identity, not just its directory. */
+export interface ReplicaStorageAuthority {
+  readonly mountPath: string;
+  readonly privateRootDir: string;
+  readonly expectedDevice: number;
+  readonly approvedPaths: readonly string[];
+  readonly validateMount: (mountPath: string) => boolean;
+}
+
+export interface ReplicaStorageBudget {
+  readonly maxBytes?: number;
+  readonly maxEntries?: number;
 }
 
 export type MountCheckFn = (params: {
@@ -115,6 +135,10 @@ export type CleanupPathFn = (targetPath: string) => void;
 export interface ExportReplicaBundleOptions {
   /** Explicit absolute path to source SQLite database. Never defaults to real app path. */
   readonly sourceDbPath: string;
+  readonly storage: ReplicaStorageAuthority;
+  /** Private bounded quarantine, outside the output parent. No automatic deletion. */
+  readonly quarantineDir: string;
+  readonly storageBudget?: ReplicaStorageBudget;
   /** Explicit absolute path to target bundle directory (must not exist or must be empty). */
   readonly outputBundleDir: string;
   /** Optional explicit staging root directory (defaults to parent of outputBundleDir). */
@@ -196,12 +220,16 @@ export interface ReplicaReceiverFaultHooks {
     generationId: string
   ) => void;
   /** Called right before renaming state.json.tmp to state.json (can throw ENOSPC). */
+  readonly onFsync?: (boundary: string) => void;
+  readonly afterStateRename?: () => void;
   readonly beforeCommitStateFile?: (tempStatePath: string) => void;
 }
 
 export interface ReplicaReceiverConfig {
   /** Explicit absolute directory where receiver stores generations/, staging/, state.json, .trash/. */
   readonly stateRootDir: string;
+  readonly storage: ReplicaStorageAuthority;
+  readonly storageBudget?: ReplicaStorageBudget;
   /** Pinned Ed25519 public key (PEM or KeyObject). Required; no TOFU. */
   readonly publicKey: string | KeyObject;
   /** Optional pinned keyId; if omitted, derived from publicKey SPKI SHA-256. */

@@ -1,8 +1,10 @@
+import { runSqliteTask } from "./work.js";
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
   mkdirSync,
+  statSync,
   mkdtempSync,
   readdirSync,
   renameSync,
@@ -18,6 +20,7 @@ import {
   createReplicaError,
   retirePath,
   verifyMountAndSource,
+  validateStorage, measureStorage, isWithin, flushPath, publicReplicaError,
 } from "./cleanup.js";
 import {
   REPLICA_DB_FILENAME,
@@ -51,6 +54,7 @@ import {
   sanitizeLastSyncValue,
   validateReplicaDatabaseSchemaAndContents,
   validateSourceDatabaseSchema,
+  readBoundedRows, normalizeLogicalId, validateLimits,
 } from "./schema.js";
 import {
   ReplicaError,
@@ -69,7 +73,7 @@ function sanitizeColumnValue(
   if (value === null || value === undefined) {
     return null;
   }
-  if (colSpec.name === "deleted") {
+  if (colSpec.name === "deleted" && tableName !== "Airport" && tableName !== "Airline") {
     return null;
   }
   if (colSpec.affinity === "TEXT") {
@@ -159,7 +163,7 @@ function insertRowsForSpec(
  * filters private rows to the declared owner and eligible shared passenger scope,
  * and signs the bundle manifest with Ed25519.
  */
-export async function exportReplicaBundle(
+export async function constructReplicaBundle(
   options: ExportReplicaBundleOptions
 ): Promise<ExportReplicaBundleResult> {
   if (!options || typeof options !== "object") {
@@ -207,7 +211,7 @@ export async function exportReplicaBundle(
     );
   }
 
-  const ownerUserId = (options.ownerUserId ?? "").trim();
+  const ownerUserId = (options.ownerUserId ?? "").trim().toLowerCase();
   if (!isValidUuid(ownerUserId)) {
     throw createReplicaError(
       "INVALID_CONFIG",
@@ -254,6 +258,7 @@ export async function exportReplicaBundle(
     sourceDbPath,
     outputDir: outputBundleDir,
     mountCheck: options.mountCheck,
+    storage: options.storage,
   });
 
   // Never overwrite an existing bundle directory or active database.
@@ -269,6 +274,7 @@ export async function exportReplicaBundle(
   }
 
   const limits = options.limits ?? {};
+  validateLimits(limits);
   const maxDbBytes = limits.maxDbBytes ?? DEFAULT_MAX_DB_BYTES;
   const maxRowsPerTable =
     limits.maxRowsPerTable ?? DEFAULT_MAX_ROWS_PER_TABLE;
@@ -280,18 +286,18 @@ export async function exportReplicaBundle(
     ? assertSafeAbsolutePath(options.stagingRootDir, "stagingRootDir")
     : dirname(outputBundleDir);
 
-  mkdirSync(stagingParent, { recursive: true, mode: 0o700 });
-  mkdirSync(dirname(outputBundleDir), { recursive: true, mode: 0o700 });
-
-  const workDir = mkdtempSync(
-    join(stagingParent, `.flighty-replica-export-${randomUUID().slice(0, 8)}-`)
-  );
-  chmodSync(workDir, 0o700);
-  const fallbackTrashDir = join(stagingParent, ".replica-export-trash");
+  const quarantineDir = assertSafeAbsolutePath(options.quarantineDir, "quarantineDir");
+  if (isWithin(quarantineDir, dirname(outputBundleDir)) || isWithin(dirname(outputBundleDir), quarantineDir)) throw createReplicaError("INVALID_PATH", "Raw quarantine must be separate from the transferable export parent.");
+  validateStorage(options.storage, [stagingParent, dirname(outputBundleDir), quarantineDir]);
+  if (existsSync(outputBundleDir)) validateStorage(options.storage, [outputBundleDir], false);
+  const maxSourceBytes = limits.maxSourceDbBytes ?? DEFAULT_MAX_DB_BYTES;
+  measureStorage(quarantineDir, options.storageBudget, maxSourceBytes + maxDbBytes * 3 + 262144, 16);
+  const workDir = mkdtempSync(join(quarantineDir, ".flighty-replica-export-"));
+  const fallbackTrashDir = quarantineDir;
   const rawBackupDir = join(workDir, "raw-backup");
   const stagedBundleDir = join(workDir, "bundle");
-  mkdirSync(rawBackupDir, { recursive: true, mode: 0o700 });
-  mkdirSync(stagedBundleDir, { recursive: true, mode: 0o700 });
+  mkdirSync(rawBackupDir, { mode: 0o700 });
+  mkdirSync(stagedBundleDir, { mode: 0o700 });
 
   const rawBackupPath = join(rawBackupDir, "source-snapshot.db");
   const stagedDbPath = join(stagedBundleDir, REPLICA_DB_FILENAME);
@@ -316,6 +322,11 @@ export async function exportReplicaBundle(
         timeout: 5000,
         allowExtension: false,
       });
+      sourceDb.exec("PRAGMA trusted_schema = OFF; BEGIN");
+      validateSourceDatabaseSchema(sourceDb);
+      const pageCount = Number(sourceDb.prepare("PRAGMA page_count").get()?.page_count);
+      const pageSize = Number(sourceDb.prepare("PRAGMA page_size").get()?.page_size);
+      if (!Number.isSafeInteger(pageCount * pageSize) || pageCount * pageSize > maxSourceBytes) throw createReplicaError("EXPORT_BOUNDS_EXCEEDED", "Source snapshot byte budget exceeded.");
       const pages = await sqliteBackup(sourceDb, rawBackupPath, {
         rate: 100,
         progress: ({ totalPages }) => {
@@ -379,7 +390,7 @@ export async function exportReplicaBundle(
         readOnly: true,
         allowExtension: false,
       });
-      backupDb.exec("BEGIN");
+      backupDb.exec("PRAGMA trusted_schema = OFF; BEGIN");
 
       const schemaInfo = validateSourceDatabaseSchema(backupDb);
 
@@ -392,31 +403,15 @@ export async function exportReplicaBundle(
       destDb.exec(CREATE_REPLICA_SCHEMA_SQL);
       destDb.exec("BEGIN");
 
-      const flightColList = FLIGHT_COLUMNS.map((c) => c.name).join(", ");
-      const manualFlightColList = MANUAL_FLIGHT_COLUMNS.map(
-        (c) => c.name
-      ).join(", ");
-      const ufColList = USER_FLIGHT_COLUMNS.map((c) => c.name).join(", ");
-      const airportColList = AIRPORT_COLUMNS.map((c) => c.name).join(", ");
-      const airlineColList = AIRLINE_COLUMNS.map((c) => c.name).join(", ");
-      const ticketColList = TICKET_COLUMNS.map((c) => c.name).join(", ");
-      const profileColList = PROFILE_COLUMNS.map((c) => c.name).join(", ");
-      const connectionColList = CONNECTION_COLUMNS.map(
-        (c) => c.name
-      ).join(", ");
-
-      // Read non-deleted Flight and ManualFlight rows from backup.
-      const sourceFlights = backupDb
-        .prepare(
-          `SELECT ${flightColList} FROM Flight WHERE deleted IS NULL AND id IS NOT NULL`
-        )
-        .all() as Array<Record<string, unknown>>;
-
-      const sourceManualFlights = backupDb
-        .prepare(
-          `SELECT ${manualFlightColList} FROM ManualFlight WHERE deleted IS NULL AND id IS NOT NULL`
-        )
-        .all() as Array<Record<string, unknown>>;
+      let scannedRows = 0;
+      const read = (table: ReplicaTableName, where = "") => {
+        const rows = readBoundedRows(backupDb!, table, REPLICA_TABLES[table].columns, where, limits, true);
+        scannedRows += rows.length;
+        if (scannedRows > maxTotalRows) throw createReplicaError("EXPORT_BOUNDS_EXCEEDED", "Total source scan row budget exceeded.");
+        return rows;
+      };
+      const sourceFlights = read("Flight", "WHERE deleted IS NULL");
+      const sourceManualFlights = read("ManualFlight", "WHERE deleted IS NULL");
 
       const validFlightIds = new Set<string>();
       for (const row of sourceFlights) {
@@ -455,19 +450,8 @@ export async function exportReplicaBundle(
         return false;
       };
 
-      const sourceUserFlights = (
-        backupDb
-          .prepare(`SELECT ${ufColList} FROM UserFlight WHERE deleted IS NULL`)
-          .all() as Array<Record<string, unknown>>
-      ).filter(isEligibleUserFlightRow);
-
-      const sourceUserManualFlights = (
-        backupDb
-          .prepare(
-            `SELECT ${ufColList} FROM UserManualFlight WHERE deleted IS NULL`
-          )
-          .all() as Array<Record<string, unknown>>
-      ).filter(isEligibleUserFlightRow);
+      const sourceUserFlights = read("UserFlight", "WHERE deleted IS NULL").filter(isEligibleUserFlightRow);
+      const sourceUserManualFlights = read("UserManualFlight", "WHERE deleted IS NULL").filter(isEligibleUserFlightRow);
 
       const eligibleTrackedFlightIds = new Set<string>();
       const ownerPassengerFlightIds = new Set<string>();
@@ -482,7 +466,7 @@ export async function exportReplicaBundle(
         if (uid === ownerUserId && uf.isMyFlight === 1) {
           ownerPassengerFlightIds.add(fid);
         }
-        if (uid === ownerUserId || uf.isMyFlight === 1) {
+        if (uf.isMyFlight === 1) {
           eligibleProfileUserIds.add(uid);
         }
       }
@@ -490,19 +474,12 @@ export async function exportReplicaBundle(
       // Filter Connection rows:
       // 1. Inbound is owner passenger flight and outbound is a valid non-deleted flight (needed by getConnections), OR
       // 2. Both inbound and outbound are in eligibleTrackedFlightIds (needed by checkConnection).
-      const sourceConnections = (
-        backupDb
-          .prepare(
-            `SELECT ${connectionColList} FROM Connection WHERE deleted IS NULL`
-          )
-          .all() as Array<Record<string, unknown>>
-      ).filter((row) => {
+      const sourceConnections = read("Connection", "WHERE deleted IS NULL").filter((row) => {
         const id = row.id;
         const arrId = row.arrivingFlightId;
         const depId = row.departingFlightId;
         if (
-          typeof id !== "string" ||
-          id.trim().length === 0 ||
+          (id !== null && (typeof id !== "string" || id.trim().length === 0)) ||
           typeof arrId !== "string" ||
           typeof depId !== "string" ||
           !validFlightIds.has(arrId) ||
@@ -534,11 +511,7 @@ export async function exportReplicaBundle(
       const ticketWhere = schemaInfo.ticketHasDeletedColumn
         ? "WHERE deleted IS NULL"
         : "";
-      const sourceTickets = (
-        backupDb
-          .prepare(`SELECT ${ticketColList} FROM Ticket ${ticketWhere}`)
-          .all() as Array<Record<string, unknown>>
-      ).filter((row) => {
+      const sourceTickets = read("Ticket", ticketWhere).filter((row) => {
         const fid = row.flightId;
         const uid = row.userId;
         return (
@@ -552,33 +525,11 @@ export async function exportReplicaBundle(
       const profileWhere = schemaInfo.profileHasDeletedColumn
         ? "WHERE deleted IS NULL"
         : "";
-      const sourceProfiles = (
-        backupDb
-          .prepare(`SELECT ${profileColList} FROM Profile ${profileWhere}`)
-          .all() as Array<Record<string, unknown>>
-      ).filter(
-        (row) =>
-          typeof row.userId === "string" &&
-          eligibleProfileUserIds.has(row.userId)
-      );
-
-      // Reference tables: non-deleted Airport and Airline rows.
-      const sourceAirports = backupDb
-        .prepare(
-          `SELECT ${airportColList} FROM Airport WHERE deleted IS NULL`
-        )
-        .all() as Array<Record<string, unknown>>;
-
-      const sourceAirlines = backupDb
-        .prepare(
-          `SELECT ${airlineColList} FROM Airline WHERE deleted IS NULL`
-        )
-        .all() as Array<Record<string, unknown>>;
-
-      // SyncInfo: select ONLY lastSync (never nextURL), bounded by MAX_SYNC_INFO_ROWS.
-      const sourceSyncRows = backupDb
-        .prepare(`SELECT lastSync FROM SyncInfo LIMIT ${MAX_SYNC_INFO_ROWS}`)
-        .all() as Array<Record<string, unknown>>;
+      const sourceProfiles = read("Profile", profileWhere).filter(row => typeof row.userId === "string" && eligibleProfileUserIds.has(row.userId));
+      // Keep the bounded reference catalog including tombstones: joins and IATA ambiguity see them.
+      const sourceAirports = read("Airport");
+      const sourceAirlines = read("Airline");
+      const sourceSyncRows = read("SyncInfo");
 
       // Insert into brand-new destination database.
       rowCounts.Airline = insertRowsForSpec(
@@ -697,7 +648,7 @@ export async function exportReplicaBundle(
       } catch {
         // Ignore close errors.
       }
-      // Always retire the raw backup immediately so unallowlisted source pages never linger.
+      // Full raw pages remain recoverable in bounded private quarantine, never in an export parent.
       retirePath(rawBackupDir, fallbackTrashDir, options.cleanupPath);
     }
 
@@ -764,7 +715,13 @@ export async function exportReplicaBundle(
     if (existsSync(outputBundleDir)) {
       retirePath(outputBundleDir, fallbackTrashDir, options.cleanupPath);
     }
+    validateStorage(options.storage, [dirname(outputBundleDir), quarantineDir], false);
+    flushPath(stagedDbPath);
+    flushPath(stagedManifestPath);
+    flushPath(stagedBundleDir);
     renameSync(stagedBundleDir, outputBundleDir);
+    flushPath(dirname(outputBundleDir));
+    flushPath(workDir);
     published = true;
 
     return {
@@ -780,4 +737,15 @@ export async function exportReplicaBundle(
       // Do not touch if it wasn't created by us, since we checked non-empty before.
     }
   }
+}
+
+/** Public boundary validates caller authority before invoking the bounded native worker. */
+export async function exportReplicaBundle(options: ExportReplicaBundleOptions): Promise<ExportReplicaBundleResult> {
+  try {
+    validateLimits(options?.limits ?? {});
+    verifyMountAndSource({ requiredMountPath: options.requiredMountPath, sourceDbPath: options.sourceDbPath, outputDir: options.outputBundleDir, mountCheck: options.mountCheck, storage: options.storage });
+    if (options.cleanupPath || options.onAfterBackup) throw createReplicaError("INVALID_CONFIG", "Custom cleanup and in-process backup hooks are unsupported by bounded export.");
+    const privateKey = normalizeEd25519PrivateKey(options.signingPrivateKey).export({type: "pkcs8", format: "pem"});
+    return runSqliteTask<ExportReplicaBundleResult>({kind: "export", options: {...options, signingPrivateKey: privateKey}}, options.limits?.maxOperationDurationMs);
+  } catch (error) { throw publicReplicaError(error); }
 }

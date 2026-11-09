@@ -1,3 +1,4 @@
+import { exportSyntheticBundle as exportReplicaBundle, receiverStorage } from "./replica-support.js";
 import { generateKeyPairSync } from "node:crypto";
 import {
   chmodSync,
@@ -11,7 +12,6 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   ReplicaReceiver,
-  exportReplicaBundle,
   getActiveReplicaContext,
   getActiveReplicaDbPath,
   getActiveReplicaFreshness,
@@ -116,6 +116,7 @@ describe("replica core: publication boundaries, replay/resend, crash/ENOSPC reco
 
     const receiver1 = new ReplicaReceiver({
       stateRootDir,
+      storage: receiverStorage(stateRootDir),
       publicKey: PUB_KEY,
       producerId: "imac-exporter",
       accountId: "acct-1",
@@ -161,6 +162,7 @@ describe("replica core: publication boundaries, replay/resend, crash/ENOSPC reco
     currentClockMs = Date.parse("2026-11-08T21:10:10.000Z");
     const receiverRestarted = new ReplicaReceiver({
       stateRootDir,
+      storage: receiverStorage(stateRootDir),
       publicKey: PUB_KEY,
       producerId: "imac-exporter",
       accountId: "acct-1",
@@ -207,6 +209,7 @@ describe("replica core: publication boundaries, replay/resend, crash/ENOSPC reco
     // Replaying sequence=1 after another restart must ALSO be rejected with REPLAY_REJECTED!
     const receiverRestarted2 = new ReplicaReceiver({
       stateRootDir,
+      storage: receiverStorage(stateRootDir),
       publicKey: PUB_KEY,
       producerId: "imac-exporter",
       accountId: "acct-1",
@@ -229,6 +232,7 @@ describe("replica core: publication boundaries, replay/resend, crash/ENOSPC reco
 
     const baseConfig = {
       stateRootDir,
+      storage: receiverStorage(stateRootDir),
       publicKey: PUB_KEY,
       producerId: "imac-exporter",
       accountId: "acct-1",
@@ -344,6 +348,7 @@ describe("replica core: publication boundaries, replay/resend, crash/ENOSPC reco
 
     const receiver = new ReplicaReceiver({
       stateRootDir,
+      storage: receiverStorage(stateRootDir),
       publicKey: PUB_KEY,
       producerId: "imac-exporter",
       accountId: "acct-1",
@@ -407,6 +412,7 @@ describe("replica core: publication boundaries, replay/resend, crash/ENOSPC reco
       () =>
         new ReplicaReceiver({
           stateRootDir,
+      storage: receiverStorage(stateRootDir),
           publicKey: PUB_KEY,
           producerId: "imac-exporter",
           accountId: "acct-2",
@@ -421,6 +427,7 @@ describe("replica core: publication boundaries, replay/resend, crash/ENOSPC reco
     // Explicit account transition retires old account's generations and clears active + lastGood
     const transitionedReceiver = new ReplicaReceiver({
       stateRootDir,
+      storage: receiverStorage(stateRootDir),
       publicKey: PUB_KEY,
       producerId: "imac-exporter",
       accountId: "acct-2",
@@ -450,6 +457,7 @@ describe("replica core: publication boundaries, replay/resend, crash/ENOSPC reco
 
     const receiver = new ReplicaReceiver({
       stateRootDir,
+      storage: receiverStorage(stateRootDir),
       publicKey: PUB_KEY,
       producerId: "imac-exporter",
       accountId: "acct-1",

@@ -6,6 +6,8 @@ export {
   type ExportReplicaBundleOptions,
   type ExportReplicaBundleResult,
   type MountCheckFn,
+  type ReplicaStorageAuthority,
+  type ReplicaStorageBudget,
   type PersistedReceiverState,
   type ReplicaColumnAffinity,
   type ReplicaColumnSpec,
