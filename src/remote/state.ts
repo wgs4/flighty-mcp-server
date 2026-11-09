@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { KeyObject } from "node:crypto";
-import { idSchema, parseSchema, ProtocolError, timeSchema, verifyReceipt, verifyRequest, type Callers, type Receipt, type Signed, type SignedRequest } from "./protocol.js";
+import { digest, idSchema, parseSchema, ProtocolError, timeSchema, verifyReceipt, verifyRequest, type Callers, type Receipt, type Signed, type SignedRequest } from "./protocol.js";
 import type { StateRow } from "./store.js";
 
 export const RETENTION_MS = 86_400_000;
@@ -19,20 +19,44 @@ export type Queued = { request: SignedRequest; leaseUntil: number; receipt: Sign
 export function pinnedCallers(callers: Callers): Callers {
   return Object.fromEntries(Object.entries(callers).map(([id, policy]) => [id, { ...policy, capabilities: [...policy.capabilities] }]));
 }
+/** Cache only exact cryptographic proofs with immutable pinned keys, never state/authorization decisions.
+ * Every scan still authenticates the current DB/root and checks IDs, schemas, bindings and clock. */
+function retainedProofs(callers: Callers, macKey: KeyObject, now: () => number) {
+  const requests = new Set<string>(), receipts = new Set<string>();
+  const remember = (set: Set<string>, proof: string) => {
+    if (set.size >= 256) set.delete(set.values().next().value!);
+    set.add(proof);
+  };
+  return {
+    request(input: unknown) {
+      const proof = digest(input);
+      if (!requests.has(proof)) { const value = verifyRequest(input, callers, now(), true); remember(requests, proof); return value; }
+      const value = (input as SignedRequest).body;
+      if (value.issuedAt > now()) throw new ProtocolError("Retained request clock rejected.");
+      return value;
+    },
+    receipt(input: unknown, request: SignedRequest["body"]) {
+      const proof = digest(input) + digest(request);
+      if (!receipts.has(proof)) { const value = verifyReceipt(input, macKey, request); remember(receipts, proof); return value; }
+      return (input as Signed<Receipt>).body;
+    },
+  };
+}
 export function executorStateValidator(callers: Callers, macKey: KeyObject, now: () => number): (rows: readonly StateRow[]) => void {
+  const proofs = retainedProofs(callers, macKey, now);
   return rows => {
     const operations = new Map<string, StoredOperation>();
     for (const row of rows) {
       if (row.kind === "preview") continue;
       if (row.kind === "fence") {
-        const fence = parseSchema(fenceSchema, row.value), request = verifyRequest(fence.request, callers, now(), true);
+        const fence = parseSchema(fenceSchema, row.value), request = proofs.request(fence.request);
         if (row.id !== request.account) throw new ProtocolError("Durable unresolved account fence rejected.");
         continue;
       }
       if (row.kind !== "operation") throw new ProtocolError("Unexpected executor state kind.");
       const parsed = parseSchema(operationSchema, row.value);
-      const request = verifyRequest(parsed.request, callers, now(), true);
-      verifyReceipt(parsed.receipt, macKey, request);
+      const request = proofs.request(parsed.request);
+      proofs.receipt(parsed.receipt, request);
       if (row.id !== request.operationId) throw new ProtocolError("Durable operation ID mismatch.");
       operations.set(row.id, parsed as StoredOperation);
     }
@@ -49,13 +73,14 @@ export function executorStateValidator(callers: Callers, macKey: KeyObject, now:
   };
 }
 export function mailboxStateValidator(callers: Callers, macKey: KeyObject, now: () => number): (rows: readonly StateRow[]) => void {
+  const proofs = retainedProofs(callers, macKey, now);
   return rows => {
     for (const row of rows) {
       if (row.kind !== "mail") throw new ProtocolError("Unexpected mailbox state kind.");
-      const value = parseSchema(queuedSchema, row.value), request = verifyRequest(value.request, callers, now(), true);
+      const value = parseSchema(queuedSchema, row.value), request = proofs.request(value.request);
       if (row.id !== request.operationId || (value.leaseUntil !== 0 && (value.leaseUntil < request.issuedAt || value.leaseUntil > request.expiresAt + RETENTION_MS + 30_000))) throw new ProtocolError("Durable mailbox binding rejected.");
       if (value.receipt !== null) {
-        const receipt = verifyReceipt(value.receipt, macKey, request);
+        const receipt = proofs.receipt(value.receipt, request);
         if (!["succeeded", "failed", "unknown"].includes(receipt.state) || receipt.updatedAt < request.issuedAt) throw new ProtocolError("Durable terminal receipt rejected.");
       }
     }

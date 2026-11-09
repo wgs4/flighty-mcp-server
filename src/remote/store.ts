@@ -60,6 +60,7 @@ export class PrivateStore {
   private closed = false;
   private faulted = false;
   private inTransaction = false;
+  private transactionView?: Map<string, StateRow>;
   private pending = 0;
   private readonly consumers = new Set<string>();
   private validateState?: (rows: readonly StateRow[]) => void;
@@ -207,40 +208,49 @@ export class PrivateStore {
     this.ready(); if (this.consumers.has(name)) throw new ProtocolError("Store consumer is already active."); this.consumers.add(name);
   }
   get<T>(kind: string, id: string): T | undefined {
-    this.ready();
+    const rows = this.ready();
     if (typeof id !== "string" || !/^[A-Za-z0-9_-]{1,80}$/.test(id)) throw new ProtocolError();
-    return this.readRows().find(r => r.kind === kind && r.id === id)?.value as T | undefined;
+    const row = this.inTransaction ? this.transactionView!.get(kind + "\0" + id) : rows!.find(r => r.kind === kind && r.id === id);
+    return row ? structuredClone(row.value) as T : undefined;
   }
   list<T>(kind: string): Array<{ id: string; value: T }> {
-    this.ready(); return this.readRows().filter(r => r.kind === kind).map(r => ({ id: r.id, value: r.value as T }));
-  }
-  private readRows(): StateRow[] {
-    if (!this.inTransaction) return this.validateSnapshot();
-    // The outer transaction validated the committed snapshot; validate the complete new state at commit.
-    return this.parsed(this.rows());
+    const rows = this.ready() ?? [...this.transactionView!.values()];
+    return rows.filter(r => r.kind === kind).map(r => ({ id: r.id, value: structuredClone(r.value) as T }));
   }
   put(kind: string, id: string, value: unknown): void {
     if (!this.inTransaction) { this.transaction(() => this.put(kind, id, value)); return; }
     if (!/^[a-z][a-z-]{0,39}$/.test(kind) || !/^[A-Za-z0-9_-]{1,80}$/.test(id)) throw new ProtocolError();
-    const doc = boundedJson(value), existing = this.db.prepare("SELECT 1 FROM state WHERE kind=? AND id=?").get(kind, id);
+    const doc = boundedJson(value), existing = this.db.prepare("SELECT doc FROM state WHERE kind=? AND id=?").get(kind, id);
+    if (existing?.doc === doc) return;
     const count = this.db.prepare("SELECT COUNT(*) AS n FROM state").get()!;
     if (!existing && Number(count.n) >= this.maxRows) throw new ProtocolError("Durable queue capacity reached.");
     const tag = PrivateStore.mac(this.options, "row", canonical({ kind, id, doc }));
     this.db.prepare("INSERT OR REPLACE INTO state VALUES(?,?,?,?)").run(kind, id, doc, tag);
+    this.transactionView!.set(kind + "\0" + id, { kind, id, value: JSON.parse(doc) });
   }
   delete(kind: string, id: string): void {
     if (!this.inTransaction) { this.transaction(() => this.delete(kind, id)); return; }
     this.db.prepare("DELETE FROM state WHERE kind=? AND id=?").run(kind, id);
+    this.transactionView!.delete(kind + "\0" + id);
   }
   transaction<T>(fn: () => T): T {
-    this.ready();
+    this.ready(false);
     if (this.inTransaction) throw new ProtocolError("Nested state transaction rejected.");
     this.db.exec("BEGIN IMMEDIATE"); this.inTransaction = true;
     let committed = false;
     try {
       // Revalidate under the write lock: pre-lock validation alone permits a restored-state race.
-      try { this.validateSnapshot(); } catch (error) { this.faulted = true; throw error; }
-      const result = fn(), rows = this.rows();
+      let snapshot: StateRow[];
+      try { snapshot = this.validateSnapshot(); } catch (error) { this.faulted = true; throw error; }
+      this.transactionView = new Map(snapshot.map(row => [row.kind + "\0" + row.id, row]));
+      const before = this.db.prepare("SELECT total_changes() AS n").get()!.n;
+      const result = fn();
+      // A read-only/no-op transaction still authenticates under the lock, but publishes no new authority.
+      if (this.db.prepare("SELECT total_changes() AS n").get()!.n === before) {
+        this.db.exec("COMMIT"); committed = true;
+        return result;
+      }
+      const rows = this.rows();
       this.validateState?.(this.parsed(rows));
       const revision = this.meta().revision + 1;
       if (!Number.isSafeInteger(revision)) fail();
@@ -254,7 +264,7 @@ export class PrivateStore {
       if (!committed) { try { this.db.exec("ROLLBACK"); } catch { /* Preserve the original disk/transaction error. */ } }
       else this.faulted = true;
       throw error;
-    } finally { this.inTransaction = false; }
+    } finally { this.inTransaction = false; this.transactionView = undefined; }
   }
   private publishAnchor(revision: number, root: string): void {
     const info = lstatSync(this.options.path, { bigint: true });
@@ -279,11 +289,12 @@ export class PrivateStore {
       if (!this.faulted) this.transaction(() => { this.db.prepare("DELETE FROM writer WHERE instance=?").run(this.instance); });
     } finally { this.db.close(); this.closed = true; }
   }
-  private ready(): void {
+  private ready(validate = true): StateRow[] | undefined {
     if (this.closed || this.faulted) throw new ProtocolError("Durable state unavailable; operator recovery required.");
     this.options.checkLocation();
-    if (!this.inTransaction) {
-      try { this.validateSnapshot(); } catch (error) { this.faulted = true; throw error; }
+    if (!this.inTransaction && validate) {
+      try { return this.validateSnapshot(); } catch (error) { this.faulted = true; throw error; }
     }
+    return undefined;
   }
 }

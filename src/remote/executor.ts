@@ -59,22 +59,14 @@ export function substantiveRemoval(target: ReturnType<typeof removalTarget>): un
 export class MacExecutor {
   private readonly now: () => number;
   private readonly unresolvedAccounts = new Set<string>();
+  private readonly activeOperations = new Set<string>();
   constructor(private readonly deps: ExecutorDeps) {
     if (deps.bindingKey.length < 32) throw new ProtocolError("Private binding key is too short.");
     this.now = deps.now ?? Date.now;
     deps.store.claimConsumer("mac-executor");
     deps.store.setValidator(executorStateValidator(pinnedCallers(deps.callers), createPublicKey(deps.receiptKey), this.now));
-    // A previous process may have crossed the HTTP boundary. Never replay its operations.
-    deps.store.transaction(() => {
-      this.prune();
-      for (const { id, value } of deps.store.list<StoredOperation>("operation")) {
-        if (value.receipt.body.state === "dispatched") {
-          this.fence(value.request);
-          value.receipt = this.receipt(value.request.body, "unknown", undefined, "Dispatch outcome is unknown; account is fenced pending operator recovery. Do not automatically retry.");
-          deps.store.put("operation", id, value);
-        }
-      }
-    });
+    // Establish unresolved authority before any age-based cleanup.
+    deps.store.transaction(() => { this.recoverInterrupted(); this.prune(); });
   }
   /** Durable submission; identical concurrent IDs return the last committed receipt. */
   async submit(input: SignedRequest): Promise<Signed<Receipt>> {
@@ -85,6 +77,7 @@ export class MacExecutor {
       if (digest(saved.request.body) !== digest(req)) throw new ProtocolError("Operation ID conflicts with its durable binding.");
       return ["not-dispatched", "dispatched"].includes(saved.receipt.body.state) ? this.run(req.operationId) : saved.receipt;
     }
+    if (req.expiresAt + RETENTION_MS <= this.now()) throw new ProtocolError("Operation history is no longer retained; outcome unavailable. Do not automatically retry.");
     if (req.expiresAt <= this.now()) {
       const receipt = this.receipt(req, "failed", undefined, "Request expired. Nothing dispatched.");
       this.deps.store.put("operation", req.operationId, { request: input, contextHash: "0".repeat(64), receipt } satisfies StoredOperation);
@@ -123,9 +116,14 @@ export class MacExecutor {
     }
   }
   /** Integration schedules this explicit sweep; this module starts no timers/services. */
-  maintenance(): void { this.deps.store.transaction(() => this.prune()); }
+  maintenance(): void { this.deps.store.transaction(() => { this.recoverInterrupted(); this.prune(); }); }
   private async run(id: string): Promise<Signed<Receipt>> {
     return this.deps.store.exclusive(async () => {
+      this.activeOperations.add(id);
+      try { return await this.execute(id); } finally { this.activeOperations.delete(id); }
+    });
+  }
+  private async execute(id: string): Promise<Signed<Receipt>> {
       const stored = this.deps.store.get<StoredOperation>("operation", id);
       if (!stored) throw new ProtocolError("Operation receipt is no longer retained; absence is not proof of failure. No dispatch.");
       if (stored.receipt.body.state !== "not-dispatched") return stored.receipt;
@@ -249,7 +247,6 @@ export class MacExecutor {
       const receipt = finish("succeeded", result);
       this.deps.boundary?.("receipt");
       return receipt;
-    });
   }
   private async step<T>(fn: (signal: AbortSignal) => Promise<T>, request?: SignedRequest): Promise<T> {
     const controller = new AbortController();
@@ -330,9 +327,18 @@ export class MacExecutor {
     return seal("receipt", { version: 1, operationId: req.operationId, caller: req.caller, account: req.account,
       requestDigest: digest(req), state, updatedAt: this.now(), ...(result === undefined ? {} : { result: redactResultSecrets(result, secrets) }), ...(error ? { error: sanitizeReceiptError(error, secrets) } : {}) }, this.deps.receiptKey);
   }
+  private recoverInterrupted(): void {
+    for (const { id, value } of this.deps.store.list<StoredOperation>("operation")) {
+      if (value.receipt.body.state === "dispatched" && !this.activeOperations.has(id)) {
+        this.fence(value.request);
+        value.receipt = this.receipt(value.request.body, "unknown", undefined, "Dispatch outcome is unknown; account is fenced pending operator recovery. Do not automatically retry.");
+        this.deps.store.put("operation", id, value);
+      }
+    }
+  }
   private prune(): void {
     const now = this.now();
-    for (const { id, value } of this.deps.store.list<StoredOperation>("operation")) if (value.request.body.expiresAt + RETENTION_MS <= now) this.deps.store.delete("operation", id);
+    for (const { id, value } of this.deps.store.list<StoredOperation>("operation")) if (value.receipt.body.state !== "dispatched" && !this.activeOperations.has(id) && value.request.body.expiresAt + RETENTION_MS <= now) this.deps.store.delete("operation", id);
     for (const { id, value } of this.deps.store.list<Preview>("preview")) if (value.expiresAt <= now) this.deps.store.delete("preview", id);
   }
 }
