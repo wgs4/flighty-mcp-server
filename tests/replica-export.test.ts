@@ -107,7 +107,7 @@ describe("replica core: WAL-consistent backup and allowlist exporter", () => {
         )
         .run(uncommittedWalFlightId, IDS.owner, uncommittedSentinelPnr);
 
-      const outputBundleDir = join(root, "exported-bundle");
+      const outputBundleDir = join(root, "exports", "exported-bundle");
       const exported = await exportReplicaBundle({
         sourceDbPath: fixture.mainPath,
         outputBundleDir,
@@ -297,7 +297,7 @@ describe("replica core: WAL-consistent backup and allowlist exporter", () => {
       true
     );
 
-    const outputBundleDir = join(root, "clean-bundle");
+    const outputBundleDir = join(root, "exports", "clean-bundle");
     const exported = await exportReplicaBundle({
       sourceDbPath: fixture.mainPath,
       outputBundleDir,
@@ -374,7 +374,7 @@ describe("replica core: WAL-consistent backup and allowlist exporter", () => {
   it("supports all cached MCP read queries and READ_CASES directly against exported replica.db", async () => {
     const root = makeTempDir();
     const fixture = createFixture(root);
-    const outputBundleDir = join(root, "read-cases-bundle");
+    const outputBundleDir = join(root, "exports", "read-cases-bundle");
 
     const exported = await exportReplicaBundle({
       sourceDbPath: fixture.mainPath,
@@ -463,7 +463,7 @@ describe("replica core: WAL-consistent backup and allowlist exporter", () => {
     const fixture = createFixture(root);
 
     // 1. Mount check failure (simulating unmounted PRO-G40) must fail without creating output.
-    const unmountedOut = join(root, "unmounted-bundle");
+    const unmountedOut = join(root, "exports", "unmounted-bundle");
     await expect(
       exportReplicaBundle({
         sourceDbPath: fixture.mainPath,
@@ -487,7 +487,7 @@ describe("replica core: WAL-consistent backup and allowlist exporter", () => {
     try {
       await exportReplicaBundle({
         sourceDbPath: symlinkDb,
-        outputBundleDir: join(root, "symlink-bundle"),
+        outputBundleDir: join(root, "exports", "symlink-bundle"),
         requiredMountPath: root,
         producerId: "imac-test-exporter",
         accountId: "acct-synthetic-1",
@@ -515,7 +515,7 @@ describe("replica core: WAL-consistent backup and allowlist exporter", () => {
     try {
       await exportReplicaBundle({
         sourceDbPath: badDbPath,
-        outputBundleDir: join(root, "bad-schema-bundle"),
+        outputBundleDir: join(root, "exports", "bad-schema-bundle"),
         requiredMountPath: root,
         producerId: "imac-test-exporter",
         accountId: "acct-synthetic-1",
@@ -542,7 +542,7 @@ describe("replica core: WAL-consistent backup and allowlist exporter", () => {
     try {
       await exportReplicaBundle({
         sourceDbPath: corruptPath,
-        outputBundleDir: join(root, "corrupt-bundle"),
+        outputBundleDir: join(root, "exports", "corrupt-bundle"),
         requiredMountPath: root,
         producerId: "imac-test-exporter",
         accountId: "acct-synthetic-1",
@@ -567,7 +567,7 @@ describe("replica core: WAL-consistent backup and allowlist exporter", () => {
     await expect(
       exportReplicaBundle({
         sourceDbPath: fakeContainerPath,
-        outputBundleDir: join(root, "container-bundle"),
+        outputBundleDir: join(root, "exports", "container-bundle"),
         requiredMountPath: root,
         producerId: "imac-test-exporter",
         accountId: "acct-synthetic-1",
@@ -581,8 +581,8 @@ describe("replica core: WAL-consistent backup and allowlist exporter", () => {
     });
 
     // 6. Refuses to overwrite an existing non-empty bundle directory.
-    const existingBundleDir = join(root, "existing-non-empty");
-    mkdirSync(existingBundleDir, { recursive: true });
+    const existingBundleDir = join(root, "exports", "existing-non-empty");
+    mkdirSync(existingBundleDir, { recursive: true, mode: 0o700 });
     writeFileSync(join(existingBundleDir, "replica.db"), "do-not-overwrite");
     await expect(
       exportReplicaBundle({
@@ -619,7 +619,7 @@ describe("replica core: WAL-consistent backup and allowlist exporter", () => {
 
     const exported = await exportReplicaBundle({
       sourceDbPath: fixture.mainPath,
-      outputBundleDir: join(root, "owner-only-bundle"),
+      outputBundleDir: join(root, "exports", "owner-only-bundle"),
       requiredMountPath: root,
       producerId: "imac-test-exporter",
       accountId: "acct-synthetic-1",

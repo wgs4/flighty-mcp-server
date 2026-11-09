@@ -8,15 +8,16 @@ const quarantines = new Set<string>();
 export function receiverStorage(path: string): ReplicaStorageAuthority {
   const root = dirname(path);
   chmodSync(root, 0o700);
-  return {mountPath: root, privateRootDir: root, expectedDevice: statSync(root).dev, approvedPaths: [root], validateMount: () => true};
+  return { mountPath: root, privateRootDir: root, expectedDevice: statSync(root).dev, approvedPaths: [root], validateMount: () => true };
 }
 export function exportSyntheticBundle(options: Omit<ExportReplicaBundleOptions, "storage" | "quarantineDir">) {
   const root = dirname(options.outputBundleDir);
   const parent = dirname(root);
   chmodSync(parent, 0o700);
+  mkdirSync(root, { recursive: true, mode: 0o700 });
   chmodSync(root, 0o700);
   const quarantineDir = join(parent, `${basename(root)}-private-quarantine`);
   quarantines.add(quarantineDir);
-  return exportReplicaBundle({...options, requiredMountPath: parent, storage: receiverStorage(root), quarantineDir});
+  return exportReplicaBundle({ ...options, requiredMountPath: parent, storage: receiverStorage(root), quarantineDir });
 }
 afterEach(() => { for (const path of quarantines) trashFixture(path); quarantines.clear(); });

@@ -355,6 +355,8 @@ export function sanitizeLastSyncValue(
 }
 
 export interface SourceSchemaInspection {
+  readonly ticketPresent: boolean;
+  readonly profilePresent: boolean;
   readonly ticketHasDeletedColumn: boolean;
   readonly profileHasDeletedColumn: boolean;
 }
@@ -370,12 +372,14 @@ export function validateSourceDatabaseSchema(
   let objects = 0;
   for (const row of sourceDb.prepare("PRAGMA table_list").iterate()) {
     if (++objects > 1024) throw createReplicaError("SOURCE_SCHEMA_INVALID", "Source schema object budget exceeded.");
+    if (typeof row.name === "string" && REPLICA_TABLE_NAMES.some(name => name.toLowerCase() === (row.name as string).toLowerCase()) && !(REPLICA_TABLE_NAMES as readonly unknown[]).includes(row.name)) throw createReplicaError("SOURCE_SCHEMA_INVALID", "Source table names do not match the supported schema.");
     if ((REPLICA_TABLE_NAMES as readonly unknown[]).includes(row.name)) {
       if (row.type !== "table" || row.schema !== "main") throw createReplicaError("SOURCE_SCHEMA_INVALID", "Source allowlist requires ordinary main tables.");
       existingTables.add(row.name as string);
     }
   }
   for (const name of REPLICA_TABLE_NAMES) {
+    if ((name === "Ticket" || name === "Profile") && !existingTables.has(name)) continue;
     const ddl = sourceDb.prepare("SELECT substr(sql, 1, 65537) AS sql FROM sqlite_master WHERE name = ? AND type = 'table'").get(name)?.sql;
     if (typeof ddl !== "string" || ddl.length > 65536 || !/^CREATE\s+TABLE\b/i.test(ddl) || /\b(?:CHECK|GENERATED|VIRTUAL|REFERENCES|COLLATE|DEFAULT|AS)\b|--|\/\*/i.test(ddl)) {
       throw createReplicaError("SOURCE_SCHEMA_INVALID", "Source missing required ordinary table or contains unsafe schema expressions.");
@@ -387,6 +391,7 @@ export function validateSourceDatabaseSchema(
 
   for (const tableName of REPLICA_TABLE_NAMES) {
     if (!existingTables.has(tableName)) {
+      if (tableName === "Ticket" || tableName === "Profile") continue;
       throw createReplicaError(
         "SOURCE_SCHEMA_INVALID",
         `Source database schema validation failed: missing required table '${tableName}'.`
@@ -432,6 +437,8 @@ export function validateSourceDatabaseSchema(
   }
 
   return {
+    ticketPresent: existingTables.has("Ticket"),
+    profilePresent: existingTables.has("Profile"),
     ticketHasDeletedColumn,
     profileHasDeletedColumn,
   };
@@ -458,11 +465,11 @@ export function validateReplicaDatabaseSchemaAndContents(
   const schemaObjects = db
     .prepare("SELECT type, name, tbl_name, substr(sql, 1, 65537) AS sql FROM sqlite_master LIMIT 11")
     .all() as Array<{
-    type?: unknown;
-    name?: unknown;
-    tbl_name?: unknown;
-    sql?: unknown;
-  }>;
+      type?: unknown;
+      name?: unknown;
+      tbl_name?: unknown;
+      sql?: unknown;
+    }>;
 
   const foundTables = new Map<string, string>();
   for (const obj of schemaObjects) {
@@ -537,7 +544,7 @@ export function validateReplicaDatabaseSchemaAndContents(
       );
     }
 
-    for (let i = 0; i < spec.columns.length; i++) {
+    for (let i = 0;i < spec.columns.length;i++) {
       const expectedCol = spec.columns[i];
       const actualCol = cols[i];
       if (
@@ -763,7 +770,8 @@ function validateLogicalScope(content: Record<ReplicaTableName, Record<string, u
     }
   }
   const needed = new Set(tracked);
-  unique(content.Connection, r => r.id === null ? JSON.stringify([key(r.arrivingFlightId), key(r.departingFlightId), r.waitingAirportId]) : key(r.id));
+  unique(content.Connection, r => pair(r.arrivingFlightId, r.departingFlightId));
+  unique(content.Connection.filter(r => r.id !== null), r => key(r.id));
   for (const row of content.Connection) {
     const a = key(row.arrivingFlightId), b = key(row.departingFlightId);
     if (!flights.has(a) || !flights.has(b) || !(owners.has(a) || (tracked.has(a) && tracked.has(b)))) fail();
@@ -780,5 +788,5 @@ function validateLogicalScope(content: Record<ReplicaTableName, Record<string, u
 }
 
 export function validateLimits(limits: ReplicaValidationLimits): void {
-  for (const value of Object.values(limits)) if (!Number.isSafeInteger(value) || value < 1 || value > 1024 * 1024 * 1024) throw createReplicaError("INVALID_CONFIG", "Replica limits must be bounded positive safe integers.");
+  for (const [name, value] of Object.entries(limits)) if (!Number.isSafeInteger(value) || value < (name === "maxFutureSkewMs" ? 0 : 1) || value > 1024 * 1024 * 1024) throw createReplicaError("INVALID_CONFIG", "Replica limits must be bounded positive safe integers.");
 }

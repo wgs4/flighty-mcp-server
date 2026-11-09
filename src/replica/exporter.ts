@@ -1,10 +1,8 @@
 import { runSqliteTask } from "./work.js";
-import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
   mkdirSync,
-  statSync,
   mkdtempSync,
   readdirSync,
   renameSync,
@@ -16,11 +14,12 @@ import { MAX_SYNC_INFO_ROWS } from "../services/freshness.js";
 import { isValidUuid } from "../services/validation.js";
 import {
   assertNoDatabaseSidecars,
+  assertRegularFileNoSymlink, assertNoSymlinkChain,
   assertSafeAbsolutePath,
   createReplicaError,
   retirePath,
   verifyMountAndSource,
-  validateStorage, measureStorage, isWithin, flushPath, publicReplicaError,
+  validateStorage, measureStorageGroups, isWithin, flushPath, publicReplicaError, directoryEntries,
 } from "./cleanup.js";
 import {
   REPLICA_DB_FILENAME,
@@ -54,7 +53,7 @@ import {
   sanitizeLastSyncValue,
   validateReplicaDatabaseSchemaAndContents,
   validateSourceDatabaseSchema,
-  readBoundedRows, normalizeLogicalId, validateLimits,
+  readBoundedRows, validateLimits,
 } from "./schema.js";
 import {
   ReplicaError,
@@ -194,7 +193,7 @@ export async function constructReplicaBundle(
   ];
 
   const producerId = (options.producerId ?? "").trim();
-  if (!producerId) {
+  if (!producerId || producerId.length > 256) {
     throw createReplicaError(
       "INVALID_CONFIG",
       "Explicit non-empty producerId is required.",
@@ -203,7 +202,7 @@ export async function constructReplicaBundle(
   }
 
   const accountId = (options.accountId ?? "").trim();
-  if (!accountId) {
+  if (!accountId || accountId.length > 256) {
     throw createReplicaError(
       "INVALID_CONFIG",
       "Explicit non-empty accountId is required.",
@@ -261,10 +260,12 @@ export async function constructReplicaBundle(
     storage: options.storage,
   });
 
+  validateStorage(options.storage, [outputBundleDir], false);
   // Never overwrite an existing bundle directory or active database.
   if (existsSync(outputBundleDir)) {
-    const existingEntries = readdirSync(outputBundleDir);
-    if (existingEntries.length > 0) {
+    let nonempty = false;
+    for (const _entry of directoryEntries(outputBundleDir)) { nonempty = true; break; }
+    if (nonempty) {
       throw createReplicaError(
         "OUTPUT_EXISTS",
         "Target outputBundleDir already exists and is non-empty; refusing in-place overwrite.",
@@ -290,8 +291,8 @@ export async function constructReplicaBundle(
   if (isWithin(quarantineDir, dirname(outputBundleDir)) || isWithin(dirname(outputBundleDir), quarantineDir)) throw createReplicaError("INVALID_PATH", "Raw quarantine must be separate from the transferable export parent.");
   validateStorage(options.storage, [stagingParent, dirname(outputBundleDir), quarantineDir]);
   if (existsSync(outputBundleDir)) validateStorage(options.storage, [outputBundleDir], false);
-  const maxSourceBytes = limits.maxSourceDbBytes ?? DEFAULT_MAX_DB_BYTES;
-  measureStorage(quarantineDir, options.storageBudget, maxSourceBytes + maxDbBytes * 3 + 262144, 16);
+  const maxSourceBytes = limits.maxSourceDbBytes ?? maxDbBytes;
+  measureStorageGroups([quarantineDir, dirname(outputBundleDir), stagingParent], options.storageBudget, maxSourceBytes + maxDbBytes * 3 + 262144, 16);
   const workDir = mkdtempSync(join(quarantineDir, ".flighty-replica-export-"));
   const fallbackTrashDir = quarantineDir;
   const rawBackupDir = join(workDir, "raw-backup");
@@ -400,6 +401,7 @@ export async function constructReplicaBundle(
       destDb.exec(
         "PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA secure_delete = ON; PRAGMA foreign_keys = OFF;"
       );
+      destDb.exec(`PRAGMA max_page_count = ${Math.max(1, Math.floor(maxDbBytes / 4096))}`);
       destDb.exec(CREATE_REPLICA_SCHEMA_SQL);
       destDb.exec("BEGIN");
 
@@ -511,7 +513,7 @@ export async function constructReplicaBundle(
       const ticketWhere = schemaInfo.ticketHasDeletedColumn
         ? "WHERE deleted IS NULL"
         : "";
-      const sourceTickets = read("Ticket", ticketWhere).filter((row) => {
+      const sourceTickets = (schemaInfo.ticketPresent ? read("Ticket", ticketWhere) : []).filter((row) => {
         const fid = row.flightId;
         const uid = row.userId;
         return (
@@ -525,7 +527,7 @@ export async function constructReplicaBundle(
       const profileWhere = schemaInfo.profileHasDeletedColumn
         ? "WHERE deleted IS NULL"
         : "";
-      const sourceProfiles = read("Profile", profileWhere).filter(row => typeof row.userId === "string" && eligibleProfileUserIds.has(row.userId));
+      const sourceProfiles = (schemaInfo.profilePresent ? read("Profile", profileWhere) : []).filter(row => typeof row.userId === "string" && eligibleProfileUserIds.has(row.userId));
       // Keep the bounded reference catalog including tombstones: joins and IATA ambiguity see them.
       const sourceAirports = read("Airport");
       const sourceAirlines = read("Airline");
@@ -626,7 +628,6 @@ export async function constructReplicaBundle(
       }
 
       destDb.exec("COMMIT;");
-      destDb.exec("VACUUM;");
       backupDb.exec("COMMIT;");
     } catch (err) {
       if (err instanceof ReplicaError) {
@@ -720,9 +721,9 @@ export async function constructReplicaBundle(
     flushPath(stagedManifestPath);
     flushPath(stagedBundleDir);
     renameSync(stagedBundleDir, outputBundleDir);
-    flushPath(dirname(outputBundleDir));
-    flushPath(workDir);
     published = true;
+    try { flushPath(dirname(outputBundleDir)); flushPath(workDir); }
+    catch { throw createReplicaError("COMMIT_UNCERTAIN", "Export bundle was renamed but its durability could not be confirmed."); }
 
     return {
       bundleDir: resolve(outputBundleDir),
@@ -745,7 +746,16 @@ export async function exportReplicaBundle(options: ExportReplicaBundleOptions): 
     validateLimits(options?.limits ?? {});
     verifyMountAndSource({ requiredMountPath: options.requiredMountPath, sourceDbPath: options.sourceDbPath, outputDir: options.outputBundleDir, mountCheck: options.mountCheck, storage: options.storage });
     if (options.cleanupPath || options.onAfterBackup) throw createReplicaError("INVALID_CONFIG", "Custom cleanup and in-process backup hooks are unsupported by bounded export.");
-    const privateKey = normalizeEd25519PrivateKey(options.signingPrivateKey).export({type: "pkcs8", format: "pem"});
-    return runSqliteTask<ExportReplicaBundleResult>({kind: "export", options: {...options, signingPrivateKey: privateKey}}, options.limits?.maxOperationDurationMs);
+    const maxSourceBytes = options.limits?.maxSourceDbBytes ?? options.limits?.maxDbBytes ?? DEFAULT_MAX_DB_BYTES;
+    let inputBytes = assertRegularFileNoSymlink(options.sourceDbPath, "source").size;
+    for (const suffix of ["-wal", "-shm", "-journal"]) {
+      const path = options.sourceDbPath + suffix;
+      // lstat-based chain validation also catches dangling sidecar links.
+      assertNoSymlinkChain(path, "source sidecar");
+      if (existsSync(path)) inputBytes += assertRegularFileNoSymlink(path, "source sidecar").size;
+    }
+    if (inputBytes > maxSourceBytes) throw createReplicaError("EXPORT_BOUNDS_EXCEEDED", "Source file and sidecar byte budget exceeded.");
+    const privateKey = normalizeEd25519PrivateKey(options.signingPrivateKey).export({ type: "pkcs8", format: "pem" });
+    return runSqliteTask<ExportReplicaBundleResult>({ kind: "export", options: { ...options, signingPrivateKey: privateKey } }, options.limits?.maxOperationDurationMs);
   } catch (error) { throw publicReplicaError(error); }
 }

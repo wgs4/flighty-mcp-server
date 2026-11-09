@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, renameSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, opendirSync, readdirSync, renameSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
 import { sanitizeToolErrorMessage } from "../services/tool-safety.js";
 import { ReplicaError, type CleanupPathFn, type MountCheckFn, type ReplicaErrorCode, type ReplicaStorageAuthority, type ReplicaStorageBudget } from "./types.js";
@@ -31,7 +31,7 @@ export function isWithin(path: string, root: string): boolean {
   return path === root || path.startsWith(`${root}${sep}`);
 }
 export function assertNoSymlinkChain(path: string, _label: string, _stop?: string): void {
-  for (let current = resolve(path); ; current = dirname(current)) {
+  for (let current = resolve(path);;current = dirname(current)) {
     if (statIfPresent(current)?.isSymbolicLink()) throw createReplicaError("INVALID_PATH", "Symbolic links are forbidden in replica paths.");
     if (dirname(current) === current) break;
   }
@@ -52,7 +52,7 @@ export function assertNoDatabaseSidecars(path: string, _label?: string): void {
 export function assertPrivatePath(path: string, root: string, device?: number): void {
   assertNoSymlinkChain(path, "storage");
   if (!isWithin(path, root)) throw createReplicaError("INVALID_PATH", "Replica storage escapes its private root.");
-  for (let current = path; ; current = dirname(current)) {
+  for (let current = path;;current = dirname(current)) {
     const st = statIfPresent(current);
     if (st && ((st.mode & 0o077) !== 0 || (typeof process.getuid === "function" && st.uid !== process.getuid()) || (device !== undefined && st.dev !== device) || (!st.isDirectory() && (!st.isFile() || st.nlink !== 1)))) {
       throw createReplicaError("INVALID_PATH", "Replica storage must be private, owned, on the approved device, and unlinked.");
@@ -69,10 +69,11 @@ export function validateStorage(authority: ReplicaStorageAuthority, paths: reado
   assertNoSymlinkChain(mount, "mount");
   let approved = false;
   try { approved = authority.validateMount(mount) === true; } catch { /* Fail closed. */ }
-  if (!approved || !statIfPresent(mount)?.isDirectory() || lstatSync(mount).dev !== authority.expectedDevice || !isWithin(root, mount)) {
+  if (!approved || !statIfPresent(mount)?.isDirectory() || (lstatSync(mount).mode & 0o022) !== 0 || lstatSync(mount).dev !== authority.expectedDevice || !isWithin(root, mount)) {
     throw createReplicaError("MOUNT_UNAVAILABLE", "Approved storage mount identity is unavailable.");
   }
-  for (const input of [root, ...paths]) {
+  assertPrivatePath(root, root, authority.expectedDevice);
+  for (const input of paths) {
     const path = assertSafeAbsolutePath(input, "storage path");
     if (!authority.approvedPaths.some(p => isWithin(path, assertSafeAbsolutePath(p, "approved path")))) throw createReplicaError("INVALID_PATH", "Replica path is outside explicitly approved storage paths.");
     assertPrivatePath(path, root, authority.expectedDevice);
@@ -81,14 +82,14 @@ export function validateStorage(authority: ReplicaStorageAuthority, paths: reado
     for (const path of [root, ...paths]) {
       // Create each component privately, rather than allowing recursive mkdir's intermediate defaults.
       const missing: string[] = [];
-      for (let current = path; !statIfPresent(current); current = dirname(current)) missing.unshift(current);
+      for (let current = path;!statIfPresent(current);current = dirname(current)) missing.unshift(current);
       for (const component of missing) mkdirSync(component, { mode: 0o700 });
       assertPrivatePath(path, root, authority.expectedDevice);
       if (!lstatSync(path).isDirectory()) throw createReplicaError("INVALID_PATH", "Replica storage path must be a directory.");
     }
   }
 }
-export function verifyMountAndSource(params: {requiredMountPath: string; sourceDbPath: string; outputDir: string; mountCheck?: MountCheckFn; storage?: ReplicaStorageAuthority}): void {
+export function verifyMountAndSource(params: { requiredMountPath: string; sourceDbPath: string; outputDir: string; mountCheck?: MountCheckFn; storage?: ReplicaStorageAuthority }): void {
   const source = assertSafeAbsolutePath(params.sourceDbPath, "source");
   const output = assertSafeAbsolutePath(params.outputDir, "output");
   if (source.includes("Library/Containers/com.flightyapp.flighty")) throw createReplicaError("INVALID_CONFIG", "Real application source paths remain gated.");
@@ -99,13 +100,20 @@ export function verifyMountAndSource(params: {requiredMountPath: string; sourceD
   const { size } = assertRegularFileNoSymlink(source, "source", "SOURCE_NOT_FOUND");
   if (size === 0) throw createReplicaError("SOURCE_NOT_FOUND", "Source database is empty.");
 }
+export function* directoryEntries(path: string): Generator<string> {
+  const dir = opendirSync(path);
+  try { for (;;) { const entry = dir.readSync(); if (!entry) break; yield entry.name; } }
+  finally { dir.closeSync(); }
+}
 export function assertExactBundle(path: string): void {
   assertNoSymlinkChain(path, "bundle");
-  const entries = readdirSync(path).sort();
+  const entries: string[] = [];
+  for (const entry of directoryEntries(path)) { entries.push(entry); if (entries.length > 2) break; }
+  entries.sort();
   if (entries.length !== 2 || entries[0] !== "manifest.json" || entries[1] !== "replica.db") throw createReplicaError("DB_CONTENT_INVALID", "Bundle must contain exactly replica.db and manifest.json.");
-  for (const entry of entries) assertRegularFileNoSymlink(join(path, entry), "bundle file");
+  for (const entry of entries) { assertRegularFileNoSymlink(join(path, entry), "bundle file"); assertPrivatePath(join(path, entry), path); }
 }
-export function measureStorage(path: string, budget: ReplicaStorageBudget = {}, reserveBytes = 0, reserveEntries = 0): {bytes: number; entries: number} {
+export function measureStorage(path: string, budget: ReplicaStorageBudget = {}, reserveBytes = 0, reserveEntries = 0): { bytes: number; entries: number } {
   const maxBytes = budget.maxBytes ?? 512 * 1024 * 1024;
   const maxEntries = budget.maxEntries ?? 2048;
   if (![maxBytes, maxEntries].every(n => Number.isSafeInteger(n) && n > 0)) throw createReplicaError("INVALID_CONFIG", "Invalid replica storage budget.");
@@ -117,19 +125,28 @@ export function measureStorage(path: string, budget: ReplicaStorageBudget = {}, 
     entries++;
     bytes += st.isFile() ? st.size : 0;
     if (bytes > maxBytes || entries > maxEntries) throw createReplicaError("STORAGE_BUDGET_EXCEEDED", "Private replica storage budget is full; operator retirement is required.");
-    if (st.isDirectory()) for (const name of readdirSync(target)) visit(join(target, name));
+    if (st.isDirectory()) for (const name of directoryEntries(target)) visit(join(target, name));
   };
   visit(path);
   if (bytes > maxBytes || entries > maxEntries) throw createReplicaError("STORAGE_BUDGET_EXCEEDED", "Private replica storage budget is full; operator retirement is required.");
-  return {bytes, entries};
+  return { bytes, entries };
+}
+export function measureStorageGroups(paths: readonly string[], budget: ReplicaStorageBudget = {}, reserveBytes = 0, reserveEntries = 0): void {
+  const unique = [...new Set(paths)].filter(path => !paths.some(other => other !== path && isWithin(path, other)));
+  let bytes = reserveBytes, entries = reserveEntries;
+  for (const path of unique) { const usage = measureStorage(path, budget); bytes += usage.bytes; entries += usage.entries; }
+  if (bytes > (budget.maxBytes ?? 512 * 1024 * 1024) || entries > (budget.maxEntries ?? 2048)) throw createReplicaError("STORAGE_BUDGET_EXCEEDED", "Private replica storage budget is full; operator retirement is required.");
 }
 /** Private recoverable quarantine only. Never deletes data or spills into system Trash. */
 export function retirePath(target: string, quarantine: string, _custom?: CleanupPathFn): void {
-  if (!statIfPresent(target)) return;
-  assertNoSymlinkChain(target, "retirement");
-  assertNoSymlinkChain(quarantine, "quarantine");
-  if (!statIfPresent(quarantine)?.isDirectory()) throw createReplicaError("INVALID_PATH", "Explicit private quarantine must exist.");
-  renameSync(target, join(quarantine, `${basename(target)}-${randomUUID()}`));
+  try {
+    if (_custom) throw createReplicaError("INVALID_CONFIG", "Custom retirement callbacks are unsupported.");
+    if (!statIfPresent(target)) return;
+    assertNoSymlinkChain(target, "retirement");
+    assertNoSymlinkChain(quarantine, "quarantine");
+    if (!statIfPresent(quarantine)?.isDirectory()) throw createReplicaError("INVALID_PATH", "Explicit private quarantine must exist.");
+    renameSync(target, join(quarantine, `${basename(target)}-${randomUUID()}`));
+  } catch (error) { throw publicReplicaError(error); }
 }
 export function flushPath(path: string, hook?: (boundary: string) => void, boundary = "file"): void {
   let fd: number | undefined;

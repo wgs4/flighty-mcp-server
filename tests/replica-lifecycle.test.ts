@@ -91,6 +91,7 @@ describe("replica core: publication boundaries, replay/resend, crash/ENOSPC reco
 
     const bundleDir = join(
       params.root,
+      "exports",
       `bundle-${params.label ?? `e${params.epoch ?? 1}-s${params.sequence}`}-${Date.now()}`
     );
     return exportReplicaBundle({
@@ -288,7 +289,7 @@ describe("replica core: publication boundaries, replay/resend, crash/ENOSPC reco
     });
     expect(() =>
       receiverBeforePublishCrash.acceptBundle(bundle2.bundleDir)
-    ).toThrow("Simulated crash beforePublishBundle");
+    ).toThrowError(expect.objectContaining({ code: "STORAGE_WRITE_FAILED" }));
     expect(
       receiverBeforePublishCrash.getStateSnapshot().highwaterSequence
     ).toBe(1);
@@ -304,7 +305,7 @@ describe("replica core: publication boundaries, replay/resend, crash/ENOSPC reco
     });
     expect(() =>
       receiverOrphanCrash.acceptBundle(bundle2.bundleDir)
-    ).toThrow("Simulated SIGKILL afterPublishBundleBeforeStateCommit");
+    ).toThrowError(expect.objectContaining({ code: "STORAGE_WRITE_FAILED" }));
 
     // Verify that the uncommitted orphan directory is sitting in generations/ prior to restart:
     expect(
@@ -412,7 +413,7 @@ describe("replica core: publication boundaries, replay/resend, crash/ENOSPC reco
       () =>
         new ReplicaReceiver({
           stateRootDir,
-      storage: receiverStorage(stateRootDir),
+          storage: receiverStorage(stateRootDir),
           publicKey: PUB_KEY,
           producerId: "imac-exporter",
           accountId: "acct-2",

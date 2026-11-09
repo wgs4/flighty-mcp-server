@@ -1,12 +1,10 @@
-import { randomUUID } from "node:crypto";
+import { runSqliteTask } from "./work.js";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
-   copyFileSync,
+  copyFileSync,
   existsSync,
-   closeSync,
-  fsyncSync,
   mkdirSync,
-  openSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -23,6 +21,7 @@ import {
   assertSafeAbsolutePath,
   createReplicaError,
   retirePath,
+  assertExactBundle, assertPrivatePath, validateStorage, measureStorage, flushPath, publicReplicaError,
 } from "./cleanup.js";
 import {
   buildReplicaFreshnessMetadata,
@@ -44,7 +43,7 @@ import {
   DEFAULT_MAX_DB_BYTES,
   REPLICA_SCHEMA_HASH,
   REPLICA_SCHEMA_VERSION,
-  validateReplicaDatabaseSchemaAndContents,
+  validateLimits,
 } from "./schema.js";
 import {
   ReplicaError,
@@ -61,40 +60,6 @@ const MAX_MANIFEST_BYTES = 256 * 1024;
 const STATE_FILENAME = "state.json";
 const STATE_FORMAT_VERSION = "flighty-replica-state-v1";
 
-function fsyncFileAndParentDir(filePath: string, dirPath: string): void {
-  let fd: number | undefined;
-  try {
-    fd = openSync(filePath, "r");
-    fsyncSync(fd);
-  } catch {
-    // Some filesystems do not support fsync on read descriptors; ignore best-effort.
-  } finally {
-    if (fd !== undefined) {
-      try {
-        closeSync(fd);
-      } catch {
-        // Ignore close error.
-      }
-    }
-  }
-
-  let dirFd: number | undefined;
-  try {
-    dirFd = openSync(dirPath, "r");
-    fsyncSync(dirFd);
-  } catch {
-    // Directory fsync is best-effort across OSes.
-  } finally {
-    if (dirFd !== undefined) {
-      try {
-        closeSync(dirFd);
-      } catch {
-        // Ignore close error.
-      }
-    }
-  }
-}
-
 /**
  * Verifies a replica bundle directory on disk:
  * - Path safety, symlink absence, and absence of SQLite WAL/SHM/journal sidecars
@@ -105,7 +70,7 @@ function fsyncFileAndParentDir(filePath: string, dirPath: string): void {
  * - SQLite quick_check, exact 10-table allowlist schema, zero views/triggers/extra indexes,
  *   exact row counts, value types, no soft-deleted rows, and no unrelated friend-followed rows.
  */
-export function verifyReplicaBundle(
+function verifyReplicaBundleInternal(
   options: VerifyReplicaBundleOptions
 ): VerifiedReplicaBundle {
   const bundleDir = assertSafeAbsolutePath(
@@ -113,6 +78,10 @@ export function verifyReplicaBundle(
     "bundleDir"
   );
   assertNoSymlinkChain(bundleDir, "bundleDir");
+  assertPrivatePath(bundleDir, bundleDir);
+  assertNoDatabaseSidecars(join(bundleDir, REPLICA_DB_FILENAME));
+  assertExactBundle(bundleDir);
+  validateLimits(options.limits ?? {});
 
   const manifestPath = join(bundleDir, REPLICA_MANIFEST_FILENAME);
   const dbPath = join(bundleDir, REPLICA_DB_FILENAME);
@@ -193,33 +162,7 @@ export function verifyReplicaBundle(
     );
   }
 
-  let db: DatabaseSync | undefined;
-  try {
-    db = new DatabaseSync(dbPath, {
-      readOnly: true,
-      allowExtension: false,
-    });
-    validateReplicaDatabaseSchemaAndContents(
-      db,
-      manifest,
-      options.limits
-    );
-  } catch (err) {
-    if (err instanceof ReplicaError) {
-      throw err;
-    }
-    throw createReplicaError(
-      "DB_INTEGRITY_FAILED",
-      "Failed to open or validate candidate replica SQLite database.",
-      pathsToRedact
-    );
-  } finally {
-    try {
-      db?.close();
-    } catch {
-      // Ignore close error.
-    }
-  }
+  runSqliteTask({ kind: "validate", dbPath, manifest, limits: options.limits }, options.limits?.maxOperationDurationMs);
 
   return {
     bundleDir,
@@ -230,6 +173,10 @@ export function verifyReplicaBundle(
   };
 }
 
+export function verifyReplicaBundle(options: VerifyReplicaBundleOptions): VerifiedReplicaBundle {
+  try { return verifyReplicaBundleInternal(options); } catch (error) { throw publicReplicaError(error); }
+}
+
 export class ReplicaReceiver {
   private readonly stateRootDir: string;
   private readonly generationsDir: string;
@@ -238,6 +185,8 @@ export class ReplicaReceiver {
   private readonly stateFilePath: string;
   private readonly config: ReplicaReceiverConfig;
   private readonly pinnedKeyId: string;
+  private readonly verificationKeyFingerprint: string;
+  private uncertain = false;
   private readonly expectedSchemaVersion: string;
   private readonly expectedSchemaHash: string;
   private readonly maxRetainedGenerations: number;
@@ -245,106 +194,119 @@ export class ReplicaReceiver {
   private readonly leaseCounts = new Map<string, number>();
 
   constructor(config: ReplicaReceiverConfig) {
-    if (!config || typeof config !== "object") {
-      throw createReplicaError(
-        "INVALID_CONFIG",
-        "ReplicaReceiver configuration object is required."
+    try {
+      if (!config || typeof config !== "object") {
+        throw createReplicaError(
+          "INVALID_CONFIG",
+          "ReplicaReceiver configuration object is required."
+        );
+      }
+
+      this.stateRootDir = assertSafeAbsolutePath(
+        config.stateRootDir,
+        "stateRootDir"
       );
-    }
+      assertNoSymlinkChain(this.stateRootDir, "stateRootDir");
 
-    this.stateRootDir = assertSafeAbsolutePath(
-      config.stateRootDir,
-      "stateRootDir"
-    );
-    assertNoSymlinkChain(this.stateRootDir, "stateRootDir");
+      const pubKey = normalizeEd25519PublicKey(config.publicKey);
+      this.verificationKeyFingerprint = createHash("sha256").update(pubKey.export({ type: "spki", format: "der" })).digest("hex");
+      this.pinnedKeyId =
+        config.expectedKeyId?.trim() || computePublicKeyId(pubKey);
 
-    const pubKey = normalizeEd25519PublicKey(config.publicKey);
-    this.pinnedKeyId =
-      config.expectedKeyId?.trim() || computePublicKeyId(pubKey);
+      const producerId = (config.producerId ?? "").trim();
+      if (!producerId || producerId.length > 256) {
+        throw createReplicaError(
+          "INVALID_CONFIG",
+          "Pinned producerId is required in receiver configuration."
+        );
+      }
 
-    const producerId = (config.producerId ?? "").trim();
-    if (!producerId) {
-      throw createReplicaError(
-        "INVALID_CONFIG",
-        "Pinned producerId is required in receiver configuration."
-      );
-    }
+      const accountId = (config.accountId ?? "").trim();
+      if (!accountId || accountId.length > 256) {
+        throw createReplicaError(
+          "INVALID_CONFIG",
+          "Pinned accountId is required in receiver configuration."
+        );
+      }
 
-    const accountId = (config.accountId ?? "").trim();
-    if (!accountId) {
-      throw createReplicaError(
-        "INVALID_CONFIG",
-        "Pinned accountId is required in receiver configuration."
-      );
-    }
+      const ownerUserId = (config.ownerUserId ?? "").trim().toLowerCase();
+      if (!isValidUuid(ownerUserId)) {
+        throw createReplicaError(
+          "INVALID_CONFIG",
+          "Pinned ownerUserId must be a valid UUID in receiver configuration."
+        );
+      }
 
-    const ownerUserId = (config.ownerUserId ?? "").trim();
-    if (!isValidUuid(ownerUserId)) {
-      throw createReplicaError(
-        "INVALID_CONFIG",
-        "Pinned ownerUserId must be a valid UUID in receiver configuration."
-      );
-    }
+      const operatorOverride = (config.operatorOwnerOverride ?? "").trim();
+      if (
+        operatorOverride.length > 0 &&
+        operatorOverride.toLowerCase() !== ownerUserId.toLowerCase()
+      ) {
+        throw createReplicaError(
+          "OWNER_MISMATCH",
+          "Configured operator owner override disagrees with the approved replica ownerUserId scope."
+        );
+      }
 
-    const operatorOverride = (config.operatorOwnerOverride ?? "").trim();
-    if (
-      operatorOverride.length > 0 &&
-      operatorOverride.toLowerCase() !== ownerUserId.toLowerCase()
-    ) {
-      throw createReplicaError(
-        "OWNER_MISMATCH",
-        "Configured operator owner override disagrees with the approved replica ownerUserId scope."
-      );
-    }
+      if (
+        typeof config.epoch !== "number" ||
+        !Number.isSafeInteger(config.epoch) ||
+        config.epoch < 1
+      ) {
+        throw createReplicaError(
+          "INVALID_CONFIG",
+          "Pinned epoch must be a positive safe integer (>= 1)."
+        );
+      }
 
-    if (
-      typeof config.epoch !== "number" ||
-      !Number.isSafeInteger(config.epoch) ||
-      config.epoch < 1
-    ) {
-      throw createReplicaError(
-        "INVALID_CONFIG",
-        "Pinned epoch must be a positive safe integer (>= 1)."
-      );
-    }
+      this.expectedSchemaVersion =
+        config.schemaVersion ?? REPLICA_SCHEMA_VERSION;
+      this.expectedSchemaHash = config.schemaHash ?? REPLICA_SCHEMA_HASH;
+      if (
+        this.expectedSchemaVersion !== REPLICA_SCHEMA_VERSION ||
+        this.expectedSchemaHash !== REPLICA_SCHEMA_HASH
+      ) {
+        throw createReplicaError(
+          "SCHEMA_MISMATCH",
+          "Receiver schemaVersion/schemaHash configuration does not match static allowlist schema."
+        );
+      }
 
-    this.expectedSchemaVersion =
-      config.schemaVersion ?? REPLICA_SCHEMA_VERSION;
-    this.expectedSchemaHash = config.schemaHash ?? REPLICA_SCHEMA_HASH;
-    if (
-      this.expectedSchemaVersion !== REPLICA_SCHEMA_VERSION ||
-      this.expectedSchemaHash !== REPLICA_SCHEMA_HASH
-    ) {
-      throw createReplicaError(
-        "SCHEMA_MISMATCH",
-        "Receiver schemaVersion/schemaHash configuration does not match static allowlist schema."
-      );
-    }
+      this.maxRetainedGenerations = config.maxRetainedGenerations ?? 2;
+      if (!Number.isSafeInteger(this.maxRetainedGenerations) || this.maxRetainedGenerations < 2 || this.maxRetainedGenerations > 64) throw createReplicaError("INVALID_CONFIG", "Generation retention must be between 2 and 64.");
+      validateLimits(config.limits ?? {});
 
-    this.maxRetainedGenerations = Math.max(
-      2,
-      config.maxRetainedGenerations ?? 2
-    );
+      if (config.cleanupPath) throw createReplicaError("INVALID_CONFIG", "Receiver cleanup is bounded private quarantine; custom deletion callbacks are unsupported.");
+      this.config = {
+        ...config,
+        publicKey: pubKey,
+        producerId,
+        accountId,
+        ownerUserId,
+      };
 
-    this.config = {
-      ...config,
-      publicKey: pubKey,
-      producerId,
-      accountId,
-      ownerUserId,
-    };
+      this.generationsDir = join(this.stateRootDir, "generations");
+      this.stagingDir = join(this.stateRootDir, "staging");
+      this.trashDir = join(this.stateRootDir, ".trash");
+      this.stateFilePath = join(this.stateRootDir, STATE_FILENAME);
 
-    this.generationsDir = join(this.stateRootDir, "generations");
-    this.stagingDir = join(this.stateRootDir, "staging");
-    this.trashDir = join(this.stateRootDir, ".trash");
-    this.stateFilePath = join(this.stateRootDir, STATE_FILENAME);
+      this.validateStore();
+      this.state = this.recoverAndLoadState();
+    } catch (error) { throw publicReplicaError(error); }
+  }
 
-    mkdirSync(this.stateRootDir, { recursive: true, mode: 0o700 });
-    mkdirSync(this.generationsDir, { recursive: true, mode: 0o700 });
-    mkdirSync(this.stagingDir, { recursive: true, mode: 0o700 });
-    mkdirSync(this.trashDir, { recursive: true, mode: 0o700 });
-
-    this.state = this.recoverAndLoadState();
+  private validateStore(): void {
+    const paths = [this.stateRootDir, this.generationsDir, this.stagingDir, this.trashDir];
+    validateStorage(this.config.storage, paths, false);
+    measureStorage(this.stateRootDir, this.config.storageBudget);
+    validateStorage(this.config.storage, paths);
+  }
+  private assertReady(): void {
+    if (this.uncertain) throw createReplicaError("COMMIT_UNCERTAIN", "Receiver commit durability is uncertain; restart and revalidate before further work.");
+    this.validateStore();
+  }
+  private bindingId(state: { producerId: string; accountId: string; ownerUserId: string; epoch: number } = this.config): string {
+    return createHash("sha256").update(JSON.stringify([state.producerId, state.accountId, state.ownerUserId.toLowerCase(), state.epoch])).digest("hex");
   }
 
   private createInitialState(): PersistedReceiverState {
@@ -356,6 +318,9 @@ export class ReplicaReceiver {
       epoch: this.config.epoch,
       schemaVersion: this.expectedSchemaVersion,
       schemaHash: this.expectedSchemaHash,
+      verificationKeyFingerprint: this.verificationKeyFingerprint,
+      keyId: this.pinnedKeyId,
+      bindingHighwaters: {},
       highwaterSequence: 0,
       activeGenerationId: null,
       lastGoodGenerationId: null,
@@ -364,139 +329,60 @@ export class ReplicaReceiver {
   }
 
   private recoverAndLoadState(): PersistedReceiverState {
-    // 1. Retire all uncommitted staging directories/files left from prior crashes.
-    for (const entry of readdirSync(this.stagingDir)) {
-      retirePath(
-        join(this.stagingDir, entry),
-        this.trashDir,
-        this.config.cleanupPath
-      );
+    let state = this.createInitialState();
+    if (!existsSync(this.stateFilePath)) {
+      if (readdirSync(this.generationsDir).length || readdirSync(this.stagingDir).length || readdirSync(this.trashDir).length) throw createReplicaError("STORAGE_WRITE_FAILED", "Receiver state is missing while prior storage exists; replay history cannot be reconstructed safely.");
+      this.writeStateFileAtomically(state);
     }
-
-    let loadedState: PersistedReceiverState | null = null;
     if (existsSync(this.stateFilePath)) {
-      assertRegularFileNoSymlink(
-        this.stateFilePath,
-        "state.json",
-        "STORAGE_WRITE_FAILED"
-      );
-      let raw: unknown;
-      try {
-        raw = JSON.parse(readFileSync(this.stateFilePath, "utf8"));
-      } catch {
-        throw createReplicaError(
-          "STORAGE_WRITE_FAILED",
-          "Persisted receiver state.json is corrupted or unreadable.",
-          [this.stateFilePath]
-        );
-      }
+      const { size } = assertRegularFileNoSymlink(this.stateFilePath, "state");
+      if (size > 2 * 1024 * 1024) throw createReplicaError("STORAGE_WRITE_FAILED", "Receiver state exceeds its byte budget.");
+      let raw: any;
+      try { raw = JSON.parse(readFileSync(this.stateFilePath, "utf8")); } catch { throw createReplicaError("STORAGE_WRITE_FAILED", "Receiver state is unreadable."); }
+      const invalid = () => { throw createReplicaError("STORAGE_WRITE_FAILED", "Receiver state structure or signed record is invalid."); };
+      const exactKeys = (value: object, keys: string[]) => Object.keys(value).length === keys.length && Object.keys(value).every(k => keys.includes(k));
+      const stateKeys = ["formatVersion", "producerId", "accountId", "ownerUserId", "epoch", "schemaVersion", "schemaHash", "verificationKeyFingerprint", "keyId", "bindingHighwaters", "highwaterSequence", "activeGenerationId", "lastGoodGenerationId", "acceptedBySequence"];
+      const recordKeys = ["generationId", "producerId", "accountId", "ownerUserId", "epoch", "sequence", "dbSha256", "manifestSha256", "bundleDirName", "receivedAt", "receivedAtMs", "manifest", "retainedOnDisk"];
+      if (!raw || typeof raw !== "object" || !exactKeys(raw, stateKeys) || [raw.producerId, raw.accountId, raw.keyId, raw.schemaVersion].some(v => typeof v !== "string" || !v.trim() || v.length > 256) || typeof raw.ownerUserId !== "string" || raw.ownerUserId !== raw.ownerUserId.toLowerCase()) invalid();
 
-      if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-        throw createReplicaError(
-          "STORAGE_WRITE_FAILED",
-          "Persisted receiver state.json must be a JSON object.",
-          [this.stateFilePath]
-        );
-      }
-
-      const s = raw as Record<string, unknown>;
-      if (
-        s.formatVersion !== STATE_FORMAT_VERSION ||
-        typeof s.producerId !== "string" ||
-        typeof s.accountId !== "string" ||
-        typeof s.ownerUserId !== "string" ||
-        typeof s.epoch !== "number" ||
-        typeof s.highwaterSequence !== "number" ||
-        !Number.isSafeInteger(s.highwaterSequence) ||
-        s.highwaterSequence < 0 ||
-        !s.acceptedBySequence ||
-        typeof s.acceptedBySequence !== "object" ||
-        Array.isArray(s.acceptedBySequence)
-      ) {
-        throw createReplicaError(
-          "STORAGE_WRITE_FAILED",
-          "Persisted receiver state.json has invalid structure.",
-          [this.stateFilePath]
-        );
-      }
-
-      const sameBinding =
-        s.producerId === this.config.producerId &&
-        s.accountId === this.config.accountId &&
-        s.ownerUserId.toLowerCase() ===
-          this.config.ownerUserId.toLowerCase() &&
-        s.epoch === this.config.epoch &&
-        s.schemaVersion === this.expectedSchemaVersion &&
-        s.schemaHash === this.expectedSchemaHash;
-
+      if (!raw || raw.formatVersion !== STATE_FORMAT_VERSION || typeof raw.producerId !== "string" || typeof raw.accountId !== "string" || typeof raw.ownerUserId !== "string" || !isValidUuid(raw.ownerUserId) || !Number.isSafeInteger(raw.epoch) || raw.epoch < 1 || !Number.isSafeInteger(raw.highwaterSequence) || raw.highwaterSequence < 0 || !/^[a-f0-9]{64}$/.test(raw.verificationKeyFingerprint ?? "") || typeof raw.keyId !== "string" || !raw.bindingHighwaters || typeof raw.bindingHighwaters !== "object" || Array.isArray(raw.bindingHighwaters) || Object.keys(raw.bindingHighwaters).length > 64) invalid();
+      for (const [binding, highwater] of Object.entries(raw.bindingHighwaters)) if (!/^[a-f0-9]{64}$/.test(binding) || !Number.isSafeInteger(highwater) || (highwater as number) < 0) invalid();
+      if ((raw.bindingHighwaters[this.bindingId(raw)] ?? 0) !== raw.highwaterSequence) invalid();
+      const sameBinding = raw.producerId === this.config.producerId && raw.accountId === this.config.accountId && raw.ownerUserId === this.config.ownerUserId && raw.epoch === this.config.epoch && raw.verificationKeyFingerprint === this.verificationKeyFingerprint && raw.keyId === this.pinnedKeyId && raw.schemaVersion === this.expectedSchemaVersion && raw.schemaHash === this.expectedSchemaHash;
       if (!sameBinding) {
-        if (!this.config.allowAccountTransition) {
-          throw createReplicaError(
-            "ACCOUNT_TRANSITION_REQUIRED",
-            "Persisted receiver state belongs to a different account, owner, producer, or epoch; explicit transition is required before serving or accepting data.",
-            [this.stateRootDir]
-          );
+        if (!this.config.allowAccountTransition) throw createReplicaError("ACCOUNT_TRANSITION_REQUIRED", "Explicit key, account, owner, producer, schema or epoch transition is required.");
+        if (Object.keys(raw.bindingHighwaters).length >= 64 && !(this.bindingId() in raw.bindingHighwaters)) throw createReplicaError("STORAGE_BUDGET_EXCEEDED", "Binding history is full; explicit storage migration is required.");
+        state = { ...state, bindingHighwaters: raw.bindingHighwaters, highwaterSequence: raw.bindingHighwaters[this.bindingId()] ?? 0 };
+        // Commit isolation first. A failure after rename never retires potentially referenced data.
+        this.writeStateFileAtomically(state);
+      } else {
+        if (!raw.acceptedBySequence || typeof raw.acceptedBySequence !== "object" || Array.isArray(raw.acceptedBySequence) || Object.keys(raw.acceptedBySequence).length > 256) invalid();
+        for (const [seq, rec] of Object.entries(raw.acceptedBySequence) as [string, any][]) {
+          if (!rec || typeof rec !== "object" || !exactKeys(rec, recordKeys) || String(rec.sequence) !== seq || !Number.isSafeInteger(rec.sequence) || rec.sequence < 1 || rec.sequence > raw.highwaterSequence || rec.retainedOnDisk !== true || typeof rec.bundleDirName !== "string" || !/^gen-e[1-9][0-9]{0,15}-s[1-9][0-9]{0,15}-[a-f0-9]{12}$/.test(rec.bundleDirName) || rec.generationId !== rec.bundleDirName || !Number.isSafeInteger(rec.receivedAtMs) || rec.receivedAtMs < 0 || typeof rec.receivedAt !== "string" || new Date(rec.receivedAtMs).toISOString() !== rec.receivedAt) invalid();
+          const manifest = parseReplicaManifestJson(JSON.stringify(rec.manifest));
+          verifyManifestSignatureAndClaims({ ...this.verificationOptions(""), manifest, checkFutureAgainstNow: false });
+          rec.manifest = manifest;
+          Object.freeze(rec);
+          if (manifest.sequence !== rec.sequence || manifest.epoch !== rec.epoch || manifest.producerId !== rec.producerId || manifest.accountId !== rec.accountId || manifest.ownerUserId !== rec.ownerUserId || rec.dbSha256 !== manifest.dbSha256 || rec.manifestSha256 !== computeManifestSha256(manifest) || rec.generationId !== this.generationId(manifest)) invalid();
         }
-
-        // Explicit account/epoch transition: retire all prior account generations
-        // so previous account's active or lastGood data can NEVER leak.
-        for (const entry of readdirSync(this.generationsDir)) {
-          retirePath(
-            join(this.generationsDir, entry),
-            this.trashDir,
-            this.config.cleanupPath
-          );
-        }
-        const transitioned = this.createInitialState();
-        this.writeStateFileAtomically(transitioned);
-        return transitioned;
-      }
-
-      loadedState = {
-        formatVersion: STATE_FORMAT_VERSION,
-        producerId: s.producerId,
-        accountId: s.accountId,
-        ownerUserId: s.ownerUserId,
-        epoch: s.epoch,
-        schemaVersion: String(s.schemaVersion),
-        schemaHash: String(s.schemaHash),
-        highwaterSequence: s.highwaterSequence,
-        activeGenerationId:
-          typeof s.activeGenerationId === "string"
-            ? s.activeGenerationId
-            : null,
-        lastGoodGenerationId:
-          typeof s.lastGoodGenerationId === "string"
-            ? s.lastGoodGenerationId
-            : null,
-        acceptedBySequence: s.acceptedBySequence as Record<
-          string,
-          AcceptedGenerationRecord
-        >,
-      };
-    }
-
-    const effectiveState = loadedState ?? this.createInitialState();
-
-    // 2. Retire any uncommitted orphan directories in generations/ that are not in state.json.
-    const committedDirNames = new Set<string>();
-    for (const rec of Object.values(effectiveState.acceptedBySequence)) {
-      if (rec && typeof rec.bundleDirName === "string") {
-        committedDirNames.add(rec.bundleDirName);
+        for (const pointer of [raw.activeGenerationId, raw.lastGoodGenerationId]) if (pointer !== null && (typeof pointer !== "string" || !Object.values(raw.acceptedBySequence).some((r: any) => r.generationId === pointer))) invalid();
+        if (raw.activeGenerationId !== null && !Object.values(raw.acceptedBySequence).some((r: any) => r.generationId === raw.activeGenerationId && r.sequence === raw.highwaterSequence)) invalid();
+        state = raw;
       }
     }
-
-    for (const entry of readdirSync(this.generationsDir)) {
-      if (!committedDirNames.has(entry)) {
-        retirePath(
-          join(this.generationsDir, entry),
-          this.trashDir,
-          this.config.cleanupPath
-        );
-      }
+    const committed = new Set(Object.values(state.acceptedBySequence).map(r => r.bundleDirName));
+    for (const dir of [this.stagingDir, this.generationsDir]) for (const entry of readdirSync(dir)) {
+      if (dir === this.generationsDir && committed.has(entry)) continue;
+      retirePath(join(dir, entry), this.trashDir);
     }
+    return state;
+  }
 
-    return effectiveState;
+  private generationId(manifest: import("./types.js").ReplicaManifest): string {
+    return `gen-e${manifest.epoch}-s${manifest.sequence}-${manifest.dbSha256.slice(0, 12)}`;
+  }
+  private verificationOptions(bundleDir: string): VerifyReplicaBundleOptions {
+    return { bundleDir, trustedPublicKey: this.config.publicKey, expectedKeyId: this.pinnedKeyId, expectedProducerId: this.config.producerId, expectedAccountId: this.config.accountId, expectedOwnerUserId: this.config.ownerUserId, operatorOwnerOverride: this.config.operatorOwnerOverride, expectedEpoch: this.config.epoch, expectedSchemaVersion: this.expectedSchemaVersion, expectedSchemaHash: this.expectedSchemaHash, limits: this.config.limits, now: this.config.now };
   }
 
   private writeStateFileAtomically(nextState: PersistedReceiverState): void {
@@ -506,23 +392,28 @@ export class ReplicaReceiver {
     );
     const pathsToRedact = [this.stateRootDir, this.stateFilePath, tmpPath];
 
+    let renamed = false;
     try {
+      this.validateStore();
       this.config.faultHooks?.beforeCommitStateFile?.(tmpPath);
-      const serialized = `${JSON.stringify(nextState, null, 2)}\n`;
-      writeFileSync(tmpPath, serialized, { encoding: "utf8", mode: 0o600 });
-      fsyncFileAndParentDir(tmpPath, this.stagingDir);
+      const serialized = `${JSON.stringify(nextState)}\n`;
+      if (Buffer.byteLength(serialized) > 2 * 1024 * 1024) throw createReplicaError("STORAGE_BUDGET_EXCEEDED", "Receiver state byte budget exceeded.");
+      writeFileSync(tmpPath, serialized, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      flushPath(tmpPath, this.config.faultHooks?.onFsync, "state-temp-file");
+      flushPath(this.stagingDir, this.config.faultHooks?.onFsync, "state-staging-dir");
       renameSync(tmpPath, this.stateFilePath);
-      fsyncFileAndParentDir(this.stateFilePath, this.stateRootDir);
-    } catch (err) {
-      retirePath(tmpPath, this.trashDir, this.config.cleanupPath);
-      if (err instanceof ReplicaError) {
-        throw err;
+      renamed = true;
+      this.config.faultHooks?.afterStateRename?.();
+      flushPath(this.stateRootDir, this.config.faultHooks?.onFsync, "state-root-dir");
+      flushPath(this.stagingDir, this.config.faultHooks?.onFsync, "state-source-dir");
+    } catch (error) {
+      if (renamed) {
+        this.state = nextState;
+        this.uncertain = true;
+        throw createReplicaError("COMMIT_UNCERTAIN", "Receiver state was renamed but durability could not be confirmed; restart required.");
       }
-      throw createReplicaError(
-        "STORAGE_WRITE_FAILED",
-        "Failed to commit receiver state.json atomically.",
-        pathsToRedact
-      );
+      retirePath(tmpPath, this.trashDir);
+      throw createReplicaError("STORAGE_WRITE_FAILED", "Receiver state could not be durably committed.");
     }
   }
 
@@ -551,26 +442,16 @@ export class ReplicaReceiver {
       rec.producerId !== this.config.producerId ||
       rec.accountId !== this.config.accountId ||
       rec.ownerUserId.toLowerCase() !==
-        this.config.ownerUserId.toLowerCase() ||
+      this.config.ownerUserId.toLowerCase() ||
       rec.epoch !== this.config.epoch
     ) {
       return false;
     }
 
-    const bundleDir = join(this.generationsDir, rec.bundleDirName);
-    const dbPath = join(bundleDir, REPLICA_DB_FILENAME);
     try {
-      assertNoSymlinkChain(bundleDir, "generation bundleDir", this.stateRootDir);
-      assertNoDatabaseSidecars(dbPath, "active replica database");
-      const { size } = assertRegularFileNoSymlink(dbPath, "replica.db");
-      if (size !== rec.manifest.dbBytes) {
-        return false;
-      }
-      const { sha256 } = computeFileSha256(dbPath);
-      return verifyExactHexDigest(sha256, rec.dbSha256);
-    } catch {
-      return false;
-    }
+      const verified = verifyReplicaBundle(this.verificationOptions(join(this.generationsDir, rec.bundleDirName)));
+      return rec.retainedOnDisk && verified.manifestSha256 === rec.manifestSha256 && verified.manifest.dbSha256 === rec.dbSha256 && verified.manifest.sequence === rec.sequence && this.generationId(verified.manifest) === rec.generationId;
+    } catch { return false; }
   }
 
   /**
@@ -581,11 +462,15 @@ export class ReplicaReceiver {
    * - Leaves accepted state intact on disk-full, partial transfer, or crash before state commit.
    */
   acceptBundle(sourceBundleDir: string): AcceptReplicaBundleResult {
+    try { this.assertReady(); return this.acceptBundleInternal(sourceBundleDir); } catch (error) { throw publicReplicaError(error); }
+  }
+  private acceptBundleInternal(sourceBundleDir: string): AcceptReplicaBundleResult {
     const cleanSourceDir = assertSafeAbsolutePath(
       sourceBundleDir,
       "sourceBundleDir"
     );
     assertNoSymlinkChain(cleanSourceDir, "sourceBundleDir");
+    assertExactBundle(cleanSourceDir);
 
     const srcManifestPath = join(
       cleanSourceDir,
@@ -628,6 +513,17 @@ export class ReplicaReceiver {
       );
     }
 
+    // Verify before allocating staging: identical resends do not accumulate full copies.
+    const incoming = verifyReplicaBundle(this.verificationOptions(cleanSourceDir));
+    const prior = this.state.acceptedBySequence[String(incoming.manifest.sequence)];
+    if (prior && incoming.manifest.sequence === this.state.highwaterSequence && prior.manifestSha256 === incoming.manifestSha256) {
+      if (!this.isGenerationHealthyOnDisk(prior)) throw createReplicaError("ACTIVE_GENERATION_DAMAGED", "Duplicate generation is damaged on disk.");
+      return { status: "duplicate_acknowledged", generationId: prior.generationId, epoch: prior.epoch, sequence: prior.sequence, receivedAt: prior.receivedAt, receivedAtMs: prior.receivedAtMs, captureStartedAt: prior.manifest.captureStartedAt, captureCompletedAt: prior.manifest.captureCompletedAt, dbPath: join(this.generationsDir, prior.bundleDirName, REPLICA_DB_FILENAME), manifest: prior.manifest, highwaterSequence: this.state.highwaterSequence };
+    }
+    if (prior && prior.manifestSha256 !== incoming.manifestSha256) throw createReplicaError("CONFLICTING_SEQUENCE", "Sequence was previously accepted with different content.");
+    if (incoming.manifest.sequence <= this.state.highwaterSequence) throw createReplicaError("REPLAY_REJECTED", "Sequence is not greater than the accepted highwater.");
+    if (Object.keys(this.state.acceptedBySequence).length >= 256) throw createReplicaError("STORAGE_BUDGET_EXCEEDED", "Leased generation history is full; release requests before accepting more data.");
+    measureStorage(this.stateRootDir, this.config.storageBudget, srcDbBytes + srcManifestBytes + 4 * 1024 * 1024, 16);
     const stageDir = join(
       this.stagingDir,
       `stage-${Date.now()}-${randomUUID()}`
@@ -746,13 +642,15 @@ export class ReplicaReceiver {
 
       // Seal replica.db read-only before publishing into generations/.
       chmodSync(stagedDbPath, 0o400);
-      fsyncFileAndParentDir(stagedDbPath, stageDir);
-      fsyncFileAndParentDir(stagedManifestPath, stageDir);
+      flushPath(stagedDbPath, this.config.faultHooks?.onFsync, "bundle-db");
+      flushPath(stagedManifestPath, this.config.faultHooks?.onFsync, "bundle-manifest");
+      flushPath(stageDir, this.config.faultHooks?.onFsync, "bundle-stage-dir");
 
       try {
         renameSync(stageDir, generationDir);
         publishedGenDir = generationDir;
-        fsyncFileAndParentDir(generationDir, this.generationsDir);
+        flushPath(this.generationsDir, this.config.faultHooks?.onFsync, "bundle-generations-dir");
+        flushPath(this.stagingDir, this.config.faultHooks?.onFsync, "bundle-source-dir");
       } catch (err) {
         if (err instanceof ReplicaError) {
           throw err;
@@ -803,6 +701,7 @@ export class ReplicaReceiver {
       const nextState: PersistedReceiverState = {
         ...this.state,
         highwaterSequence: manifest.sequence,
+        bindingHighwaters: { ...this.state.bindingHighwaters, [this.bindingId()]: manifest.sequence },
         activeGenerationId: generationId,
         lastGoodGenerationId: nextLastGoodId,
         acceptedBySequence: {
@@ -836,6 +735,7 @@ export class ReplicaReceiver {
       }
       if (
         !committed &&
+        !this.uncertain &&
         !simulatingAbruptCrash &&
         publishedGenDir &&
         existsSync(publishedGenDir)
@@ -855,6 +755,11 @@ export class ReplicaReceiver {
    * `allowStaleRecovery` is enabled).
    */
   acquireLease(): ReplicaLease {
+    try { return this.acquireLeaseInternal(); } catch (error) { throw publicReplicaError(error); }
+  }
+  private acquireLeaseInternal(): ReplicaLease {
+    this.assertReady();
+    if (this.getActiveLeaseCount() >= 1024) throw createReplicaError("STORAGE_BUDGET_EXCEEDED", "Replica lease budget exceeded.");
     const envOverride = (
       this.config.operatorOwnerOverride ??
       process.env.FLIGHTY_OWNER_USER_ID ??
@@ -937,13 +842,12 @@ export class ReplicaReceiver {
             "Cannot open database on a released replica lease."
           );
         }
-        return new DatabaseSync(dbPath, {
-          readOnly: true,
-          allowExtension: false,
-        });
+        try { return new DatabaseSync(dbPath, { readOnly: true, allowExtension: false }); }
+        catch (error) { throw publicReplicaError(error); }
       },
-      computeFreshness: (opts) =>
-        buildReplicaFreshnessMetadata({
+      computeFreshness: (opts) => {
+        if (released) throw createReplicaError("INVALID_CONFIG", "Cannot use a released replica lease.");
+        return buildReplicaFreshnessMetadata({
           manifest: selectedRec.manifest,
           generationId: genId,
           dbPath,
@@ -954,7 +858,8 @@ export class ReplicaReceiver {
           now: opts?.now ?? this.config.now,
           toolName: opts?.toolName,
           isError: opts?.isError,
-        }),
+        });
+      },
       release: () => {
         if (released) return;
         released = true;
@@ -995,6 +900,10 @@ export class ReplicaReceiver {
    * - Any generation with an active request lease (`leaseCounts.get(genId) > 0`).
    */
   cleanupOldGenerations(): string[] {
+    try { return this.cleanupOldGenerationsInternal(); } catch (error) { throw publicReplicaError(error); }
+  }
+  private cleanupOldGenerationsInternal(): string[] {
+    this.assertReady();
     const protectedIds = new Set<string>();
     if (this.state.activeGenerationId) {
       protectedIds.add(this.state.activeGenerationId);
@@ -1031,10 +940,7 @@ export class ReplicaReceiver {
       }
       const genDir = join(this.generationsDir, rec.bundleDirName);
       retirePath(genDir, this.trashDir, this.config.cleanupPath);
-      updatedMap[String(rec.sequence)] = {
-        ...rec,
-        retainedOnDisk: false,
-      };
+      delete updatedMap[String(rec.sequence)];
       retiredIds.push(rec.generationId);
     }
 

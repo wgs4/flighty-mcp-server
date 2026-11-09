@@ -20,5 +20,5 @@ try {
   process.stdout.write(JSON.stringify({ value }));
 } catch (error) {
   const safe = publicReplicaError(error);
-  process.stdout.write(JSON.stringify({ error: {code: safe.code, message: safe.message} }));
+  process.stdout.write(JSON.stringify({ error: { code: safe.code, message: safe.message } }));
 }

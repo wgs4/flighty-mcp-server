@@ -145,7 +145,7 @@ export interface ExportReplicaBundleOptions {
   readonly stagingRootDir?: string;
   /** Required mounted volume root (e.g. "/Volumes/PRO-G40"). Mandatory check before export. */
   readonly requiredMountPath: string;
-  /** Injectable mount/source check for synthetic tests. */
+  /** Optional additional check; never replaces the required storage identity authority. */
   readonly mountCheck?: MountCheckFn;
   /** Explicit producer identifier (e.g. "imac-flighty-exporter"). */
   readonly producerId: string;
@@ -169,11 +169,10 @@ export interface ExportReplicaBundleOptions {
   readonly captureCompletedAt?: Date | number | string;
   /** Optional validation/export size and row limits. */
   readonly limits?: ReplicaValidationLimits;
-  /** Optional injectable safe cleanup handler (defaults to trash / quarantine). */
+  /** Deprecated: supplied callbacks are rejected; retirement uses bounded private quarantine. */
   readonly cleanupPath?: CleanupPathFn;
   /**
-   * Optional test hook invoked after the SQLite backup completes and before reading from the backup.
-   * Useful for deterministic concurrent writer tests.
+   * Deprecated: in-process hooks are rejected by the killable native export boundary.
    */
   readonly onAfterBackup?: (info: { totalPages: number }) => void | Promise<void>;
 }
@@ -219,9 +218,11 @@ export interface ReplicaReceiverFaultHooks {
     generationDir: string,
     generationId: string
   ) => void;
-  /** Called right before renaming state.json.tmp to state.json (can throw ENOSPC). */
+  /** Called at each named file/directory flush boundary, immediately before fsync. */
   readonly onFsync?: (boundary: string) => void;
+  /** A throw here models uncertain commit after state rename. */
   readonly afterStateRename?: () => void;
+  /** Called before writing the new state temp file. */
   readonly beforeCommitStateFile?: (tempStatePath: string) => void;
 }
 
@@ -258,7 +259,7 @@ export interface ReplicaReceiverConfig {
   readonly limits?: ReplicaValidationLimits;
   /** Injectable clock for deterministic testing. */
   readonly now?: NowInput;
-  /** Injectable safe cleanup handler (defaults to trash / .trash quarantine). */
+  /** Deprecated: supplied callbacks are rejected; retirement uses bounded private quarantine. */
   readonly cleanupPath?: CleanupPathFn;
   /** Optional fault-injection hooks for crash/ENOSPC testing. */
   readonly faultHooks?: ReplicaReceiverFaultHooks;
@@ -289,6 +290,9 @@ export interface PersistedReceiverState {
   readonly epoch: number;
   readonly schemaVersion: string;
   readonly schemaHash: string;
+  readonly verificationKeyFingerprint: string;
+  readonly keyId: string;
+  readonly bindingHighwaters: Readonly<Record<string, number>>;
   readonly highwaterSequence: number;
   readonly activeGenerationId: string | null;
   readonly lastGoodGenerationId: string | null;

@@ -44,7 +44,7 @@ describe("replica core: manifest signing, pinned key/owner/schema verification, 
 
   async function buildValidBundle(root: string, sequence = 1) {
     const fixture = createFixture(root);
-    const bundleDir = join(root, `bundle-seq-${sequence}`);
+    const bundleDir = join(root, "exports", `bundle-seq-${sequence}`);
     return exportReplicaBundle({
       sourceDbPath: fixture.mainPath,
       outputBundleDir: bundleDir,
@@ -70,6 +70,7 @@ describe("replica core: manifest signing, pinned key/owner/schema verification, 
     }) => void
   ): string {
     cpSync(sourceBundleDir, targetBundleDir, { recursive: true });
+    chmodSync(targetBundleDir, 0o700);
     const dbPath = join(targetBundleDir, REPLICA_DB_FILENAME);
     const manifestPath = join(targetBundleDir, REPLICA_MANIFEST_FILENAME);
     chmodSync(dbPath, 0o600);

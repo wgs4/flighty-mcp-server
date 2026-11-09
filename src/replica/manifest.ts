@@ -7,7 +7,7 @@ import {
   verify as cryptoVerify,
   type KeyObject,
 } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { closeSync, openSync, readSync } from "node:fs";
 import { resolveNowMs, type NowInput } from "../services/freshness.js";
 import { isValidUuid } from "../services/validation.js";
 import { createReplicaError } from "./cleanup.js";
@@ -42,11 +42,15 @@ export function computeFileSha256(filePath: string): {
   sha256: string;
   bytes: number;
 } {
-  const buf = readFileSync(filePath);
-  return {
-    sha256: computeBufferSha256(buf),
-    bytes: buf.byteLength,
-  };
+  try {
+    const hash = createHash("sha256");
+    const buffer = Buffer.alloc(64 * 1024);
+    const fd = openSync(filePath, "r");
+    let bytes = 0;
+    try { for (;;) { const count = readSync(fd, buffer, 0, buffer.length, null); if (!count) break; bytes += count; hash.update(buffer.subarray(0, count)); } }
+    finally { closeSync(fd); }
+    return { sha256: hash.digest("hex"), bytes };
+  } catch { throw createReplicaError("STORAGE_WRITE_FAILED", "Could not hash replica file."); }
 }
 
 export function normalizeEd25519PrivateKey(
@@ -282,6 +286,9 @@ export function parseReplicaManifestJson(rawJson: string): ReplicaManifest {
   }
 
   const m = parsed as Record<string, unknown>;
+  const fields = ["formatVersion", "schemaVersion", "schemaHash", "producerId", "accountId", "ownerUserId", "ownerLabel", "includeSharedPassengers", "epoch", "sequence", "captureStartedAt", "captureCompletedAt", "dbFileName", "dbBytes", "dbSha256", "rowCounts", "keyId", "signatureAlgorithm", "signature"];
+  if (Object.keys(m).length !== fields.length || Object.keys(m).some(k => !fields.includes(k)) || [m.producerId, m.accountId, m.keyId, m.schemaVersion].some(v => typeof v !== "string" || v.length > 256)) throw createReplicaError("MANIFEST_INVALID", "Manifest fields or claim lengths are invalid.");
+
   if (m.formatVersion !== REPLICA_MANIFEST_FORMAT_VERSION) {
     throw createReplicaError(
       "MANIFEST_INVALID",
@@ -315,7 +322,7 @@ export function parseReplicaManifestJson(rawJson: string): ReplicaManifest {
       "Manifest accountId is missing or empty."
     );
   }
-  if (typeof m.ownerUserId !== "string" || !isValidUuid(m.ownerUserId)) {
+  if (typeof m.ownerUserId !== "string" || !isValidUuid(m.ownerUserId) || m.ownerUserId !== m.ownerUserId.toLowerCase()) {
     throw createReplicaError(
       "MANIFEST_INVALID",
       "Manifest ownerUserId must be a valid UUID."
@@ -577,7 +584,7 @@ export function verifyManifestSignatureAndClaims(params: {
   if (
     operatorOverride.length > 0 &&
     operatorOverride.toLowerCase() !==
-      params.expectedOwnerUserId.toLowerCase()
+    params.expectedOwnerUserId.toLowerCase()
   ) {
     throw createReplicaError(
       "OWNER_MISMATCH",
