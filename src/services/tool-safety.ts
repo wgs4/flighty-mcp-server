@@ -1,4 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { withSqliteBudget } from "../replica/work.js";
+import { getActiveReplicaLease, runWithReplicaLeaseContext } from "../replica/context.js";
+import type { ReplicaReceiver } from "../replica/receiver.js";
 import { homedir } from "node:os";
 import { z, type ZodTypeAny } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -132,7 +135,7 @@ export function sanitizeToolErrorMessage(rawMessage: string): string {
   );
 
   // Redact known configured paths and user home directory paths
-  for (const knownPath of [MAIN_DB_PATH, AUTH_DB_PATH, PREFS_PLIST_PATH]) {
+  for (const knownPath of [MAIN_DB_PATH, AUTH_DB_PATH, PREFS_PLIST_PATH, process.env.FLIGHTY_DB_PATH]) {
     if (knownPath) {
       msg = msg.split(knownPath).join("[redacted-path]");
     }
@@ -147,6 +150,10 @@ export function sanitizeToolErrorMessage(rawMessage: string): string {
     /\/(?:Users|home|Volumes|private\/var|var\/folders)\/[^\s"':;,)]*/g,
     "[redacted-path]"
   );
+
+  // Linux errors can contain configured paths outside home/volume prefixes.
+  // Paths are never actionable tool output; redact every remaining absolute path.
+  msg = msg.replace(/(^|[\s"'=:(])\/(?!\/)[^\s"'<>;,)]*/g, "$1[redacted-path]");
 
   // Collapse multi-line dumps and cap length
   msg = msg.replace(/\s+/g, " ").trim();
@@ -194,6 +201,7 @@ export function buildOwnerIdentityEnvelope(identity: OwnerIdentity) {
   return {
     user_id: identity.userId,
     source: identity.source,
+    ...(identity.source === "replica_producer" ? { provenance: identity } : {}),
     label: identity.label,
     is_fallback: identity.isFallback,
     is_shared_or_fallback: identity.isSharedOwner,
@@ -232,8 +240,9 @@ export function wrapToolResult(
   const effectiveNow =
     options.now !== undefined ? options.now : invocationStore?.nowMs;
 
+  const replica = getActiveReplicaLease()?.computeFreshness({ now: effectiveNow, toolName: effectiveToolName, isError });
   const freshness =
-    options.freshness ??
+    options.freshness ?? replica?.app_sync ??
     readDatabaseFreshness({
       toolName: effectiveToolName,
       isError,
@@ -295,6 +304,7 @@ export function wrapToolResult(
           trust_notice: UNTRUSTED_DATA_ENVELOPE_NOTICE,
           queried_at: freshness.queried_at,
           freshness,
+          ...(replica ? { replica } : {}),
         };
 
         if (isOwnerScoped && ownerIdentity) {
@@ -394,12 +404,16 @@ function isZodRawShape(
 export interface InstallToolSafetyOptions {
   dbPath?: string | null;
   now?: NowInput;
+  replicaReceiver?: ReplicaReceiver;
+  replicaBudget?: { acceptanceMs: number; sqliteTaskMs: number };
 }
 
 interface SafetyState {
   db?: FlightyDatabase;
   dbPath?: string | null;
   now?: NowInput;
+  replicaReceiver?: ReplicaReceiver;
+  replicaBudget?: { acceptanceMs: number; sqliteTaskMs: number };
 }
 
 function resolveDbPathForSafetyState(
@@ -409,6 +423,7 @@ function resolveDbPathForSafetyState(
     return state.dbPath;
   }
   if (state.db !== undefined) {
+    if (state.replicaReceiver) return getActiveReplicaLease()?.dbPath ?? null;
     const candidate = (state.db as unknown as { dbPath?: unknown })?.dbPath;
     if (typeof candidate === "string" && candidate.trim().length > 0) {
       return candidate;
@@ -450,6 +465,8 @@ export function installToolSafety(
     db,
     dbPath: options?.dbPath,
     now: options?.now,
+    replicaReceiver: options?.replicaReceiver,
+    replicaBudget: options?.replicaBudget,
   };
   installedServers.set(server as object, state);
 
@@ -584,7 +601,17 @@ export function installToolSafety(
       );
     };
 
-    return originalRegisterTool(name, safeConfig, wrappedHandler);
+    const completeHandler = async (args: Record<string, unknown> = {}, extra?: unknown) => {
+      if (!state.replicaReceiver) return wrappedHandler(args, extra);
+      let lease;
+      try { lease = withSqliteBudget(state.replicaBudget?.acceptanceMs ?? 90_000, state.replicaBudget?.sqliteTaskMs ?? 30_000, () => state.replicaReceiver!.acquireLease()); } catch {
+        if (!isOwnerScoped && !["flighty_search_airports", "flighty_search_airlines"].includes(name)) return wrappedHandler(args, extra);
+        return createSanitizedToolError(new Error("Replica unavailable. No verified generation for configured account."), { toolName: name, now: state.now });
+      }
+      try { return await runWithReplicaLeaseContext(lease, () => wrappedHandler(args, extra)); }
+      finally { lease.release(); }
+    };
+    return originalRegisterTool(name, safeConfig, completeHandler);
   };
 
   return server;

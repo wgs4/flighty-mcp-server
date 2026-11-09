@@ -28,8 +28,8 @@ export function buildReplicaOwnerIdentity(
 ): ReplicaOwnerProvenance {
   return Object.freeze({
     userId: manifest.ownerUserId,
-    source: "env_override",
-    label: "pinned_owner_override",
+    source: "replica_producer",
+    label: "replica_export_scope",
     isFallback: false,
     isSharedOwner: false,
     warning: REPLICA_OWNER_PROVENANCE_NOTE,

@@ -43,12 +43,14 @@ import type {
 export type OwnerIdentitySource =
   | "env_override"
   | "jwt_subject"
-  | "frequency_fallback";
+  | "frequency_fallback"
+  | "replica_producer";
 
 export type OwnerIdentityLabel =
   | "signed_in_owner"
   | "pinned_owner_override"
-  | "shared_or_fallback_owner";
+  | "shared_or_fallback_owner"
+  | "replica_export_scope";
 
 export interface OwnerIdentity {
   userId: string;
@@ -229,8 +231,15 @@ LEFT JOIN Ticket t ON f.id = t.flightId AND uf.userId = t.userId
 WHERE uf.deleted IS NULL AND f.deleted IS NULL AND uf.isMyFlight = 1
 `;
 
+export interface DatabaseContext {
+  dbPath: string;
+  openDatabase(): Database;
+  ownerIdentity: OwnerIdentity;
+}
+
 export class FlightyDatabase {
-  private dbPath: string;
+  private localDbPath: string;
+  get dbPath(): string { return this.contextProvider ? this.contextProvider().dbPath : this.localDbPath; }
   private authDbPath: string;
   private cachedOwnerId: string | null = null;
   private cachedOwner: {
@@ -242,13 +251,15 @@ export class FlightyDatabase {
 
   constructor(
     dbPath: string = MAIN_DB_PATH,
-    authDbPath: string = AUTH_DB_PATH
+    authDbPath: string = AUTH_DB_PATH,
+    private readonly contextProvider?: () => DatabaseContext
   ) {
-    this.dbPath = dbPath;
+    this.localDbPath = dbPath;
     this.authDbPath = authDbPath;
   }
 
   private getDb(): Database {
+    if (this.contextProvider) return this.contextProvider().openDatabase();
     if (!existsSync(this.dbPath)) {
       throw new Error(
         "Flighty database not found at configured path. Make sure the Flighty app is installed."
@@ -268,6 +279,7 @@ export class FlightyDatabase {
   }
 
   private resolveOwnerIdentity(db: Database): OwnerIdentity {
+    if (this.contextProvider) return this.recordResolvedIdentity(this.contextProvider().ownerIdentity);
     // Tier 0: FLIGHTY_OWNER_USER_ID env var — operator pin.
     const envOwner = (process.env.FLIGHTY_OWNER_USER_ID ?? "").trim();
     if (envOwner) {
@@ -675,6 +687,22 @@ export class FlightyDatabase {
     } finally {
       db.close();
     }
+  }
+
+  /** All account-bound candidates, including conflicting duplicates. Mac executor rejects ambiguity. */
+  getRemovalCandidates(flightId: string): RemovalLocalRecord[] {
+    if (!isValidUuid(flightId)) throw new Error("Invalid flight_id: expected UUID format.");
+    const db = this.getDb();
+    try {
+      const identity = this.resolveOwnerIdentity(db);
+      const query = FLIGHT_BASE_QUERY
+        .replace("SELECT\n    f.id,", "SELECT\n    uf.isMyFlight AS is_passenger,\n    f.id,")
+        .replace("AND uf.isMyFlight = 1", "AND uf.isMyFlight IN (0, 1)") +
+        " AND uf.userId = ? AND f.id = ? COLLATE NOCASE";
+      const rows = db.prepare(query).all(identity.userId, flightId) as Record<string, unknown>[];
+      return rows.map(({ is_passenger, ...flight }) => ({ flight: buildFlightDict(flight),
+        record: is_passenger === 1 ? "passenger" : "followed", identity }));
+    } finally { db.close(); }
   }
 
   getFlight(params: GetFlightParams): FlightRecord | null {
