@@ -53,3 +53,9 @@ it("unreceipted expired original request archives only with independent bound ev
   r=openLinux(f.linux); const status=await r.durable.status("unreceipted") as any; expect(status.status).toBe("expired"); expect(status.receipt).toBeUndefined(); expect(r.clientStore.get("client", "unreceipted")).toBeUndefined();
   const proof=r.clientStore.archived<any>("client-resolution","unreceipted-audit"); expect(proof.unknownReceipt).toBeNull(); expect(()=>verifyClientResolution(proof,"unreceipted-audit",callersFor(f.linux),f.mac.publicKey,f.operator.publicKey)).not.toThrow(); r.close();
 });
+
+it("retirement refuses lookalike user artifacts rather than accepting a broad generated-name prefix", () => {
+  const f = runtimeFixture(); roots.push(f.root); provisionMac(f.macConfig);
+  const file = join(f.macConfig.rawQuarantine,"raw-user-notes"); writeFileSync(file,"must-retain",{mode:0o600});const old=new Date(Date.now()-3*86400000);utimesSync(file,old,old);
+  const trash=vi.fn();expect(()=>retireArtifacts(f.macConfig,"quarantine",1,trash)).toThrow();expect(trash).not.toHaveBeenCalled();expect(readFileSync(file,"utf8")).toBe("must-retain");
+});

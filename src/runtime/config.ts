@@ -66,7 +66,7 @@ export function readConfig(file: string | undefined, kind: "linux" | "mac"): Con
   } catch { throw new ProtocolError("Runtime configuration unavailable or invalid. Explicit private approved configuration required."); }
 }
 export function publicKey(pem: string): KeyObject {
-  if (!/^-----BEGIN PUBLIC KEY-----\r?\n/.test(pem)) throw new ProtocolError("Public verification fields must not contain private keys.");
+  if (!/^-----BEGIN PUBLIC KEY-----\r?\n[A-Za-z0-9+/=\r\n]+-----END PUBLIC KEY-----\r?\n?$/.test(pem)) throw new ProtocolError("Public verification fields must not contain private keys.");
   const key = createPublicKey(pem);
   if (key.asymmetricKeyType !== "ed25519") throw new ProtocolError();
   return key;

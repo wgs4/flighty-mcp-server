@@ -80,6 +80,8 @@ export function retireRecovery(config: Config, role: StoreRole, limit: number, t
   if (!config.operatorPublicKey) throw new ProtocolError("Independent operator verification key required.");
   return PrivateStore.retireRecoveryAudits(roleOptions(config, role), { key: publicKey(config.operatorPublicKey), role }, limit, retirementHelper(config, trash));
 }
+const artifactUuid = "[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}";
+const generatedQuarantineName = new RegExp(`^(?:incoming-${artifactUuid}-${artifactUuid}|gen-e[1-9][0-9]*-s[1-9][0-9]*-[a-f0-9]{12}-${artifactUuid}|(?:state\\.json\\.tmp\\.|stage-)[0-9]+-${artifactUuid}-${artifactUuid}|\\.flighty-replica-export-[A-Za-z0-9]{6}-${artifactUuid}|raw-backup-${artifactUuid}|copy-e[1-9][0-9]*-s[1-9][0-9]*-${artifactUuid})$`);
 export type ArtifactCategory = "history" | "quarantine" | "copies";
 /** Explicit local operator retirement only. No caller paths, shell, deletion or remote verb.
  * Recoverable OS trash must be separately provisioned/approved; absence fails honestly. */
@@ -103,7 +105,7 @@ export function retireArtifacts(config: Config, category: ArtifactCategory, limi
       for (const name of readdirSync(root)) {
         if (retired >= limit) break;
         const allowed = category === "copies" ? /^copy-e[1-9][0-9]*-s[1-9][0-9]*$/.test(name) :
-          /^(incoming-[a-f0-9-]{36}|gen-e\d+-s\d+-[a-f0-9]+|state\.json\.tmp\.|\.flighty-replica-export-|raw-|copy-e)/.test(name);
+          generatedQuarantineName.test(name);
         if (!allowed) throw new ProtocolError("Unrecognized application artifact; operator inspection required.");
         const path = join(root, name); assertNoSymlinkChain(path, "retirement"); assertPrivatePath(path, root);
         // Never retire an active operation's in-process artifact: all stores are exclusively held above.

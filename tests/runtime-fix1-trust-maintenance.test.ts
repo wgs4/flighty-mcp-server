@@ -39,12 +39,13 @@ it("actual Linux config key transition retains old evidence only through explici
   expect((await r.durable.status(old.body.operationId) as any).status).toBe("pending"); await expect(r.client.submit(old)).rejects.toThrow();
   const nextRequest = r.client.prepare({ kind: "request-snapshot" }); await r.durable.remember(nextRequest); expect((await r.client.submit(nextRequest)).queue).toBe("queued"); r.close();
 });
-it.each(["caller", "history", "receipt", "producer", "private"])("rejects operator reuse through normalized %s key before provisioning/open", value => {
+it.each(["caller", "history", "receipt", "producer", "private", "concatenated-private"])("rejects operator reuse through normalized %s key before provisioning/open", value => {
   const f = fixture();
   if (value === "caller") f.macConfig.operatorPublicKey = f.macConfig.callers[0].publicKey.replace(/\n/g, "\r\n");
   if (value === "history") { f.macConfig.callers[0].historicalPublicKeys = [f.macConfig.operatorPublicKey]; }
   if (value === "receipt") f.macConfig.operatorPublicKey = f.mac.publicKey.export({ type: "spki", format: "pem" }).toString();
   if (value === "producer") f.macConfig.operatorPublicKey = f.macConfig.pins.publicKey;
+  if (value === "concatenated-private") f.macConfig.operatorPublicKey += f.operator.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
   if (value === "private") f.macConfig.operatorPublicKey = f.operator.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
   expect(() => validateConfig(f.macConfig)).toThrow(); expect(() => provisionMac(f.macConfig)).toThrow();
 });
