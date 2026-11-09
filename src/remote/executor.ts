@@ -6,15 +6,17 @@ import { parseFlightCode, FlightyApi } from "../services/flighty-api.js";
 import { assertWritesEnabled, type RuntimePolicy } from "../services/policy.js";
 import { generateConfirmCode } from "../services/removal-confirm.js";
 import { digest, canonical, ProtocolError, seal, verifyRequest, type Callers, type Request, type Receipt, type Signed, type SignedRequest } from "./protocol.js";
-import { sanitizeReceiptError, redactResultSecrets } from "./redaction.js";
+import { sanitizeReceiptError, redactResultSecrets, privateBuildValue } from "./redaction.js";
 import { PrivateStore } from "./store.js";
 
 /** Captured independently on Mac, never from a replica/request account. Never persist this object. */
 export type CredentialContext = Readonly<{ account: string; session: string; authToken: string; buildToken: string; syncUrl: string | null }>;
+export type StepActivity = { retain(): () => void; assertActive(): void };
+class AuthorizationExpiredError extends ProtocolError {}
 export type ExecutorDeps = {
   store: PrivateStore; callers: Callers; receiptKey: KeyObject; bindingKey: Buffer;
   captureContext: (signal: AbortSignal) => Promise<CredentialContext | null>;
-  createApi: (context: CredentialContext, signal: AbortSignal) => WriteApi;
+  createApi: (context: CredentialContext, signal: AbortSignal, activity: StepActivity) => WriteApi;
   /** Reopen current local source per call. The adapter must bind owner to context.account. */
   openDatabase: (context: CredentialContext) => {
     db: WriteDatabase;
@@ -32,14 +34,30 @@ import { executorStateValidator, pinnedCallers, RETENTION_MS, type StoredOperati
 const MAX_PREVIEWS = 32;
 
 /** Bounded API instances use exactly the captured token; discovery stays in the injected capture. */
-export function capturedApiFactory(options: { policy: RuntimePolicy; fetchImpl: typeof fetch }): (context: CredentialContext, signal: AbortSignal) => WriteApi {
-  return (context, signal) => {
+export function capturedApiFactory(options: { policy: RuntimePolicy; fetchImpl: typeof fetch }): (context: CredentialContext, signal: AbortSignal, activity?: StepActivity) => WriteApi {
+  return (context, signal, activity) => {
     const captured = { ...context };
     return new FlightyApi({ policy: options.policy,
-      fetchImpl: (url, init) => {
-        signal.throwIfAborted();
-        const combined = init?.signal ? AbortSignal.any([signal, init.signal]) : signal;
-        return options.fetchImpl(url, { ...init, signal: combined });
+      fetchImpl: async (url, init) => {
+        signal.throwIfAborted(); activity?.assertActive();
+        const release = activity?.retain() ?? (() => {});
+        try {
+          const combined = init?.signal ? AbortSignal.any([signal, init.signal]) : signal;
+          const response = await options.fetchImpl(url, { ...init, signal: combined });
+          if (!response.body) { release(); return response; }
+          const reader = response.body.getReader();
+          let cancelling = false;
+          const body = new ReadableStream<Uint8Array>({
+            async pull(controller) {
+              try {
+                const chunk = await reader.read();
+                if (chunk.done) { if (!cancelling) release(); controller.close(); } else controller.enqueue(chunk.value);
+              } catch (error) { if (!cancelling) release(); controller.error(error); }
+            },
+            async cancel(reason) { cancelling = true; try { await reader.cancel(reason); } finally { release(); } },
+          });
+          return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+        } catch (error) { release(); throw error; }
       },
       readAuthToken: () => captured.authToken, getBuildToken: () => captured.buildToken,
       readSyncUrl: () => captured.syncUrl });
@@ -60,6 +78,7 @@ export class MacExecutor {
   private readonly now: () => number;
   private readonly unresolvedAccounts = new Set<string>();
   private readonly activeOperations = new Set<string>();
+  private readonly activeReads = new Map<string, number>();
   constructor(private readonly deps: ExecutorDeps) {
     if (deps.bindingKey.length < 32) throw new ProtocolError("Private binding key is too short.");
     this.now = deps.now ?? Date.now;
@@ -130,10 +149,12 @@ export class MacExecutor {
       const req = stored.request.body;
       let redactionContext: CredentialContext | undefined;
       const finish = (state: Receipt["state"], result?: unknown, error?: string) => {
+        if (["succeeded", "failed", "unknown"].includes(state)) delete stored.phase;
         stored.receipt = this.receipt(req, state, result, error, redactionContext);
         this.deps.store.put("operation", id, stored);
         return stored.receipt;
       };
+      if (this.activeReads.has(req.account)) return finish("failed", undefined, "An earlier nonmutating step is still active. Nothing dispatched.");
       if (this.unresolvedAccounts.has(req.account) || this.deps.store.get<AccountFence>("fence", req.account)) {
         return finish("failed", undefined, "Account is fenced by an unresolved earlier step; operator recovery is required. Nothing dispatched.");
       }
@@ -183,7 +204,7 @@ export class MacExecutor {
             const stepApi: WriteApi = {
               searchFlight: async (...args) => {
                 const current = await this.sameContext(req, stored.contextHash);
-                return this.step(signal => this.deps.createApi(current, signal).searchFlight(...args), stored.request);
+                return this.step((signal, activity) => this.deps.createApi(current, signal, activity).searchFlight(...args), { request: stored.request, expiresAt: req.expiresAt });
               },
               subscribeFlight: async () => { throw new ProtocolError(); }, followFlight: async () => { throw new ProtocolError(); }, deleteFlight: async () => { throw new ProtocolError(); },
             };
@@ -201,6 +222,24 @@ export class MacExecutor {
           } finally { source.close(); }
         } catch { return finish("failed", undefined, "Flight search failed before mutation dispatch."); }
       }
+      if (op.kind === "request-snapshot") {
+        try {
+          ctx = await this.sameContext(req, stored.contextHash);
+          this.deps.store.transaction(() => { stored.phase = "snapshot-running"; finish("not-dispatched"); });
+        } catch { return finish("failed", undefined, "Snapshot authorization unavailable. No cloud mutation dispatched."); }
+        this.deps.boundary?.("dispatch");
+        let snapshotId: string;
+        try {
+          ctx = await this.sameContext(req, stored.contextHash);
+          const response = await this.step(signal => this.deps.requestSnapshot(ctx, signal), { request: stored.request, expiresAt: req.expiresAt });
+          if (!/^[A-Za-z0-9_-]{1,80}$/.test(response.snapshotId)) throw new ProtocolError();
+          snapshotId = response.snapshotId;
+        } catch { return finish("failed", undefined, "Snapshot failed or was interrupted. No cloud mutation dispatched."); }
+        this.deps.boundary?.("response");
+        const receipt = finish("succeeded", { status: "snapshot_requested", snapshot_id: snapshotId });
+        this.deps.boundary?.("receipt"); return receipt;
+      }
+      let authorizationExpiry = req.expiresAt, authorizationLocalHash: string | undefined;
       try {
         ctx = await this.sameContext(req, stored.contextHash);
         this.deps.store.transaction(() => {
@@ -210,6 +249,8 @@ export class MacExecutor {
             if (!preview || preview.consumed || preview.expiresAt <= this.now() || preview.flightId !== op.flight_id.toLowerCase() ||
                 preview.caller !== req.caller || preview.account !== ctx.account || preview.capability !== op.kind ||
                 preview.contextHash !== stored.contextHash || preview.localHash !== digest(substantiveRemoval(target))) throw new ProtocolError();
+            authorizationExpiry = Math.min(authorizationExpiry, preview.expiresAt);
+            authorizationLocalHash = preview.localHash;
             // Code consumption and dispatch state commit together before HTTP, including on crashes.
             this.deps.store.put("preview", op.confirm_code.trim(), { ...preview, consumed: true });
           }
@@ -228,44 +269,87 @@ export class MacExecutor {
         return finish("failed", undefined, "Current context or confirmation rejected. Nothing dispatched.");
       }
       this.deps.boundary?.("dispatch");
-      let result: unknown;
+      let result: unknown, mutationInvoked = false;
       try {
+        // Publication can block or cross sleep; the consumed preview's original deadline is independent.
+        ctx = await this.sameContext(req, stored.contextHash);
+        if (op.kind === "remove-confirm" && digest(substantiveRemoval(this.target(ctx, op.flight_id))) !== authorizationLocalHash) throw new ProtocolError();
+        verifyRequest(stored.request, this.deps.callers, this.now());
+        if (authorizationExpiry <= this.now()) throw new AuthorizationExpiredError();
+      } catch { return finish("failed", undefined, "Authorization expired or changed before the API step. Nothing dispatched; confirmation remains consumed."); }
+      try {
+        const options = { request: stored.request, mutation: true, expiresAt: authorizationExpiry, started: () => mutationInvoked };
         if (op.kind === "add" || op.kind === "follow") {
-          if (op.kind === "add") await this.step(signal => this.deps.createApi(ctx, signal).subscribeFlight(serverUuid!), stored.request); else await this.step(signal => this.deps.createApi(ctx, signal).followFlight(serverUuid!), stored.request);
+          await this.step((signal, activity) => {
+            const api = this.deps.createApi(ctx, signal, activity);
+            activity.assertActive(); mutationInvoked = true;
+            if (op.kind === "add") return api.subscribeFlight(serverUuid!);
+            return api.followFlight(serverUuid!);
+          }, options);
           result = { status: op.kind === "add" ? "added" : "followed", flight_code: assertFlightCode(op.flight_code), date: op.date,
             airline: airlineName!, server_flight_uuid: serverUuid!, message: "API accepted the request. Later app/replica reconciliation is not yet verified." };
-        } else if (op.kind === "remove-confirm") {
-          await this.step(signal => this.deps.createApi(ctx, signal).deleteFlight(op.flight_id), stored.request);
-          result = { status: "removed", flight_id: op.flight_id, message: "API accepted removal. Later app/replica reconciliation is not yet verified." };
         } else {
-          const response = await this.step(signal => this.deps.requestSnapshot(ctx, signal), stored.request);
-          if (!/^[A-Za-z0-9_-]{1,80}$/.test(response.snapshotId)) throw new ProtocolError();
-          result = { status: "snapshot_requested", snapshot_id: response.snapshotId };
+          await this.step((signal, activity) => {
+            const api = this.deps.createApi(ctx, signal, activity); activity.assertActive(); mutationInvoked = true; return api.deleteFlight(op.flight_id);
+          }, options);
+          result = { status: "removed", flight_id: op.flight_id, message: "API accepted removal. Later app/replica reconciliation is not yet verified." };
         }
-      } catch { return finish("unknown", undefined, "Dispatch outcome is unknown; do not automatically retry. A stale cache or missing row is not proof of failure."); }
+      } catch (error) {
+        if (error instanceof AuthorizationExpiredError && !mutationInvoked) return finish("failed", undefined, "Authorization expired before the API step. Nothing dispatched; confirmation remains consumed.");
+        return finish("unknown", undefined, "Dispatch outcome is unknown; do not automatically retry. A stale cache or missing row is not proof of failure.");
+      }
       this.deps.boundary?.("response");
       const receipt = finish("succeeded", result);
       this.deps.boundary?.("receipt");
       return receipt;
   }
-  private async step<T>(fn: (signal: AbortSignal) => Promise<T>, request?: SignedRequest): Promise<T> {
+  private async step<T>(fn: (signal: AbortSignal, activity: StepActivity) => Promise<T>, options: {
+    request?: SignedRequest; account?: string; mutation?: boolean; expiresAt?: number; started?: () => boolean;
+  } = {}): Promise<T> {
+    const remaining = Math.min(15_000, (options.expiresAt ?? Infinity) - this.now());
+    if (remaining <= 0) throw new AuthorizationExpiredError();
+    const account = options.request?.body.account ?? options.account;
     const controller = new AbortController();
+    let pending = 0, blocked = false;
+    const activity: StepActivity = {
+      assertActive: () => {
+        controller.signal.throwIfAborted();
+        if (options.expiresAt !== undefined && options.expiresAt <= this.now()) throw new AuthorizationExpiredError();
+      },
+      retain: () => {
+        pending++;
+        const releaseStore = options.mutation ? () => {} : this.deps.store.holdResource();
+        let released = false;
+        return () => {
+          if (released) return; released = true; pending--; releaseStore();
+          if (blocked && pending === 0 && account) {
+            const count = this.activeReads.get(account)! - 1;
+            if (count === 0) this.activeReads.delete(account); else this.activeReads.set(account, count);
+          }
+        };
+      },
+    };
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => {
-        controller.abort();
-        reject(new ProtocolError("Executor step timed out."));
-      }, 15_000);
+      timer = setTimeout(() => { controller.abort(); reject(new ProtocolError("Executor step timed out.")); }, remaining);
       timer.unref?.();
     });
-    try { return await Promise.race([fn(controller.signal), deadline]); }
-    catch (error) {
+    const release = activity.retain();
+    let operation: Promise<T>, invoked = false;
+    const failure = () => {
       controller.abort();
-      // Even a provider that ignores cancellation cannot release dispatch authority for this account.
-      if (request) this.fence(request);
-      throw error;
-    }
-    finally { clearTimeout(timer); }
+      if (options.mutation && options.request && (options.started?.() ?? true)) this.fence(options.request);
+      else if (pending > 0 && account) {
+        blocked = true; this.activeReads.set(account, (this.activeReads.get(account) ?? 0) + 1);
+      }
+    };
+    try { activity.assertActive(); invoked = true; operation = Promise.resolve(fn(controller.signal, activity)); }
+    catch (error) { release(); clearTimeout(timer); if (invoked) failure(); throw error; }
+    operation = operation.then(value => { release(); return value; }, error => { release(); throw error; });
+    try { return await Promise.race([operation, deadline]); }
+    catch (error) {
+      failure(); throw error;
+    } finally { clearTimeout(timer); }
   }
   private fence(request: SignedRequest): void {
     this.unresolvedAccounts.add(request.body.account);
@@ -276,7 +360,7 @@ export class MacExecutor {
   private async context(req: Request): Promise<CredentialContext> {
     this.deps.checkSource();
     assertWritesEnabled(this.deps.policy);
-    const ctx = await this.step(signal => this.deps.captureContext(signal));
+    const ctx = await this.step(signal => this.deps.captureContext(signal), { account: req.account, expiresAt: req.expiresAt });
     if (!ctx || !ctx.account || !ctx.session || !ctx.authToken || !ctx.buildToken ||
         [ctx.account, ctx.session, ctx.authToken, ctx.buildToken].some(v => typeof v !== "string" || v.length > 16_384) ||
         !(ctx.syncUrl === null || (typeof ctx.syncUrl === "string" && ctx.syncUrl.length <= 4096))) {
@@ -320,16 +404,21 @@ export class MacExecutor {
     });
   }
   private receipt(req: Request, state: Receipt["state"], result?: unknown, error?: string, context?: CredentialContext): Signed<Receipt> {
-    const secrets = context ? [context.authToken, context.buildToken, context.session, context.syncUrl ?? ""] : [];
+    const secrets = context ? [context.authToken, ...privateBuildValue(context.buildToken), context.session, context.syncUrl ?? ""] : [];
+    const credentials = context ? [context.authToken, context.syncUrl ?? ""] : [];
     if (context?.syncUrl) {
-      try { new URL(context.syncUrl).searchParams.forEach((value, key) => { if (/token|secret|auth|key/i.test(key)) secrets.push(value); }); } catch { /* Exact URL redaction still applies. */ }
+      try { new URL(context.syncUrl).searchParams.forEach((value, key) => { if (/token|secret|auth|key/i.test(key)) { secrets.push(value); credentials.push(value); } }); } catch { /* Exact URL redaction still applies. */ }
     }
     return seal("receipt", { version: 1, operationId: req.operationId, caller: req.caller, account: req.account,
-      requestDigest: digest(req), state, updatedAt: this.now(), ...(result === undefined ? {} : { result: redactResultSecrets(result, secrets) }), ...(error ? { error: sanitizeReceiptError(error, secrets) } : {}) }, this.deps.receiptKey);
+      requestDigest: digest(req), state, updatedAt: this.now(), ...(result === undefined ? {} : { result: redactResultSecrets(result, secrets, credentials) }), ...(error ? { error: sanitizeReceiptError(error, secrets) } : {}) }, this.deps.receiptKey);
   }
   private recoverInterrupted(): void {
     for (const { id, value } of this.deps.store.list<StoredOperation>("operation")) {
-      if (value.receipt.body.state === "dispatched" && !this.activeOperations.has(id)) {
+      if ((value.phase === "snapshot-running" || (value.request.body.operation.kind === "request-snapshot" && value.receipt.body.state === "dispatched")) && !this.activeOperations.has(id)) {
+        delete value.phase;
+        value.receipt = this.receipt(value.request.body, "failed", undefined, "Snapshot was interrupted. No cloud mutation dispatched.");
+        this.deps.store.put("operation", id, value);
+      } else if (value.receipt.body.state === "dispatched" && !this.activeOperations.has(id)) {
         this.fence(value.request);
         value.receipt = this.receipt(value.request.body, "unknown", undefined, "Dispatch outcome is unknown; account is fenced pending operator recovery. Do not automatically retry.");
         this.deps.store.put("operation", id, value);

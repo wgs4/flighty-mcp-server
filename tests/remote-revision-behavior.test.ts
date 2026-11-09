@@ -56,11 +56,13 @@ describe("actual cancellation and durable account fencing", () => {
     expect(f.api.subscribeFlight).toHaveBeenCalledTimes(1); expect(f.api.searchFlight).toHaveBeenCalledTimes(1);
   });
   it("a search timeout cannot let a second request overlap an unresolved HTTP step", async () => {
-    const f = setup(); vi.useFakeTimers(); f.api.searchFlight.mockImplementationOnce(() => new Promise(() => {}));
+    const f = setup(); vi.useFakeTimers(); let settle!: () => void;
+    f.api.searchFlight.mockImplementationOnce(() => new Promise(resolve => { settle = () => resolve(null); }));
     const first = f.executor.submit(f.request(add)), second = f.executor.submit(f.request(add));
     await vi.advanceTimersByTimeAsync(15_001);
     expect((await first).body.state).toBe("failed"); expect((await second).body.state).toBe("failed");
     expect(f.api.searchFlight).toHaveBeenCalledTimes(1); expect(f.api.subscribeFlight).not.toHaveBeenCalled();
+    settle(); await tick();
   });
   it("failure to persist an unresolved fence quarantines the store instead of enabling the next mutation", async () => {
     const f = setup(), put = f.store.put.bind(f.store); vi.useFakeTimers();

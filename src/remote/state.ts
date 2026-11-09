@@ -5,12 +5,12 @@ import type { StateRow } from "./store.js";
 
 export const RETENTION_MS = 86_400_000;
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
-const operationSchema = z.object({ request: z.unknown(), contextHash: hash, receipt: z.unknown() }).strict();
+const operationSchema = z.object({ request: z.unknown(), contextHash: hash, receipt: z.unknown(), phase: z.literal("snapshot-running").optional() }).strict();
 const previewSchema = z.object({ requestId: idSchema, flightId: z.string().uuid(), caller: idSchema, account: idSchema,
   capability: z.literal("remove-confirm"), contextHash: hash, localHash: hash, expiresAt: timeSchema, consumed: z.boolean() }).strict();
 const fenceSchema = z.object({ request: z.unknown(), state: z.literal("unresolved") }).strict();
 const queuedSchema = z.object({ request: z.unknown(), leaseUntil: timeSchema, receipt: z.unknown().nullable() }).strict();
-export type StoredOperation = { request: SignedRequest; contextHash: string; receipt: Signed<Receipt> };
+export type StoredOperation = { request: SignedRequest; contextHash: string; receipt: Signed<Receipt>; phase?: "snapshot-running" };
 export type Preview = z.infer<typeof previewSchema>;
 export type AccountFence = { request: SignedRequest; state: "unresolved" };
 export type Queued = { request: SignedRequest; leaseUntil: number; receipt: Signed<Receipt> | null };
@@ -23,12 +23,24 @@ export function pinnedCallers(callers: Callers): Callers {
  * Every scan still authenticates the current DB/root and checks IDs, schemas, bindings and clock. */
 function retainedProofs(callers: Callers, macKey: KeyObject, now: () => number) {
   const requests = new Set<string>(), receipts = new Set<string>();
+  let trust = pinnedCallers(callers);
+  const checkTrust = () => {
+    const keys = Object.keys(callers);
+    if (keys.length !== Object.keys(trust).length || keys.some(id => {
+      const current = callers[id], previous = trust[id];
+      return !current || !previous || current.publicKey !== previous.publicKey || current.account !== previous.account ||
+        current.capabilities.length !== previous.capabilities.length || current.capabilities.some((capability, index) => capability !== previous.capabilities[index]);
+    })) {
+      requests.clear(); receipts.clear(); trust = pinnedCallers(callers);
+    }
+  };
   const remember = (set: Set<string>, proof: string) => {
     if (set.size >= 256) set.delete(set.values().next().value!);
     set.add(proof);
   };
   return {
     request(input: unknown) {
+      checkTrust();
       const proof = digest(input);
       if (!requests.has(proof)) { const value = verifyRequest(input, callers, now(), true); remember(requests, proof); return value; }
       const value = (input as SignedRequest).body;
@@ -36,6 +48,7 @@ function retainedProofs(callers: Callers, macKey: KeyObject, now: () => number) 
       return value;
     },
     receipt(input: unknown, request: SignedRequest["body"]) {
+      checkTrust();
       const proof = digest(input) + digest(request);
       if (!receipts.has(proof)) { const value = verifyReceipt(input, macKey, request); remember(receipts, proof); return value; }
       return (input as Signed<Receipt>).body;
@@ -57,6 +70,7 @@ export function executorStateValidator(callers: Callers, macKey: KeyObject, now:
       const parsed = parseSchema(operationSchema, row.value);
       const request = proofs.request(parsed.request);
       proofs.receipt(parsed.receipt, request);
+      if (parsed.phase && (request.operation.kind !== "request-snapshot" || (parsed.receipt as Signed<Receipt>).body.state !== "not-dispatched")) throw new ProtocolError("Snapshot phase binding rejected.");
       if (row.id !== request.operationId) throw new ProtocolError("Durable operation ID mismatch.");
       operations.set(row.id, parsed as StoredOperation);
     }

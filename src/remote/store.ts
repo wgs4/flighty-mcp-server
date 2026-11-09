@@ -62,6 +62,7 @@ export class PrivateStore {
   private inTransaction = false;
   private transactionView?: Map<string, StateRow>;
   private pending = 0;
+  private resources = 0;
   private readonly consumers = new Set<string>();
   private validateState?: (rows: readonly StateRow[]) => void;
 
@@ -277,6 +278,12 @@ export class PrivateStore {
   }
   /** A failed security-state publication cannot leave this process authorized to continue. */
   quarantine(): void { this.faulted = true; }
+  /** Keep the single-writer owner alive until an actual nonmutating resource settles. */
+  holdResource(): () => void {
+    this.ready(false); this.resources++;
+    let released = false;
+    return () => { if (!released) { released = true; this.resources--; } };
+  }
   exclusive<T>(fn: () => Promise<T>): Promise<T> {
     this.pending++;
     const next = this.tail.then(() => { this.ready(); return fn(); }).finally(() => { this.pending--; });
@@ -284,7 +291,7 @@ export class PrivateStore {
   }
   close(): void {
     if (this.closed) return;
-    if (this.pending) throw new ProtocolError("Cannot close state while execution is active.");
+    if (this.pending || this.resources) throw new ProtocolError("Cannot close state while execution is active.");
     try {
       if (!this.faulted) this.transaction(() => { this.db.prepare("DELETE FROM writer WHERE instance=?").run(this.instance); });
     } finally { this.db.close(); this.closed = true; }
