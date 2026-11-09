@@ -58,6 +58,7 @@ export interface FlightRecord {
   import_source: string | null;
   friend_name?: string | null;
   tracking_source?: TrackingSource;
+  friendship_status?: "unverified";
   passenger_name_source?: "profile" | "unknown";
   passenger_name_unknown_reason?: string | null;
 }
@@ -187,12 +188,13 @@ export interface SearchFlightsParams {
   limit?: number;
 }
 
-export type TrackingSource = "owner_passenger" | "owner_followed" | "connected_friend_passenger";
+export type TrackingSource = "owner_passenger" | "owner_followed" | "cached_shared_passenger";
 export type FlightPhase = "scheduled" | "taxi_out" | "airborne" | "taxi_in" | "at_gate" | "cancelled" | "unknown";
 
 export interface TrackingAssociation {
   user_id: string;
   tracking_source: TrackingSource;
+  friendship_status: "unverified";
   passenger_name: string | null;
   passenger_name_source: "profile" | "unknown";
   passenger_name_unknown_reason: string | null;

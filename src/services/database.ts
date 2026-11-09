@@ -9,7 +9,7 @@ import {
   EARTH_CIRCUMFERENCE_KM,
 } from "../constants.js";
 import { readFlightyAuthToken, readJwtSubject } from "./auth-token.js";
-import { deriveConnectionCheck, deriveTrackingTiming } from "./tracking.js";
+import { airportContinuity, deriveConnectionCheck, deriveTrackingTiming } from "./tracking.js";
 import {
   DEFAULT_PAGE_LIMIT,
   DEFAULT_REFERENCE_LIMIT,
@@ -471,7 +471,8 @@ export class FlightyDatabase {
         "SELECT\n    f.id,",
         `SELECT
     CASE WHEN uf.isMyFlight = 1 AND NULLIF(TRIM(p.fullName), '') IS NOT NULL THEN p.fullName END AS friend_name,
-    CASE WHEN uf.isMyFlight = 0 THEN 'owner_followed' ELSE 'connected_friend_passenger' END AS tracking_source,
+    CASE WHEN uf.isMyFlight = 0 THEN 'owner_followed' ELSE 'cached_shared_passenger' END AS tracking_source,
+    'unverified' AS friendship_status,
     CASE WHEN uf.isMyFlight = 1 AND NULLIF(TRIM(p.fullName), '') IS NOT NULL THEN 'profile' ELSE 'unknown' END AS passenger_name_source,
     CASE WHEN uf.isMyFlight = 0 THEN 'followed_row_does_not_identify_passenger'
          WHEN NULLIF(TRIM(p.fullName), '') IS NULL THEN 'profile_name_missing' END AS passenger_name_unknown_reason,
@@ -550,7 +551,8 @@ export class FlightyDatabase {
       const name = !followed && typeof row.association_name === "string" && row.association_name.trim() ? row.association_name : null;
       const association: TrackingAssociation = {
         user_id: row.association_user_id as string,
-        tracking_source: followed ? "owner_followed" : isOwner ? "owner_passenger" : "connected_friend_passenger",
+        tracking_source: followed ? "owner_followed" : isOwner ? "owner_passenger" : "cached_shared_passenger",
+        friendship_status: "unverified",
         passenger_name: name,
         passenger_name_source: name === null ? "unknown" : "profile",
         passenger_name_unknown_reason: followed ? "followed_row_does_not_identify_passenger" : name === null ? "profile_name_missing" : null,
@@ -587,7 +589,7 @@ export class FlightyDatabase {
       flight: flightRow as unknown as FlightRecord,
       associations: ordered,
       identity_ambiguous: ordered.length > 1,
-      attribution_notice: "Each association identifies its own cached source only. A followed owner row does not identify its passenger. With multiple associations, booking fields are supplied per association rather than choosing one traveler.",
+      attribution_notice: "Each association identifies its own cached source only. Membership and Profile names do not verify friendship. A followed owner row does not identify its passenger. With multiple associations, booking fields are supplied per association rather than choosing one traveler.",
       departure_airport_id: departure_airport_id as string | null,
       arrival_airport_id: arrival_airport_id as string | null,
       departure_code_unambiguous: Boolean(departure_code_unambiguous),
@@ -608,11 +610,20 @@ export class FlightyDatabase {
     }
   }
 
-  private readConnectionMinimum(db: Database, inboundId: string, outboundId: string): CachedConnectionMinimum {
-    const rows = db.prepare(`SELECT mctMinutes FROM Connection
+  private readConnectionMinimum(db: Database, inbound: TrackedFlight, outbound: TrackedFlight): CachedConnectionMinimum {
+    const rows = db.prepare(`SELECT mctMinutes, waitingAirportId FROM Connection
       WHERE deleted IS NULL AND arrivingFlightId = ? COLLATE NOCASE AND departingFlightId = ? COLLATE NOCASE`)
-      .all(inboundId, outboundId) as Array<{ mctMinutes: unknown }>;
+      .all(inbound.flight.id, outbound.flight.id) as Array<{ mctMinutes: unknown; waitingAirportId: unknown }>;
     if (rows.length === 0) return { minutes: null, basis: null, reason: "no_cached_connection_for_exact_pair" };
+    const normalizeId = (id: unknown) => typeof id === "string" && id.trim() ? id.trim().toLowerCase() : null;
+    const continuity = airportContinuity(inbound, outbound);
+    const transferId = normalizeId(inbound.arrival_airport_id) ?? normalizeId(outbound.departure_airport_id);
+    const contexts = rows.map(({ waitingAirportId }) => normalizeId(waitingAirportId));
+    if (continuity.matches !== true || transferId === null || contexts.some((id) => id === null)) {
+      return { minutes: null, basis: null, reason: "unknown_cached_minimum_airport_context" };
+    }
+    if (new Set(contexts).size !== 1) return { minutes: null, basis: null, reason: "conflicting_cached_minimum_airport_contexts" };
+    if (contexts[0] !== transferId) return { minutes: null, basis: null, reason: "cached_minimum_airport_context_mismatch" };
     // An MCT is a duration in minutes, not a date or a default threshold. A
     // value above a full day is outside this tool's supported cache semantics.
     const valid = rows.every(({ mctMinutes }) => typeof mctMinutes === "number" && Number.isFinite(mctMinutes) && mctMinutes >= 0 && mctMinutes <= 1440);
@@ -634,7 +645,7 @@ export class FlightyDatabase {
       const inbound = this.readTrackingFlight(db, identity.userId, inboundId);
       const outbound = this.readTrackingFlight(db, identity.userId, outboundId);
       if (!inbound || !outbound) return null;
-      const minimum = this.readConnectionMinimum(db, inboundId, outboundId);
+      const minimum = this.readConnectionMinimum(db, inbound, outbound);
       return { result: deriveConnectionCheck(inbound, outbound, minimum), identity };
     } finally {
       db.close();
@@ -667,6 +678,10 @@ export class FlightyDatabase {
   }
 
   getFlight(params: GetFlightParams): FlightRecord | null {
+    return this.readFlight(params)?.flight ?? null;
+  }
+
+  private readFlight(params: GetFlightParams, forTracking = false): { flight: FlightRecord; timestampIssues: Record<string, string> } | null {
     const hasId = params.flight_id !== undefined && params.flight_id !== "";
     const hasNumber =
       params.flight_number !== undefined && params.flight_number !== "";
@@ -713,7 +728,15 @@ export class FlightyDatabase {
       const row = db.prepare(query).get(...binds) as
         | Record<string, unknown>
         | undefined;
-      return row ? buildFlightDict(row) : null;
+      if (!row) return null;
+      const timestampIssues: Record<string, string> = {};
+      if (!forTracking) return { flight: buildFlightDict(row), timestampIssues };
+      const normalized = { ...row };
+      for (const key of TIMESTAMP_COLUMNS) {
+        if (row[key] != null && trackingTsToIso(row[key]) === null) timestampIssues[key] = "invalid_timestamp";
+        if (key in normalized) normalized[key] = trackingTsToIso(row[key]);
+      }
+      return { flight: normalized as unknown as FlightRecord, timestampIssues };
     } finally {
       db.close();
     }
@@ -785,8 +808,9 @@ export class FlightyDatabase {
 
   getFlightStatus(flightNumber: string): FlightStatusRecord | null {
     assertValidFlightNumber(flightNumber);
-    const flight = this.getFlight({ flight_number: flightNumber.trim() });
-    if (!flight) return null;
+    const record = this.readFlight({ flight_number: flightNumber.trim() }, true);
+    if (!record) return null;
+    const { flight, timestampIssues } = record;
 
     let depDelayMin: number | null = null;
     let arrDelayMin: number | null = null;
@@ -806,7 +830,7 @@ export class FlightyDatabase {
       }
     }
 
-    const timing = deriveTrackingTiming(flight);
+    const timing = deriveTrackingTiming(flight, Date.now(), timestampIssues);
     const status: FlightStatusRecord["status"] =
       timing.phase === "airborne" ? "in_air" :
       timing.phase === "taxi_in" || timing.phase === "at_gate" ? "landed" :

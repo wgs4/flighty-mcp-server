@@ -23,7 +23,7 @@ type TimeField = typeof ACTUAL_MILESTONES[number]
   | "arrivalScheduleRunwayEstimated" | "arrivalScheduleRunwayOriginal"
   | "arrivalScheduleGateEstimated" | "arrivalScheduleGateOriginal"
   | "departureScheduleGateEstimated" | "departureScheduleGateOriginal"
-  | "departureScheduleRunwayOriginal";
+  | "departureScheduleRunwayEstimated" | "departureScheduleRunwayOriginal";
 
 function timeReader(flight: FlightRecord, initialIssues: Record<string, string>) {
   const issues = { ...initialIssues };
@@ -36,27 +36,122 @@ function timeReader(flight: FlightRecord, initialIssues: Record<string, string>)
   return { issues, read };
 }
 
+type Candidate = { ms: number; basis: TimeField };
+
+// One validation pass supplies both countdowns and connection selection. Actual
+// milestones outrank predictions; a contradictory current prediction cannot be
+// rescued by silently reverting to an older schedule.
+function validatedTimeline(flight: FlightRecord, now: number, timestampIssues: Record<string, string>) {
+  const { issues, read } = timeReader(flight, timestampIssues);
+  const conflicts: Record<string, string[]> = {};
+  const fields: TimeField[] = [...ACTUAL_MILESTONES,
+    "departureScheduleGateEstimated", "departureScheduleGateOriginal",
+    "departureScheduleRunwayEstimated", "departureScheduleRunwayOriginal",
+    "arrivalScheduleRunwayEstimated", "arrivalScheduleRunwayOriginal",
+    "arrivalScheduleGateEstimated", "arrivalScheduleGateOriginal"];
+  const times = new Map(fields.map((field) => [field, read(field)]));
+  const actuals = ACTUAL_MILESTONES.map((field) => times.get(field)!);
+  let watermark: number | null = null;
+  for (let i = 0; i < actuals.length; i++) {
+    const value = actuals[i];
+    if (value === null) continue;
+    const field = ACTUAL_MILESTONES[i];
+    if (value > now) issues[field] = "future_actual_timestamp";
+    if (watermark !== null && value < watermark) issues[field] = "out_of_order_actual_milestones";
+    watermark = watermark === null ? value : Math.max(watermark, value);
+  }
+  const invalidMilestones = ACTUAL_MILESTONES.some((field) => issues[field] !== undefined);
+  if (invalidMilestones) {
+    for (const field of ACTUAL_MILESTONES) {
+      if (times.get(field) !== null && !issues[field]) issues[field] = "inconsistent_actual_milestones";
+    }
+  }
+  const candidate = (field: TimeField): Candidate | null => {
+    const ms = times.get(field);
+    return ms == null || issues[field] ? null : { ms, basis: field };
+  };
+  const reject = (field: TimeField, reason: string, bound: Candidate) => {
+    issues[field] = reason;
+    conflicts[field] = [bound.basis];
+  };
+  const choose = (candidates: readonly TimeField[]): Candidate | null => {
+    for (const field of candidates) {
+      const value = candidate(field);
+      if (value) return value;
+      // Invalid encodings and unverified actuals permit a labelled fallback.
+      // Chronological contradictions require unknown rather than a stale time.
+      if (conflicts[field]) return null;
+    }
+    return null;
+  };
+  const actual = ACTUAL_MILESTONES.map(candidate);
+  const [pushback, takeoff, touchdown, atGate] = actual;
+  const gateDepartureFields = ["departureScheduleGateActual", "departureScheduleGateEstimated", "departureScheduleGateOriginal"] as const;
+  const runwayDepartureFields = ["departureScheduleRunwayActual", "departureScheduleRunwayEstimated", "departureScheduleRunwayOriginal"] as const;
+  // A new gate departure estimate supersedes an old runway departure schedule.
+  const currentGateDeparture = candidate("departureScheduleGateEstimated");
+  const currentRunwayDeparture = candidate("departureScheduleRunwayEstimated");
+  const runwayDepartureBound = takeoff ?? candidate("departureScheduleRunwayEstimated") ??
+    (candidate("departureScheduleGateEstimated") ? null : candidate("departureScheduleRunwayOriginal"));
+  for (const field of gateDepartureFields.slice(1)) {
+    const value = candidate(field);
+    const upper = takeoff ?? touchdown ?? atGate ?? runwayDepartureBound;
+    if (value && upper && value.ms > upper.ms) reject(field, "gate_departure_follows_runway_or_arrival", upper);
+  }
+  const departure = choose(gateDepartureFields);
+  for (const field of runwayDepartureFields.slice(1)) {
+    const value = candidate(field);
+    if (value && departure && value.ms < departure.ms) reject(field, "runway_departure_precedes_gate_departure", departure);
+  }
+  const runwayDeparture = choose(runwayDepartureFields);
+  const departureBounds = [takeoff ?? runwayDeparture, pushback ?? departure,
+    // Rejection against another prediction must not erase a current departure
+    // estimate and accidentally validate an even earlier arrival.
+    ...(!pushback && !takeoff && !touchdown && !atGate ? [currentGateDeparture, currentRunwayDeparture] : [])
+  ].filter((v): v is Candidate => v !== null);
+  const runwayArrivalFields = ["arrivalScheduleRunwayActual", "arrivalScheduleRunwayEstimated", "arrivalScheduleRunwayOriginal"] as const;
+  for (const field of runwayArrivalFields.slice(1)) {
+    const value = candidate(field);
+    // Once actual touchdown/at-gate is known, stale predictions are not bounds.
+    const lower = departureBounds.find((bound) => value && value.ms < bound.ms);
+    if (value && lower) reject(field, "runway_arrival_precedes_departure", lower);
+  }
+  const landing = choose(runwayArrivalFields);
+  const gateArrivalFields = ["arrivalScheduleGateActual", "arrivalScheduleGateEstimated", "arrivalScheduleGateOriginal"] as const;
+  for (const field of gateArrivalFields.slice(1)) {
+    const value = candidate(field);
+    if (!value) continue;
+    const lowerDeparture = departureBounds.find((bound) => value.ms < bound.ms);
+    if (touchdown && value.ms < touchdown.ms) reject(field, "gate_arrival_precedes_touchdown", touchdown);
+    else if (lowerDeparture) reject(field, "gate_arrival_precedes_departure", lowerDeparture);
+    else if (landing && value.ms < landing.ms) reject(field, "gate_arrival_precedes_runway_arrival", landing);
+  }
+  const gate = choose(gateArrivalFields);
+  // Check every departure fallback against the established arrival evidence too.
+  for (const field of gateDepartureFields.slice(1)) {
+    const value = candidate(field);
+    const upper = takeoff ?? touchdown ?? atGate ?? runwayDepartureBound ?? landing ?? gate;
+    if (value && upper && value.ms > upper.ms) reject(field, "gate_departure_follows_runway_or_arrival", upper);
+  }
+  const reason = (candidates: readonly TimeField[], missing: string) => {
+    for (const field of candidates) if (issues[field]) return issues[field];
+    return missing;
+  };
+  return { issues, conflicts, actuals, invalidMilestones, landing, gate,
+    departure: choose(gateDepartureFields), gateEstimated: candidate("arrivalScheduleGateEstimated"),
+    landingReason: reason(runwayArrivalFields, "no_valid_runway_arrival_time"),
+    gateReason: reason(gateArrivalFields, "no_valid_gate_arrival_time") };
+}
+
 export function deriveTrackingTiming(
   flight: FlightRecord,
   now: number = Date.now(),
   timestampIssues: Record<string, string> = {}
 ) {
   if (!Number.isFinite(now)) throw new Error("Invalid calculation time.");
-  const { issues, read } = timeReader(flight, timestampIssues);
-  const actuals = ACTUAL_MILESTONES.map((field) => {
-    const value = read(field);
-    if (value !== null && value > now) issues[field] = "future_actual_timestamp";
-    return value;
-  });
-  let previous: number | null = null;
-  for (let i = 0; i < actuals.length; i++) {
-    const value = actuals[i];
-    if (value === null) continue;
-    if (previous !== null && value < previous) issues[ACTUAL_MILESTONES[i]] = "out_of_order_actual_milestones";
-    previous = value;
-  }
+  const timeline = validatedTimeline(flight, now, timestampIssues);
+  const { issues, actuals, invalidMilestones } = timeline;
   const [pushback, takeoff, touchdown, atGate] = actuals;
-  const invalidMilestones = ACTUAL_MILESTONES.some((field) => issues[field] !== undefined);
   let phase: FlightPhase;
   let phaseReason: string;
   if (flight.is_cancelled) {
@@ -78,7 +173,7 @@ export function deriveTrackingTiming(
     phase = "taxi_out";
     phaseReason = "actual_gate_departure_without_actual_runway_departure";
   } else {
-    const scheduledDeparture = read("departureScheduleGateOriginal") ?? read("departureScheduleRunwayOriginal");
+    const scheduledDeparture = trackingTimestamp(flight.departureScheduleGateOriginal) ?? trackingTimestamp(flight.departureScheduleRunwayOriginal);
     phase = scheduledDeparture !== null && scheduledDeparture > now ? "scheduled" : "unknown";
     phaseReason = phase === "scheduled" ? "future_scheduled_departure_no_actual_milestones" : "no_actual_milestones_and_no_future_scheduled_departure";
   }
@@ -101,39 +196,28 @@ export function deriveTrackingTiming(
   } else if (atGate !== null) {
     landingReason = "at_gate_but_runway_arrival_time_missing";
   } else {
-    const estimated = read("arrivalScheduleRunwayEstimated");
-    const scheduled = read("arrivalScheduleRunwayOriginal");
-    landingAt = estimated ?? scheduled;
-    landingBasis = estimated !== null ? "arrivalScheduleRunwayEstimated" : scheduled !== null ? "arrivalScheduleRunwayOriginal" : null;
-    const departure = takeoff ?? pushback ?? read("departureScheduleRunwayOriginal") ?? read("departureScheduleGateOriginal");
-    if (landingAt === null) landingReason = "no_valid_runway_arrival_time";
-    else if (departure !== null && landingAt < departure) {
-      landingReason = "runway_arrival_precedes_departure";
-      issues[landingBasis!] = landingReason;
-    }
+    landingAt = timeline.landing?.ms ?? null;
+    landingBasis = timeline.landing?.basis ?? null;
+    if (landingAt === null) landingReason = timeline.landingReason;
     else if (landingAt <= now) {
       landingState = "overdue";
       landingReason = "runway_arrival_time_passed_without_actual_touchdown";
     } else {
-      landingState = estimated !== null ? "estimated" : "scheduled";
+      landingState = landingBasis === "arrivalScheduleRunwayEstimated" ? "estimated" : "scheduled";
       minutesToLanding = (landingAt - now) / 60000;
-      if (estimated === null) landingReason = "time_until_scheduled_landing_not_predicted_flight_duration";
+      if (landingState === "scheduled") landingReason = "time_until_scheduled_landing_not_predicted_flight_duration";
     }
   }
 
-  const gateEstimated = read("arrivalScheduleGateEstimated");
-  const gateScheduled = read("arrivalScheduleGateOriginal");
-  const gateTime = !invalidMilestones && atGate !== null ? atGate : gateEstimated ?? gateScheduled;
-  const gateBasis = !invalidMilestones && atGate !== null ? "arrivalScheduleGateActual" : gateEstimated !== null ? "arrivalScheduleGateEstimated" : gateScheduled !== null ? "arrivalScheduleGateOriginal" : null;
+  const gateTime = timeline.gate?.ms ?? null;
+  const gateBasis = timeline.gate?.basis ?? null;
   let gateReason: string | null = null;
   let minutesToGate: number | null = null;
   if (phase === "cancelled") gateReason = "cancelled_flight";
   else if (invalidMilestones) gateReason = phaseReason;
   else if (atGate !== null) minutesToGate = 0;
-  else if (gateTime === null) gateReason = "no_valid_gate_arrival_time";
-  else if (touchdown !== null && gateTime < touchdown) gateReason = "gate_arrival_precedes_touchdown";
-  else if (landingAt !== null && landingReason !== "runway_arrival_precedes_departure" && gateTime < landingAt) gateReason = "gate_arrival_precedes_runway_arrival";
-  else if (gateTime < now) gateReason = "gate_arrival_time_passed_without_actual_gate_arrival";
+  else if (gateTime === null) gateReason = timeline.gateReason;
+  else if (gateTime <= now) gateReason = "gate_arrival_time_passed_without_actual_gate_arrival";
   else minutesToGate = (gateTime - now) / 60000;
 
   let taxiElapsed: number | null = null;
@@ -159,12 +243,13 @@ export function deriveTrackingTiming(
     taxi_in_elapsed_minutes: taxiElapsed,
     taxi_in_completed_minutes: taxiCompleted,
     taxi_in_reason: taxiReason,
-    gate_eta: iso(gateEstimated),
+    gate_eta: iso(timeline.gateEstimated?.ms ?? null),
     gate_arrival_at: iso(gateTime),
     gate_time_basis: gateBasis,
     minutes_to_gate: minutesToGate,
     gate_countdown_reason: gateReason,
     timestamp_issues: issues,
+    timestamp_conflicts: timeline.conflicts,
     timestamp_basis: "UTC",
     calculated_at: new Date(now).toISOString(),
   };
@@ -202,22 +287,6 @@ function normalizedTail(value: unknown): string | null {
   return /^[A-Z0-9]{2,12}$/.test(normalized) ? normalized : null;
 }
 
-function connectionGateTime(tracked: TrackedFlight, direction: "arrival" | "departure", now: number, timestampIssues: Record<string, string>) {
-  const { read, issues } = timeReader(tracked.flight, timestampIssues);
-  const fields = direction === "arrival"
-    ? ["arrivalScheduleGateActual", "arrivalScheduleGateEstimated", "arrivalScheduleGateOriginal"] as const
-    : ["departureScheduleGateActual", "departureScheduleGateEstimated", "departureScheduleGateOriginal"] as const;
-  for (const field of fields) {
-    const time = read(field);
-    if (field.endsWith("Actual") && time !== null && time > now) {
-      issues[field] = "future_actual_timestamp";
-      continue;
-    }
-    if (time !== null && !issues[field]) return { at: new Date(time).toISOString(), ms: time, basis: field, issues };
-  }
-  return { at: null, ms: null, basis: null, issues };
-}
-
 export function deriveConnectionCheck(
   inbound: TrackedFlight,
   outbound: TrackedFlight,
@@ -227,8 +296,12 @@ export function deriveConnectionCheck(
   const inboundTiming = deriveTrackingTiming(inbound.flight, now, inbound.timestamp_issues);
   const outboundTiming = deriveTrackingTiming(outbound.flight, now, outbound.timestamp_issues);
   const continuity = airportContinuity(inbound, outbound);
-  const arrival = connectionGateTime(inbound, "arrival", now, inboundTiming.timestamp_issues);
-  const departure = connectionGateTime(outbound, "departure", now, outboundTiming.timestamp_issues);
+  const inboundTimeline = validatedTimeline(inbound.flight, now, inbound.timestamp_issues);
+  const outboundTimeline = validatedTimeline(outbound.flight, now, outbound.timestamp_issues);
+  const gateTime = (value: Candidate | null) => ({ ms: value?.ms ?? null,
+    at: value ? new Date(value.ms).toISOString() : null, basis: value?.basis ?? null });
+  const arrival = gateTime(inboundTimeline.gate);
+  const departure = gateTime(outboundTimeline.departure);
   const layover = arrival.ms === null || departure.ms === null ? null : (departure.ms - arrival.ms) / 60000;
   const inboundTail = normalizedTail(inbound.flight.tail_number);
   const outboundTail = normalizedTail(outbound.flight.tail_number);
@@ -244,12 +317,12 @@ export function deriveConnectionCheck(
   } else if (continuity.matches === null) {
     risk = "unknown";
     riskReason = "Airport continuity cannot be established from the cached identities.";
+  } else if (inboundTimeline.invalidMilestones || outboundTimeline.invalidMilestones) {
+    risk = "unknown";
+    riskReason = "Invalid or inconsistent actual milestones prevent a reliable operational assessment.";
   } else if (layover !== null && layover < 0) {
     risk = "missed";
     riskReason = "Selected outbound gate departure precedes inbound gate arrival; negative layover on the selected cached time bases, not proof of a traveler's outcome.";
-  } else if ((inboundTiming.phase === "unknown" && Object.keys(inboundTiming.timestamp_issues).length > 0) || (outboundTiming.phase === "unknown" && Object.keys(outboundTiming.timestamp_issues).length > 0)) {
-    risk = "unknown";
-    riskReason = "Invalid or inconsistent actual milestones prevent a reliable operational assessment.";
   } else if (["taxi_out", "airborne", "taxi_in", "at_gate"].includes(outboundTiming.phase)) {
     risk = "unknown";
     riskReason = "Outbound has already left its gate in the cache; boarding availability and traveler outcome are unknown.";
@@ -298,7 +371,8 @@ export function deriveConnectionCheck(
     risk_reason: riskReason,
     operational_notice: `Inbound phase: ${inboundTiming.phase}; outbound phase: ${outboundTiming.phase}. These are cached milestones, not a boarding decision.`,
     unknown_factors: ["boarding_cutoff", "security", "walking_time", "immigration", "traveler_identity", "current_data_freshness"],
-    timestamp_issues: { inbound: { ...inboundTiming.timestamp_issues, ...arrival.issues }, outbound: { ...outboundTiming.timestamp_issues, ...departure.issues } },
+    timestamp_issues: { inbound: inboundTimeline.issues, outbound: outboundTimeline.issues },
+    timestamp_conflicts: { inbound: inboundTimeline.conflicts, outbound: outboundTimeline.conflicts },
     timestamp_basis: "UTC",
     calculated_at: new Date(now).toISOString(),
     cached_data_notice: CACHED_TRACKING_NOTICE,

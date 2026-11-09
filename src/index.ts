@@ -88,7 +88,7 @@ server.registerTool(
           "flighty_get_connections — layover and connection info",
           "flighty_get_tracking_status — exact UUID, cached runway/gate phases, countdowns and passenger provenance",
           "flighty_check_connection — check a proposed pair of eligible cached flight UUIDs without assuming traveler identity",
-          "flighty_list_friend_flights — connected friends' flights",
+          "flighty_list_friend_flights — cached shared passenger/followed flights; friendship unverified",
           "flighty_search_airports — airport lookup by code, city, or name",
           "flighty_search_airlines — airline lookup by code, name, or alliance",
         ],

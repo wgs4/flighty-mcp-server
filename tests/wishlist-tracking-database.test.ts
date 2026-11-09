@@ -4,6 +4,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createFixture, IDS } from "./fixture/create.mjs";
 import { fixtureTempRoot, trashFixture } from "./fixture/lifecycle.mjs";
 import { FlightyDatabase, getScopedOwnerIdentity, runWithOwnerIdentityScope } from "../src/services/database.js";
+import { previewHash, RemovalConfirmStore } from "../src/services/removal-confirm.js";
 import { registerTrackingTools } from "../src/tools/tracking.js";
 
 const NOW = Date.parse("2026-11-09T02:00:00.000Z");
@@ -65,7 +66,7 @@ describe("eligible exact UUID tracking reads", () => {
     expect(owner.tracked.flight.booking_reference).toBe("SYNTHETIC-PNR");
     const followed = db.getTrackingFlight(IDS.followed)!.tracked;
     expect(followed.associations[0]).toMatchObject({ tracking_source: "owner_followed", passenger_name: null, passenger_name_source: "unknown", passenger_name_unknown_reason: "followed_row_does_not_identify_passenger", booking_reference: "SYNTHETIC-FOLLOW-PNR" });
-    expect(db.getTrackingFlight(IDS.friendFlight)!.tracked.associations[0]).toMatchObject({ tracking_source: "connected_friend_passenger", passenger_name: "Synthetic Friend" });
+    expect(db.getTrackingFlight(IDS.friendFlight)!.tracked.associations[0]).toMatchObject({ tracking_source: "cached_shared_passenger", passenger_name: "Synthetic Friend" });
     const manual = db.getTrackingFlight(IDS.manual)!.tracked;
     expect(manual.flight.id).toBe(IDS.manual);
     expect(manual.flight.departureScheduleGateOriginal).toBe(new Date(at(70) * 1000).toISOString());
@@ -86,7 +87,7 @@ describe("eligible exact UUID tracking reads", () => {
     expect(association.passenger_name_unknown_reason).toBe("profile_name_missing");
     const listed = db.listFriendFlights().find((row) => row.id === IDS.friendFlight)!;
     expect(listed.friend_name).toBeNull();
-    expect(listed.tracking_source).toBe("connected_friend_passenger");
+    expect(listed.tracking_source).toBe("cached_shared_passenger");
     expect(listed.passenger_name_unknown_reason).toBe("profile_name_missing");
   });
 
@@ -115,7 +116,7 @@ describe("eligible exact UUID tracking reads", () => {
     const tracked = db.getTrackingFlight(IDS.followed)!.tracked;
     expect(tracked.identity_ambiguous).toBe(true);
     expect(tracked.associations.find((a) => a.tracking_source === "owner_followed")!.passenger_name).toBeNull();
-    expect(tracked.associations.find((a) => a.tracking_source === "connected_friend_passenger")!.passenger_name).toBe("Synthetic Friend");
+    expect(tracked.associations.find((a) => a.tracking_source === "cached_shared_passenger")!.passenger_name).toBe("Synthetic Friend");
   });
 
   it("excludes arbitrary unlinked cached flights and another user's followed rows", () => {
@@ -269,5 +270,92 @@ describe("connection lookup and tool integration", () => {
     expect(db.getFlightStatus("ZZ101")!).toMatchObject({ status: "landed", phase: "at_gate" });
     update(IDS.flight, { arrivalScheduleGateActual: at(-10) });
     expect(db.getFlightStatus("ZZ101")!.status).toBe("unknown");
+  });
+});
+
+describe("review regressions: cache provenance, MCT and raw status evidence", () => {
+  it.each([false, true])("M3 labels non-owner membership with Profile=%s as cached sharing, friendship unverified", (withProfile) => {
+    sql.prepare("UPDATE UserFlight SET userId = ? WHERE flightId = ?").run(OTHER, IDS.friendFlight);
+    if (withProfile) sql.prepare("INSERT INTO Profile VALUES (?, 'Cached Person', 'Cached')").run(OTHER);
+    const tracked = db.getTrackingFlight(IDS.friendFlight)!.tracked;
+    expect(tracked.associations[0]).toMatchObject({ tracking_source: "cached_shared_passenger", friendship_status: "unverified", passenger_name: withProfile ? "Cached Person" : null, passenger_name_source: withProfile ? "profile" : "unknown" });
+    expect(tracked.attribution_notice).toMatch(/do not verify friendship/);
+    expect(db.listFriendFlights().find((row) => row.id === IDS.friendFlight)).toMatchObject({ tracking_source: "cached_shared_passenger", friendship_status: "unverified", friend_name: withProfile ? "Cached Person" : null });
+  });
+
+  it.each([
+    ["airport-c", "cached_minimum_airport_context_mismatch"],
+    [null, "unknown_cached_minimum_airport_context"],
+    ["  ", "unknown_cached_minimum_airport_context"],
+    ["missing-airport", "cached_minimum_airport_context_mismatch"],
+  ])("M4 rejects waiting airport %j", (airport, reason) => {
+    sql.prepare("UPDATE Connection SET waitingAirportId = ?").run(airport);
+    const result = db.checkConnection(IDS.flight, IDS.manual)!.result;
+    expect(result.airport_continuity.matches).toBe(true);
+    expect(result.min_connection_time_minutes).toBeNull();
+    expect(result.min_connection_time_basis).toBeNull();
+    expect(result.min_connection_time_reason).toBe(reason);
+    expect(result.risk).toBe("unknown");
+  });
+
+  it("rejects equal MCT values with conflicting waiting-airport contexts", () => {
+    sql.prepare("INSERT INTO Connection VALUES ('context-conflict', ?, ?, 'airport-c', 30, NULL)").run(IDS.flight, IDS.manual);
+    expect(db.checkConnection(IDS.flight, IDS.manual)!.result).toMatchObject({ min_connection_time_minutes: null, min_connection_time_reason: "conflicting_cached_minimum_airport_contexts", risk: "unknown" });
+  });
+
+  it("permits multiple agreeing MCT contexts but rejects a missing context among them", () => {
+    sql.prepare("INSERT INTO Connection VALUES ('same-context', ?, ?, ' AIRPORT-B ', 30, NULL)").run(IDS.flight, IDS.manual);
+    expect(db.checkConnection(IDS.flight, IDS.manual)!.result.min_connection_time_minutes).toBe(30);
+    sql.exec("UPDATE Connection SET waitingAirportId = NULL WHERE id = 'same-context'");
+    expect(db.checkConnection(IDS.flight, IDS.manual)!.result.min_connection_time_reason).toBe("unknown_cached_minimum_airport_context");
+  });
+
+  it("does not apply MCT when the transfer airport cannot be established", () => {
+    update(IDS.flight, { scheduledArrivalAirportId: null });
+    const result = db.checkConnection(IDS.flight, IDS.manual)!.result;
+    expect(result.airport_continuity.matches).toBeNull();
+    expect(result.min_connection_time_minutes).toBeNull();
+    expect(result.min_connection_time_reason).toBe("unknown_cached_minimum_airport_context");
+  });
+
+  it("ManualFlight without runway schedule rejects gate arrival before its departure", async () => {
+    update(IDS.manual, { arrivalScheduleGateOriginal: at(20) }, "ManualFlight");
+    const timing = body(await tools().get("flighty_get_tracking_status")!.handler({ flight_id: IDS.manual })).result.timing;
+    expect(timing.minutes_to_gate).toBeNull();
+    expect(timing.timestamp_issues.arrivalScheduleGateOriginal).toBe("gate_arrival_precedes_departure");
+    expect(db.checkConnection(IDS.manual, IDS.friendFlight)!.result.arrival_gate_at).toBeNull();
+  });
+
+  it.each([-1, 0, "invalid", 1e20])("M5 legacy status retains invalid raw actual %j and matches exact tracking unknown", async (actual) => {
+    update(IDS.flight, { departureScheduleGateOriginal: at(10), arrivalScheduleRunwayActual: actual });
+    const status = db.getFlightStatus("ZZ101")!;
+    const exact = body(await tools().get("flighty_get_tracking_status")!.handler({ flight_id: IDS.flight })).result.timing;
+    expect(status.status).toBe("unknown");
+    expect(status.phase).toBe(exact.phase);
+    expect(status.phase_reason).toBe(exact.phase_reason);
+    expect(exact.timestamp_issues.arrivalScheduleRunwayActual).toBe("invalid_timestamp");
+  });
+
+  it("status and tracking calls do not enrich or mutate hashed removal records as time advances", () => {
+    update(IDS.flight, { arrivalScheduleRunwayActual: -1 });
+    const before = db.getRemovalFlight(IDS.flight);
+    const serialized = JSON.stringify(before);
+    const preview = { ...before! };
+    const hash = previewHash(preview);
+    const store = new RemovalConfirmStore();
+    const issued = store.issue(IDS.flight, preview);
+    db.getFlightStatus("ZZ101");
+    db.getTrackingFlight(IDS.flight);
+    vi.mocked(Date.now).mockReturnValue(NOW + 60000);
+    db.getFlightStatus("ZZ101");
+    db.checkConnection(IDS.flight, IDS.manual);
+    const after = db.getRemovalFlight(IDS.flight)!;
+    expect(JSON.stringify(after)).toBe(serialized);
+    expect(previewHash({ ...after })).toBe(hash);
+    expect(store.consume(issued.code, IDS.flight, { ...after })).toEqual({ ok: true });
+    expect(store.consume(issued.code, IDS.flight, { ...after })).toEqual({ ok: false, reason: "replay" });
+    expect(before!.flight).not.toHaveProperty("timestamp_issues");
+    expect(before!.flight).not.toHaveProperty("calculated_at");
+    expect(before!.flight).not.toHaveProperty("timing");
   });
 });

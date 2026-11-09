@@ -26,10 +26,10 @@ function tracked(overrides: Partial<FlightRecord> = {}, metadata: Partial<Tracke
 const minimum: CachedConnectionMinimum = { minutes: 30, basis: "cached_exact_pair", reason: null };
 const noMinimum: CachedConnectionMinimum = { minutes: null, basis: null, reason: "no_cached_connection_for_exact_pair" };
 const check = (inbound: TrackedFlight, outbound: TrackedFlight, mct = minimum) => deriveConnectionCheck(inbound, outbound, mct, NOW);
-const inbound = (overrides: Partial<FlightRecord> = {}) => tracked({ arrivalScheduleGateEstimated: at(10), ...overrides });
+const inbound = (overrides: Partial<FlightRecord> = {}) => tracked({ arrivalScheduleRunwayOriginal: at(0), arrivalScheduleGateEstimated: at(10), ...overrides });
 const outbound = (overrides: Partial<FlightRecord> = {}, metadata: Partial<TrackedFlight> = {}) => tracked({
   id: "44444444-4444-4444-8444-444444444444", departure_airport_iata: "BBB", arrival_airport_iata: "CCC",
-  departureScheduleGateOriginal: at(50), ...overrides,
+  departureScheduleGateOriginal: at(50), arrivalScheduleRunwayOriginal: at(90), arrivalScheduleGateOriginal: at(110), ...overrides,
 }, { departure_airport_id: "b", arrival_airport_id: "c", ...metadata });
 
 describe("runway and gate milestone timing", () => {
@@ -241,5 +241,110 @@ describe("explicit proposed connection logic", () => {
     expect(future.risk).toBe("unknown");
     expect(future.departure_gate_time_basis).toBe("departureScheduleGateOriginal");
     expect(future.timestamp_issues.outbound.departureScheduleGateActual).toBe("future_actual_timestamp");
+  });
+});
+
+describe("review regressions: shared chronology validation", () => {
+  it("M1/Gemini M2 rejects gate ETA before touchdown in tracking and connection, retaining diagnostics", () => {
+    const leg = inbound({ arrivalScheduleRunwayActual: at(-5), arrivalScheduleGateEstimated: at(-10), arrivalScheduleGateOriginal: at(40) });
+    const timing = deriveTrackingTiming(leg.flight, NOW);
+    const result = check(leg, outbound({ departureScheduleGateOriginal: at(60) }));
+    expect(timing.phase).toBe("taxi_in");
+    expect(timing.minutes_to_gate).toBeNull();
+    expect(timing.gate_time_basis).toBeNull();
+    expect(result.arrival_gate_at).toBeNull();
+    expect(result.layover_minutes).toBeNull();
+    expect(result.risk).toBe("unknown");
+    expect(result.timestamp_issues.inbound.arrivalScheduleGateEstimated).toBe("gate_arrival_precedes_touchdown");
+    expect(timing.timestamp_issues).toEqual(result.timestamp_issues.inbound);
+    expect(timing.timestamp_conflicts.arrivalScheduleGateEstimated).toEqual(["arrivalScheduleRunwayActual"]);
+  });
+
+  it.each(["arrivalScheduleGateEstimated", "arrivalScheduleGateOriginal"] as const)("rejects reversed %s without a runway schedule, rather than selecting another unchecked field", (field) => {
+    const leg = inbound({ departureScheduleGateOriginal: at(80), arrivalScheduleRunwayOriginal: null,
+      arrivalScheduleGateEstimated: field.endsWith("Estimated") ? at(20) : null, arrivalScheduleGateOriginal: at(20) });
+    const timing = deriveTrackingTiming(leg.flight, NOW);
+    expect(timing.minutes_to_gate).toBeNull();
+    expect(timing.gate_countdown_reason).toBe("gate_arrival_precedes_departure");
+    const result = check(leg, outbound({ departureScheduleGateOriginal: at(60) }));
+    expect(result.arrival_gate_time_basis).toBeNull();
+    expect(result.timestamp_issues.inbound[field]).toBe("gate_arrival_precedes_departure");
+    expect(result.risk).toBe("unknown");
+  });
+
+  it("validates every arrival fallback against runway arrival, not just the preferred ETA", () => {
+    const result = check(inbound({ arrivalScheduleGateEstimated: "invalid", arrivalScheduleGateOriginal: at(10), arrivalScheduleRunwayEstimated: at(20) }), outbound());
+    expect(result.arrival_gate_at).toBeNull();
+    expect(result.timestamp_issues.inbound).toMatchObject({ arrivalScheduleGateEstimated: "invalid_timestamp", arrivalScheduleGateOriginal: "gate_arrival_precedes_runway_arrival" });
+    expect(result.risk).toBe("unknown");
+  });
+
+  it("uses a labelled valid scheduled gate fallback for malformed ETA in both paths", () => {
+    const leg = inbound({ arrivalScheduleGateEstimated: "invalid", arrivalScheduleGateOriginal: at(25) });
+    const timing = deriveTrackingTiming(leg.flight, NOW);
+    const result = check(leg, outbound());
+    expect(timing.minutes_to_gate).toBe(25);
+    expect(timing.gate_time_basis).toBe("arrivalScheduleGateOriginal");
+    expect(result.arrival_gate_time_basis).toBe(timing.gate_time_basis);
+    expect(result.layover_minutes).toBe(25);
+    expect(result.risk).toBe("below_minimum");
+    expect(result.timestamp_issues.inbound.arrivalScheduleGateEstimated).toBe("invalid_timestamp");
+  });
+
+  it.each(["departureScheduleGateEstimated", "departureScheduleGateOriginal"] as const)("validates outbound %s fallback against actual takeoff", (field) => {
+    const result = check(inbound(), outbound({ departureScheduleRunwayActual: at(-10), departureScheduleGateEstimated: field.endsWith("Estimated") ? at(10) : "bad", departureScheduleGateOriginal: at(20) }));
+    expect(result.departure_gate_at).toBeNull();
+    expect(result.timestamp_issues.outbound[field]).toBe("gate_departure_follows_runway_or_arrival");
+    expect(result.risk).toBe("unknown");
+  });
+
+  it.each(["departureScheduleGateEstimated", "departureScheduleRunwayEstimated"] as const)("M2 uses current %s rather than stale original departure as landing bound", (field) => {
+    const timing = deriveTrackingTiming(flight({ departureScheduleGateOriginal: at(-100), [field]: at(40), arrivalScheduleRunwayEstimated: at(30), arrivalScheduleGateOriginal: at(35) }), NOW);
+    expect(timing.minutes_to_landing).toBeNull();
+    expect(timing.landing_countdown_state).toBe("unknown");
+    expect(timing.timestamp_issues.arrivalScheduleRunwayEstimated).toBe("runway_arrival_precedes_departure");
+    expect(timing.timestamp_conflicts.arrivalScheduleRunwayEstimated).toEqual([field]);
+    expect(timing.minutes_to_gate).toBeNull();
+  });
+
+  it("does not treat gate ETA exactly now as actual arrival", () => {
+    const timing = deriveTrackingTiming(flight({ arrivalScheduleRunwayOriginal: null, arrivalScheduleGateEstimated: at(0) }), NOW);
+    expect(timing.minutes_to_gate).toBeNull();
+    expect(timing.gate_countdown_reason).toBe("gate_arrival_time_passed_without_actual_gate_arrival");
+    expect(timing.phase).toBe("unknown");
+    expect(deriveTrackingTiming(flight({ arrivalScheduleGateActual: at(0) }), NOW).minutes_to_gate).toBe(0);
+  });
+
+  it("Gemini M1 keeps the maximum actual watermark and rejects both actual gate selections", () => {
+    const leg = inbound({ departureScheduleGateActual: at(-10), departureScheduleRunwayActual: at(-50), arrivalScheduleRunwayActual: at(-40), arrivalScheduleGateActual: at(-30) });
+    const timing = deriveTrackingTiming(leg.flight, NOW);
+    expect(timing.timestamp_issues).toMatchObject({ departureScheduleGateActual: "inconsistent_actual_milestones", departureScheduleRunwayActual: "out_of_order_actual_milestones", arrivalScheduleRunwayActual: "out_of_order_actual_milestones", arrivalScheduleGateActual: "out_of_order_actual_milestones" });
+    expect(timing.phase).toBe("unknown");
+    expect(check(leg, outbound()).arrival_gate_time_basis).not.toBe("arrivalScheduleGateActual");
+    const departing = outbound({ departureScheduleGateActual: at(-5), departureScheduleRunwayActual: at(-20) });
+    const result = check(inbound(), departing);
+    expect(result.departure_gate_time_basis).toBe("departureScheduleGateOriginal");
+    expect(result.risk).toBe("unknown");
+    expect(result.risk_reason).toMatch(/Invalid or inconsistent actual/);
+  });
+
+  it.each(["inbound", "outbound"])("invalid actuals on %s outrank a coherent negative fallback layover", (side) => {
+    const arriving = inbound({ arrivalScheduleGateEstimated: at(60), ...(side === "inbound" ? { departureScheduleGateActual: "bad" } : {}) });
+    const departing = outbound(side === "outbound" ? { departureScheduleGateActual: at(10) } : {});
+    const result = check(arriving, departing);
+    expect(result.layover_minutes).toBe(-10);
+    expect(result.risk).toBe("unknown");
+    expect(result.risk_reason).toMatch(/Invalid or inconsistent actual/);
+  });
+});
+
+describe("contradictory current departure estimates", () => {
+  it("does not erase a rejected gate estimate and then validate an arrival before it", () => {
+    const timing = deriveTrackingTiming(flight({ departureScheduleGateEstimated: at(40), departureScheduleRunwayEstimated: at(30), arrivalScheduleRunwayEstimated: at(35), arrivalScheduleGateEstimated: at(35) }), NOW);
+    expect(timing.minutes_to_landing).toBeNull();
+    expect(timing.minutes_to_gate).toBeNull();
+    expect(timing.timestamp_issues.departureScheduleGateEstimated).toBe("gate_departure_follows_runway_or_arrival");
+    expect(timing.timestamp_issues.arrivalScheduleRunwayEstimated).toBe("runway_arrival_precedes_departure");
+    expect(timing.timestamp_issues.arrivalScheduleGateEstimated).toBe("gate_arrival_precedes_departure");
   });
 });
