@@ -1,12 +1,12 @@
 # Flighty MCP Server
 
-> **Local wishlist extension.** Provides cached UUID tracking, proposed connection checks and database-level freshness metadata. Runtime `9412c5e` passed dual independent review with no HIGH/MEDIUM findings and one retained LOW; PM and Codex each passed 294 tests / 17 files and full stdio 5/5 (17 default / 14 read-only, zero read-network calls). See [verification evidence and limits](FORK-NOTES.md#wishlist-verification-evidence-and-limits). This is source/synthetic evidence, not installation or real-account validation.
+> **Runtime modes.** Local Mac stdio provides cached tracking, connection checks and freshness. Explicit replica mode adds verified cached reads and authenticated Mac operation receipts. See the [runtime and operator contract](docs/SPEC.md), [source build](docs/BUILD.md) and [field allowlist](docs/REPLICA-FIELDS.md). Review, acceptance and installed-version records are maintained separately; these docs do not certify deployment.
 
 For this fork's source installation, guarded writes, existing-client updates and lifecycle commands, follow [FORK-NOTES.md](FORK-NOTES.md). The earlier hardening assessment and retained dependency advisories are in [SECURITY_REVIEW.md](SECURITY_REVIEW.md).
 
-A zero-config [MCP](https://modelcontextprotocol.io/) server that connects AI assistants to the [Flighty](https://www.flightyapp.com/) flight tracking app. Ask about your flights, check statuses, look up delay forecasts, and add or remove flights — all through natural conversation.
+An [MCP](https://modelcontextprotocol.io/) server that connects AI assistants to the [Flighty](https://www.flightyapp.com/) flight tracking app. Ask about your flights, check statuses, look up delay forecasts, and add or remove flights — all through natural conversation.
 
-Just install Flighty on your Mac and connect the server. It reads all credentials and configuration directly from the app — no API keys, no tokens, no setup.
+Local mode reads the installed Mac app cache and discovers credentials locally when needed. Replica mode requires explicit private configuration and provisioning; it never falls back to Mac discovery, authentication or session files.
 
 ## What it does
 
@@ -26,10 +26,10 @@ Read operations query Flighty's local SQLite database directly (fast, offline-ca
 
 ## Requirements
 
-- **macOS** — Flighty stores its database in the macOS app sandbox
-- **Flighty macOS app** — installed and signed in
+- **Local mode: macOS** — Flighty stores its database in the macOS app sandbox
+- **Local mode / Mac courier: Flighty macOS app** — installed and signed in
 - **Flighty Pro** — required for the add/remove flight features
-- **Node.js 24+** (only for manual install; the .mcpb bundle includes its own runtime)
+- **Node.js 24+**, installed separately; Node is not bundled
 
 ## Installation
 
@@ -96,7 +96,7 @@ The local wishlist extension exposes 17 tools by default (14 reads and 3 writes)
 }
 ```
 
-After trimming, case-insensitive `1/true/yes/on` enables read-only mode; `0/false/no/off`, empty or unset enables writes. Other values refuse startup. Read-only removes exactly `flighty_add_flight`, `flighty_follow_flight` and `flighty_remove_flight`, leaving 14 read tools; API methods also reject writes. Restart the server to change policy. `flighty_about` reports the mode. God mode (writes enabled) remains the default.
+After trimming, case-insensitive `1/true/yes/on` enables read-only mode; `0/false/no/off`, empty or unset enables writes. Other values refuse startup. Read-only removes exactly `flighty_add_flight`, `flighty_follow_flight` and `flighty_remove_flight`, leaving 14 local tools or 16 replica tools; API methods also reject writes. Replica copy requests remain available and require their own configured capability. Restart the server to change policy. `flighty_about` reports the mode. God mode (writes enabled) remains the default.
 
 ## Friend-Share Installs
 
@@ -118,7 +118,7 @@ You can find the right userId by querying `SELECT userId, COUNT(*) FROM UserFlig
 
 ## Tools
 
-Local wishlist extension: 17 tools (14 read, including about, plus 3 writes). Read-only hides exactly the three write tools. The earlier source baseline had 15 default / 12 read-only tools.
+Local mode: 17 tools (14 reads, including about, plus 3 guarded account writes). Replica mode: 19 default / 16 read-only, adding `flighty_operation_status` and `flighty_request_copy`; the latter queues a cache copy and is not a read-only action. Read-only hides exactly the three write tools. The earlier source baseline had 15 default / 12 read-only tools.
 
 ### Flight Management
 
@@ -322,7 +322,7 @@ Permanently removes a flight from your Flighty account across all devices.
 - `flight_id` (string) — the flight UUID (from `list_flights` or `add_flight` results)
 - `confirm_code` (string, optional) — code returned by the first preview call
 
-**Confirmation:** First call returns a preview and `confirm_code`. Repeat with the same `flight_id` and code within five minutes. The one-use code is process-local and bound to the preview and available owner identity. Restart or changed details invalidate it; it is consumed before the request, including failure. There is no automatic retry. Removal is permanent across devices; inspect account state before attempting another preview after a failed request.
+**Local-mode confirmation:** First call returns a preview and `confirm_code`. Repeat with the same `flight_id` and code within five minutes. The one-use code is process-local and bound to the preview and available owner identity. Restart or changed details invalidate it; it is consumed before the request, including failure. There is no automatic retry. Removal is permanent across devices; inspect account state before attempting another preview after a failed request. In replica mode, the Mac durable store preserves previews, consumed confirmations, fences and history across normal restart, subject to TTL, context and account guards. Restart does not clear them. Add/follow each use one public tool request, but replica responses may remain pending/queued under the original operation ID until an authenticated Mac receipt establishes the result; a queue response is not cloud success.
 
 ---
 
@@ -458,7 +458,7 @@ src/
 
 ## Limitations
 
-- **macOS runtime** — relies on the Flighty macOS app's sandboxed data; Linux, mux and live-feed work are separate future scope
+- **Cache runtime** — local reads use the Mac cache; replica reads use a verified copy. Host rollout and any future upstream integration need separate approval and review.
 - **Flighty app must be installed and signed in** — the server reads its local databases for both flight data and authentication
 - **Read data freshness** — cached status may be stale; a database sync marker does not guarantee any individual flight was updated
 - **Write operations require network** — add/remove flights call the Flighty API

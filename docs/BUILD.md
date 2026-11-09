@@ -8,11 +8,11 @@ npm run build
 npm test
 ```
 
-`npm start` runs the normal server and may read the real local Flighty installation. Use the verifier below for synthetic testing. Never install or test the committed `dist/*.mcpb`.
+`npm start` runs the normal server and may read the real local Flighty installation. Use the verifier below for synthetic testing. Never install or test committed `dist/*.mcpb` artifacts. Node is separately installed, not bundled.
 
 The build compiles into a fresh temporary directory and replaces `build/` only after a successful compile. Old output stays recoverable under `.cache/flighty-build/`. It cannot leak stale files into a successful build. `npm run clean` uses `trash`; it preserves the output if that utility is unavailable. Git remains the source backup.
 
-`npm test` builds source and runs Vitest. Existing token, database-owner, airline and write coverage lives under `tests/`. All test defaults are synthetic. The stdio test exercises all 12 read handlers and checks the exact 15-tool default and 12-tool read-only inventories. Fetch and socket calls are blocked; plist reads are mocked. Tests do not use the installed app, real credentials, or real API.
+`npm test` builds source and runs Vitest. Existing token, database-owner, airline and write coverage lives under `tests/`. All test defaults are synthetic. The stdio test exercises all 14 local read handlers and checks the exact 17-tool default and 14-tool read-only inventories; replica inventory (19/16) is covered by runtime fixture tests. Fetch and socket calls are blocked; plist reads are mocked. Tests do not use the installed app, real credentials, or real API.
 
 For final acceptance, run the executable verifier against the installed build:
 
@@ -46,4 +46,6 @@ Stages and prior extension output remain under `.cache/flighty-bundle/`; the new
 
 The owner moved installation to a separate live checkout, represented publicly as `/path/to/flighty-live`. Preserve its built entry path and existing `flighty` registrations in Claude Code CLI user scope, Codex and agy. Update only to the exact final reviewed SHA after documentation acceptance; the frozen source candidate SHA is not an installed-release claim. The PM records the actual private path and installed SHA. Restart existing server processes and start new client sessions after updating. See [FORK-NOTES.md](../FORK-NOTES.md) for policy, unregister/restore commands and the future-update review process.
 
-The owner reports the app installed, signed in and database present. Synthetic verification neither accesses nor certifies that real installation or API/account behavior. Node 26 was tested; the declared minimum Node 24 and optional binary MCPB packing were not separately exercised.
+The owner reports the app installed, signed in and database present. Synthetic verification neither accesses nor certifies that real installation or API/account behavior. Mac Node 26 and native Linux Node 24 synthetic runs are recorded separately by exact source revision. The candidate-specific PM Linux log records 668/668 tests in 43 files (116.11s), source build and full stdio success with exit 0. Final PM integrity/acceptance records remain separate; older Linux passes do not validate changed source. The actual production runtime and optional binary MCPB packing remain unverified. See [SPEC.md](SPEC.md) for runtime invocation and limits.
+
+The frozen pre-documentation candidate `19a001d92abc2787017e8221e0cb073fcb38980f` has builder-reported **668/668 tests in 43 files (276.21s)**, a subsequent source build and full stdio five-group pass. This identifies tested candidate source, not code acceptance, documentation acceptance or an installed commit. Final independent code reviews and consolidated PM Linux Node 24 integrity evidence must be checked in the private delivery record before release; older revision passes are not substitutes. This Markdown-only pass ran text/source-equality checks, not runtime tests.

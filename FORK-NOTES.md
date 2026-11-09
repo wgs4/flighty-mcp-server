@@ -1,5 +1,9 @@
 # Flighty fork notes
 
+## Runtime operator reference
+
+See [SPEC.md](docs/SPEC.md) for local versus replica mode, exact local CLI grammar, private configuration, copy semantics, durable status, recovery and retirement. Current inventories are local **17/14** and replica **19/16**; default add/follow/remove remain enabled. Keep direct Mac stdio until independently approved and verified cutover. No production transport or installed revision is certified here.
+
 This is a public true fork at [wgs4/flighty-mcp-server](https://github.com/wgs4/flighty-mcp-server), release branch `god-mode-guardrails`. Upstream base: CPLX/flighty-mcp-server **v1.10.1**, commit `fe00e8fc4e68d69df97b3cea64e749b7ae43c287`, under MIT. Retain the complete [LICENSE](LICENSE) and dependency notices when redistributing.
 
 ## Local wishlist extension
@@ -16,6 +20,8 @@ There is no true refresh action or new API use. Rereading cache does not sync it
 
 ## Wishlist verification evidence and limits
 
+This section records the historical local-only revision, not current replica validation.
+
 The reviewed runtime is `9412c5ec95fe66d28724b7fa2a7c880eed03d3ef`, tree `49fc190b882836b086f8166ea0d9ea0558056f25`, integrating tracking `f9d0377` and freshness `50a55b5` on base `42100cc`. Both packets and the exact combined runtime passed independent Codex SOL and Gemini Argon review: **0 HIGH, 0 MEDIUM, 1 retained wishlist LOW**.
 
 | Verification | Accepted source/synthetic evidence |
@@ -31,11 +37,11 @@ Tracking chronology/departure-bound, provenance, exact-pair MCT context and lega
 
 Tests use synthetic databases and mocked mutation transport. Real API/account behavior, real database/schema/cardinality, numeric sync semantics, app/helper lifecycle and individual-flight accuracy remain untested. All existing dependency advisories and residual risks remain in [DEFERRED.md](docs/DEFERRED.md); no clean audit is claimed. The earlier 146-test hardening record is historical, not wishlist verification.
 
-This runtime PASS does not establish installation or production readiness. The exact documentation commit still requires separate dual review and source-equality verification, followed by PM acceptance before any installation update. No new installed SHA is asserted. This release retains the existing Mac stdio registration, client names, entry path, settings and default writes. Linux, mux and live-feed orders are separate future work and are not implemented by this release.
+This runtime PASS does not establish installation or production readiness. The exact documentation commit still requires separate dual review and source-equality verification, followed by PM acceptance before any installation update. No new installed SHA is asserted. This release retains the existing Mac stdio registration, client names, entry path, settings and default writes. That historical local release did not include the replica runtime. The current runtime contract is documented separately in [SPEC.md](docs/SPEC.md).
 
 ## Capability and guards
 
-Writes are enabled by default. Baseline inventory is **15 tools: 12 reads (including about), plus add, follow and remove**; the local wishlist extension adds two reads for **17/14**. Add/follow remain one-step. Remove first returns a preview and `confirm_code`; call `flighty_remove_flight` again with the same `flight_id` and code within five minutes. The random eight-character code is one-use, process-local and bound to the exact ID, preview and available owner identity. Restart invalidates pending codes. Changed details/identity require a fresh preview. Codes are consumed before the deletion request, even if it fails. There is no automatic retry after failure; inspect the result/account state before requesting a new preview because a failed response need not prove no remote change occurred.
+Writes are enabled by default. Current local inventory is **17 default / 14 read-only**; replica is **19/16**, adding status and cache-copy actions. Historical pre-wishlist inventory was 15/12. Add/follow each require one public tool request; replica mode may return pending/queued with the original operation ID until an authenticated Mac receipt establishes the result, not immediate cloud success. In local mode, remove first returns a preview and `confirm_code`; call `flighty_remove_flight` again with the same `flight_id` and code within five minutes. The random eight-character code is one-use, process-local and bound to the exact ID, preview and available owner identity. A local-mode restart invalidates pending codes. In replica mode, the Mac durable store preserves previews, consumed confirmations, fences and history across normal restart, subject to TTL, context and account guards; restart does not clear them. Changed details/identity require a fresh preview. Codes are consumed before the deletion request, even if it fails. There is no automatic retry after failure; inspect the result/account state before requesting a new preview because a failed response need not prove no remote change occurred.
 
 Passenger, followed and valid uncached UUID removal remain available. When local details or identity cannot be resolved, the preview says so and identifies only the exact UUID; this does not prove remote ownership.
 
@@ -43,19 +49,19 @@ Passenger, followed and valid uncached UUID removal remain available. When local
 
 | Value | Behavior |
 | --- | --- |
-| `1`, `true`, `yes`, `on` | Read-only: 12 baseline / 14 combined tools; API methods also reject writes. |
-| `0`, `false`, `no`, `off`, empty or unset | Writes enabled: 15 baseline / 17 combined tools. |
+| `1`, `true`, `yes`, `on` | Read-only: 14 local / 16 replica tools; API methods also reject writes. |
+| `0`, `false`, `no`, `off`, empty or unset | Writes enabled: 17 local / 19 replica tools. |
 | Anything else | Refuse startup with a policy error. |
 
 Authenticated destinations require HTTPS, no embedded userinfo, standard port and the exact `flightyapp.com` host or a dot-delimited subdomain. Stored sync URLs are checked before obtaining credential headers; authenticated redirects are rejected. `FLIGHTY_EXTRA_SYNC_HOSTS` optionally accepts **comma-separated exact hostnames**, trimmed/case-insensitive, with no wildcard, URL scheme, path, port or trailing dot. It is a destination allowlist, never a place for tokens, credentials or secret-bearing URLs. Adding a host permits credential-bearing requests to that host; it does not prove who operates it.
 
-Local token discovery and complete booking/confirmation/ticket fields are intentionally retained, including locally available shared records. Read-only does not redact them. `FLIGHTY_OWNER_USER_ID` still pins an owner and takes precedence; output labels distinguish pinned override, JWT-subject selection and frequency fallback. JWT decoding is not independent authentication. External text is labeled as untrusted data in every tool description/result. Labels cannot guarantee prompt-injection protection or govern what the host client sends to a model service.
+Local token discovery and complete booking/confirmation/ticket fields are intentionally retained, including locally available shared records. Read-only does not redact them. In local mode, `FLIGHTY_OWNER_USER_ID` pins an owner and takes precedence; output labels distinguish pinned override, JWT-subject selection and frequency fallback. JWT decoding is not independent authentication. Replica mode uses explicit owner/account pins without Mac auth, legacy-token or frequency fallback. External text is labeled as untrusted data in every tool description/result. Labels cannot guarantee prompt-injection protection or govern what the host client sends to a model service.
 
 Other hardening includes shell-free absolute plist calls, lazy build-token access, input/date/UUID/page bounds, bounded authenticated requests, safe errors and fresh source builds with LICENSE packaging. See [SECURITY_REVIEW.md](SECURITY_REVIEW.md) for the earlier hardening assessment, wishlist review status and original static baseline, and [docs/DEFERRED.md](docs/DEFERRED.md) for remaining limits.
 
 ## Source build and existing installations
 
-Use **Node >=24**, including built-in `node:sqlite`; validation used Node **26.0.0**. Node 24 was not separately tested. From the exact reviewed checkout:
+Use **Node >=24**, including built-in `node:sqlite`; validation used Node **26.0.0**. Native Linux Node 24 synthetic evidence is revision-specific; see [source validation](docs/BUILD.md). From the exact reviewed checkout:
 
 ```sh
 npm ci --ignore-scripts

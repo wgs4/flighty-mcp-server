@@ -2,17 +2,17 @@
 
 Base: upstream CPLX/flighty-mcp-server v1.10.1, commit fe00e8fc4e68d69df97b3cea64e749b7ae43c287 (MIT).
 
-Keep all existing tools and data fields. Writes remain enabled by default. Local token discovery stays intact. Add and follow remain one-step. Remove first returns a precise preview and a random, one-use confirmation code with a five-minute lifetime. Confirmation is bound to that flight and preview, cannot be replayed, and is consumed before the request.
+Keep all existing tools and data fields. Writes remain enabled by default. Local token discovery stays intact. Add and follow each use one public tool request. Replica responses may remain pending/queued under the original operation ID until an authenticated Mac receipt establishes the result; submission does not imply immediate cloud success. Remove first returns a precise preview and a random, one-use confirmation code with a five-minute lifetime. Confirmation is bound to that flight and preview, cannot be replayed, and is consumed before the request. Local confirmation codes are process-local and invalidated by restart. Replica Mac durable state preserves previews, consumed confirmations, fences and history across normal restart, subject to TTL, context and account guards; restart does not clear them.
 
 Authenticated requests require HTTPS, no userinfo, an exact flightyapp.com host or subdomain, or an explicitly configured extra host. Reject redirects. Validate the stored sync destination before reading credentials. Never include URL queries, credentials or raw API response bodies in errors. Bound request time and body size.
 
 Strict policy: FLIGHTY_READ_ONLY accepts 1/true/yes/on as read-only and 0/false/no/off/empty/unset as writes enabled, case-insensitively after trimming. Other values fail startup clearly. API mutation methods also enforce policy.
 
-Label external text as untrusted data in every tool result and description while keeping fields. Honor explicit owner override, retain heuristic fallback, and identify fallback/shared-owner results. Replace shell plist calls with absolute execFile calls; read build token lazily. Validate date/UUID/year/string inputs, selector exclusivity, and bound page sizes.
+Label external text as untrusted data in every tool result and description while keeping fields. In local mode, honor explicit owner override, retain heuristic fallback, and identify fallback/shared-owner results. Replica mode uses explicit owner/account pins with no Mac auth, legacy-token or frequency fallback. Replace shell plist calls with absolute execFile calls; read build token lazily. Validate date/UUID/year/string inputs, selector exclusivity, and bound page sizes.
 
 Build from locked source dependencies with npm ci --ignore-scripts. Never install committed binary bundles. Package MIT LICENSE, use clean compile output, and document Node >=24 runtime. Tests live in tests/ and use vitest, synthetic SQLite fixtures and mocked fetch only. Cover policy, registration, removal, credential ordering, redirects, owner labels, and no network from every read handler.
 
-Baseline source has 15 tools by default: 12 read tools including about plus 3 writes; read-only has 12. The local wishlist extension adds two read tools for 17 default / 14 read-only. Read-only removes exactly add, follow and remove; default writes remain enabled.
+Historical pre-wishlist source had 15 default / 12 read-only tools. Current local inventory is 17 default / 14 read-only; replica is 19/16 with status and cache-copy actions. Read-only removes exactly add, follow and remove; default writes remain enabled.
 
 Three isolated packets: P1 policy/network/removal; P2 output/process/input hygiene; P3 packaging/test infrastructure. Separate Codex SOL max and Gemini Argon high instances review every packet. Fix HIGH/MEDIUM; document LOW. After first full build run up to two revision rounds, stopping early if clean.
 
@@ -34,4 +34,10 @@ Accepted runtime evidence: `9412c5ec95fe66d28724b7fa2a7c880eed03d3ef` (tree `49f
 
 The full-suite commands were `npm test` and `node tests/verify-stdio.mjs --checks all`; this docs-only pass did not rerun them. Real API, account, database/schema, numeric sync semantics, helper lifecycle and per-flight accuracy remain untested. Exact final documentation dual review, source equality and PM acceptance precede any installation update; no new installed SHA or production readiness is asserted. Retain existing dependency advisories and prior residual risks in [DEFERRED.md](DEFERRED.md); no clean-audit claim. The 146-test hardening record above is historical.
 
-This release uses the existing Mac stdio installation and preserves client names, entry path, settings and default writes. Linux, mux and live-feed orders are separate future work outside this release.
+Preserve the existing Mac stdio installation, client names, entry path, settings and default writes until a separately approved and verified cutover. See [SPEC.md](SPEC.md) for the replica runtime contract.
+
+## Replica runtime requirements
+
+The [runtime specification](SPEC.md) defines the current operator contract: explicit fail-closed replica configuration, one Linux receiver/mailbox/client-history owner, outbound Mac courier and two fixed SSH verbs. Preserve 17/14 local and 19/16 replica inventories, the same three guarded account writes, independent operator authority, original operation IDs and honest UNKNOWN outcomes. Export only the [allowlisted fields](REPLICA-FIELDS.md) through a newly constructed database; keep raw secret-bearing backups private on the Mac outside transfer parents. Copy refresh must never imply source sync or aircraft telemetry.
+
+Host rollout, selected data/capability placement, private configuration, retention/trash audiences, accounts and scheduled jobs require separate approval. Continue direct local stdio until verified cutover. Synthetic tests and component reviews do not establish real schema/API behavior or production transport.
