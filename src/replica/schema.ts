@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { isValidUuid } from "../services/validation.js";
-import { MAX_SYNC_INFO_ROWS } from "../services/freshness.js";
+import { assertSafeSourceDdl, assertSafeSourceDefault } from "./source-ddl.js";
+import { MAX_SYNC_INFO_ROWS, parseSyncTimestamp } from "../services/freshness.js";
 import { createReplicaError } from "./cleanup.js";
 import type {
   ReplicaColumnAffinity,
@@ -289,6 +290,8 @@ export const FORBIDDEN_SOURCE_COLUMNS = Object.freeze([
   "nextURL",
 ]);
 
+const UNKNOWN_SYNC_MARKER = "replica_unknown_sync_marker";
+
 const FORBIDDEN_LAST_SYNC_PATTERNS = [
   /https?:\/\//i,
   /\bBearer\b/i,
@@ -299,7 +302,7 @@ const FORBIDDEN_LAST_SYNC_PATTERNS = [
 
 /**
  * Checks whether a value in `SyncInfo.lastSync` is safe to include in a replica.
- * Preserves null, finite numbers (for unverified numeric sync markers), and bounded non-secret strings.
+ * Preserves null, finite numeric markers, valid timestamp/numeric strings and the fixed unknown sentinel.
  */
 export function isSafeLastSyncValue(value: unknown): boolean {
   if (value === null || value === undefined) {
@@ -322,12 +325,14 @@ export function isSafeLastSyncValue(value: unknown): boolean {
       return false;
     }
   }
-  return true;
+  if (value === UNKNOWN_SYNC_MARKER) return true;
+  const parsed = parseSyncTimestamp(value, Number.MAX_SAFE_INTEGER);
+  return parsed.kind === "known" || parsed.reasonCode === "unverified_numeric_sync_format";
 }
 
 /**
  * Sanitizes a source `SyncInfo.lastSync` value so URLs, tokens, or binary blobs
- * can never be exported through `SyncInfo.lastSync`.
+ * can never be exported through `SyncInfo.lastSync`. Nonempty invalid evidence stays unknown.
  */
 export function sanitizeLastSyncValue(
   value: unknown
@@ -336,7 +341,7 @@ export function sanitizeLastSyncValue(
     return null;
   }
   if (typeof value === "number") {
-    return Number.isFinite(value) ? value : null;
+    return Number.isFinite(value) ? value : UNKNOWN_SYNC_MARKER;
   }
   if (typeof value === "bigint") {
     return value;
@@ -347,11 +352,11 @@ export function sanitizeLastSyncValue(
       return null;
     }
     if (!isSafeLastSyncValue(trimmed)) {
-      return null;
+      return UNKNOWN_SYNC_MARKER;
     }
     return trimmed;
   }
-  return null;
+  return UNKNOWN_SYNC_MARKER;
 }
 
 export interface SourceSchemaInspection {
@@ -381,9 +386,10 @@ export function validateSourceDatabaseSchema(
   for (const name of REPLICA_TABLE_NAMES) {
     if ((name === "Ticket" || name === "Profile") && !existingTables.has(name)) continue;
     const ddl = sourceDb.prepare("SELECT substr(sql, 1, 65537) AS sql FROM sqlite_master WHERE name = ? AND type = 'table'").get(name)?.sql;
-    if (typeof ddl !== "string" || ddl.length > 65536 || !/^CREATE\s+TABLE\b/i.test(ddl) || /\b(?:CHECK|GENERATED|VIRTUAL|REFERENCES|COLLATE|DEFAULT|AS)\b|--|\/\*/i.test(ddl)) {
+    if (typeof ddl !== "string" || ddl.length > 65536 || !/^CREATE\s+TABLE\b/i.test(ddl)) {
       throw createReplicaError("SOURCE_SCHEMA_INVALID", "Source missing required ordinary table or contains unsafe schema expressions.");
     }
+    assertSafeSourceDdl(ddl);
   }
 
   let ticketHasDeletedColumn = false;
@@ -399,7 +405,7 @@ export function validateSourceDatabaseSchema(
     }
 
     const spec = REPLICA_TABLES[tableName];
-    let tableInfo: Array<{ name?: unknown; hidden?: unknown }>;
+    let tableInfo: Array<{ name?: unknown; hidden?: unknown; dflt_value?: unknown }>;
     try {
       tableInfo = sourceDb
         .prepare(`PRAGMA table_xinfo(${tableName})`)
@@ -413,6 +419,7 @@ export function validateSourceDatabaseSchema(
 
     const colSet = new Set<string>();
     for (const colRow of tableInfo) {
+      assertSafeSourceDefault(colRow.dflt_value);
       if (colRow.hidden !== 0) throw createReplicaError("SOURCE_SCHEMA_INVALID", "Generated or hidden source columns are forbidden.");
       if (typeof colRow.name === "string") {
         colSet.add(colRow.name);

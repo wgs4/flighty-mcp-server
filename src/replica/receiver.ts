@@ -16,6 +16,7 @@ import { resolveNowMs, type NowInput } from "../services/freshness.js";
 import { isValidUuid } from "../services/validation.js";
 import {
   assertNoDatabaseSidecars,
+  assertReplicaDatabaseHeader,
   assertNoSymlinkChain,
   assertRegularFileNoSymlink,
   assertSafeAbsolutePath,
@@ -162,15 +163,32 @@ function verifyReplicaBundleInternal(
     );
   }
 
+  assertReplicaDatabaseHeader(dbPath);
   runSqliteTask({ kind: "validate", dbPath, manifest, limits: options.limits }, options.limits?.maxOperationDurationMs);
 
-  return {
+  const verified = {
     bundleDir,
     dbPath,
     manifestPath,
     manifest,
     manifestSha256: computeManifestSha256(manifest),
   };
+  assertVerifiedBundleUnchanged(verified);
+  return verified;
+}
+
+function assertVerifiedBundleUnchanged(verified: VerifiedReplicaBundle): void {
+  assertNoDatabaseSidecars(verified.dbPath);
+  assertExactBundle(verified.bundleDir);
+  assertReplicaDatabaseHeader(verified.dbPath);
+  const { size } = assertRegularFileNoSymlink(verified.manifestPath, "manifest");
+  if (size <= 0 || size > MAX_MANIFEST_BYTES) throw createReplicaError("MANIFEST_INVALID", "Replica manifest changed after validation.");
+  const manifest = parseReplicaManifestJson(readFileSync(verified.manifestPath, "utf8"));
+  if (assertRegularFileNoSymlink(verified.dbPath, "replica database").size !== verified.manifest.dbBytes) throw createReplicaError("DB_DIGEST_MISMATCH", "Replica database size changed after validation.");
+  const digest = computeFileSha256(verified.dbPath);
+  if (computeManifestSha256(manifest) !== verified.manifestSha256 || digest.bytes !== verified.manifest.dbBytes || digest.sha256 !== verified.manifest.dbSha256) {
+    throw createReplicaError("DB_DIGEST_MISMATCH", "Replica bundle changed after validation.");
+  }
 }
 
 export function verifyReplicaBundle(options: VerifyReplicaBundleOptions): VerifiedReplicaBundle {
@@ -646,6 +664,7 @@ export class ReplicaReceiver {
       flushPath(stagedManifestPath, this.config.faultHooks?.onFsync, "bundle-manifest");
       flushPath(stageDir, this.config.faultHooks?.onFsync, "bundle-stage-dir");
 
+      assertVerifiedBundleUnchanged(verified);
       try {
         renameSync(stageDir, generationDir);
         publishedGenDir = generationDir;
@@ -710,6 +729,7 @@ export class ReplicaReceiver {
         },
       };
 
+      assertVerifiedBundleUnchanged({ ...verified, bundleDir: generationDir, dbPath: join(generationDir, REPLICA_DB_FILENAME), manifestPath: join(generationDir, REPLICA_MANIFEST_FILENAME) });
       this.writeStateFileAtomically(nextState);
       this.state = nextState;
       committed = true;

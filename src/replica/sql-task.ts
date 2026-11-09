@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { constructReplicaBundle } from "./exporter.js";
 import { validateReplicaDatabaseSchemaAndContents } from "./schema.js";
-import { publicReplicaError } from "./cleanup.js";
+import { assertReplicaDatabaseHeader, assertNoDatabaseSidecars, publicReplicaError } from "./cleanup.js";
 process.umask(0o077);
 try {
   const task = JSON.parse(readFileSync(0, "utf8"));
@@ -12,6 +12,8 @@ try {
     task.options.storage.validateMount = () => true;
     value = await constructReplicaBundle(task.options);
   } else if (task.kind === "validate") {
+    assertNoDatabaseSidecars(task.dbPath);
+    assertReplicaDatabaseHeader(task.dbPath);
     const db = new DatabaseSync(task.dbPath, { readOnly: true, allowExtension: false, timeout: 100 });
     try { db.exec("PRAGMA trusted_schema = OFF"); validateReplicaDatabaseSchemaAndContents(db, task.manifest, task.limits); }
     finally { db.close(); }

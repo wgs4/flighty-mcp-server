@@ -58,18 +58,16 @@ describe("replica persisted trust, durable commits and retention", () => {
       fault = false; const restarted = new ReplicaReceiver(cfg); const lease = restarted.acquireLease(); expect(lease.sequence).toBe(2); expect(existsSync(lease.dbPath)).toBe(true); lease.release();
     }
   });
-  it("propagates actual EIO/ENOSPC from every fsync call rather than only fault hooks", async () => {
+  it.each([1, 2, 3, 4, 5, 6, 7, 8, 9])("propagates actual fsync failure at boundary %i and recovers the correct highwater", async (nth) => {
     const r = root(), one = await bundle(r), two = await bundle(r, 2);
-    for (let nth = 1;nth <= 9;nth++) {
-      const c = config(r, { stateRootDir: join(r, `flush-state-${nth}`) });
-      const rx = new ReplicaReceiver(c); rx.acceptBundle(one.bundleDir);
-      const original = fs.fsyncSync; let calls = 0;
-      fs.fsyncSync = (fd) => { if (++calls === nth) throw Object.assign(new Error("synthetic fsync fault"), { code: nth % 2 ? "EIO" : "ENOSPC" }); return original(fd); };
-      syncBuiltinESMExports();
-      try { expect(() => rx.acceptBundle(two.bundleDir)).toThrowError(expect.objectContaining({ code: nth >= 8 ? "COMMIT_UNCERTAIN" : "STORAGE_WRITE_FAILED" })); }
-      finally { fs.fsyncSync = original; syncBuiltinESMExports(); }
-      const restarted = new ReplicaReceiver(c); expect(restarted.getStateSnapshot().highwaterSequence).toBe(nth >= 8 ? 2 : 1); const lease = restarted.acquireLease(); expect(lease.sequence).toBe(nth >= 8 ? 2 : 1); lease.release();
-    }
+    const c = config(r, { stateRootDir: join(r, `flush-state-${nth}`) });
+    const rx = new ReplicaReceiver(c); rx.acceptBundle(one.bundleDir);
+    const original = fs.fsyncSync; let calls = 0;
+    fs.fsyncSync = (fd) => { if (++calls === nth) throw Object.assign(new Error("synthetic fsync fault"), { code: nth % 2 ? "EIO" : "ENOSPC" }); return original(fd); };
+    syncBuiltinESMExports();
+    try { expect(() => rx.acceptBundle(two.bundleDir)).toThrowError(expect.objectContaining({ code: nth >= 8 ? "COMMIT_UNCERTAIN" : "STORAGE_WRITE_FAILED" })); expect(calls).toBe(nth); }
+    finally { fs.fsyncSync = original; syncBuiltinESMExports(); }
+    const restarted = new ReplicaReceiver(c); expect(restarted.getStateSnapshot().highwaterSequence).toBe(nth >= 8 ? 2 : 1); const lease = restarted.acquireLease(); expect(lease.sequence).toBe(nth >= 8 ? 2 : 1); lease.release();
   });
   it("handles the exact post-rename fault as uncertain and requires revalidation", async () => {
     const r = root(), b = await bundle(r); let fault = false; const c = config(r, { faultHooks: { afterStateRename: () => { if (fault) throw Error("synthetic crash"); } } }); const rx = new ReplicaReceiver(c); fault = true;

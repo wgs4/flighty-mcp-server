@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, opendirSync, readdirSync, renameSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, opendirSync, readdirSync, readSync, renameSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
 import { sanitizeToolErrorMessage } from "../services/tool-safety.js";
 import { ReplicaError, type CleanupPathFn, type MountCheckFn, type ReplicaErrorCode, type ReplicaStorageAuthority, type ReplicaStorageBudget } from "./types.js";
@@ -60,6 +60,31 @@ export function assertPrivatePath(path: string, root: string, device?: number): 
     if (current === root) break;
   }
 }
+/** Protect the private root's directory entry from replacement through any mount ancestor. */
+function assertTrustedStorageAncestors(root: string, mount: string, device: number): void {
+  assertNoSymlinkChain(root, "storage ancestors");
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  for (let current = root;;current = dirname(current)) {
+    const st = statIfPresent(current);
+    if (st && (!st.isDirectory() || st.dev !== device || (uid !== undefined && st.uid !== uid && st.uid !== 0) || ((st.mode & 0o022) !== 0 && (st.mode & 0o1000) === 0))) {
+      throw createReplicaError("INVALID_PATH", "Storage ancestors allow unauthorized directory replacement.");
+    }
+    if (current === mount) break;
+  }
+}
+
+/** Replica transport supports rollback-journal headers only; WAL may create files on read. */
+export function assertReplicaDatabaseHeader(path: string): void {
+  assertRegularFileNoSymlink(path, "replica database");
+  const header = Buffer.alloc(100);
+  const fd = openSync(path, "r");
+  try {
+    if (readSync(fd, header, 0, header.length, 0) !== header.length || !header.subarray(0, 16).equals(Buffer.from("SQLite format 3\0")) || header[18] !== 1 || header[19] !== 1) {
+      throw createReplicaError("DB_SCHEMA_INVALID", "Replica database requires a standalone rollback-journal header.");
+    }
+  } finally { closeSync(fd); }
+}
+
 export function validateStorage(authority: ReplicaStorageAuthority, paths: readonly string[], create = true): void {
   if (!authority || typeof authority.validateMount !== "function" || !Number.isSafeInteger(authority.expectedDevice) || !Array.isArray(authority.approvedPaths) || authority.approvedPaths.length === 0) {
     throw createReplicaError("MOUNT_UNAVAILABLE", "Explicit storage identity authority is required.");
@@ -72,6 +97,7 @@ export function validateStorage(authority: ReplicaStorageAuthority, paths: reado
   if (!approved || !statIfPresent(mount)?.isDirectory() || (lstatSync(mount).mode & 0o022) !== 0 || lstatSync(mount).dev !== authority.expectedDevice || !isWithin(root, mount)) {
     throw createReplicaError("MOUNT_UNAVAILABLE", "Approved storage mount identity is unavailable.");
   }
+  assertTrustedStorageAncestors(root, mount, authority.expectedDevice);
   assertPrivatePath(root, root, authority.expectedDevice);
   for (const input of paths) {
     const path = assertSafeAbsolutePath(input, "storage path");
