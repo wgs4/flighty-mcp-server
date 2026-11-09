@@ -11,6 +11,9 @@ import { registerReferenceTools } from "./tools/reference.js";
 import { registerStatsTools } from "./tools/stats.js";
 import { registerConnectionTools } from "./tools/connections.js";
 import { registerTrackingTools } from "./tools/tracking.js";
+import { runtimeMode, readConfig } from "./runtime/config.js";
+import { openLinux, type LinuxRuntime } from "./runtime/linux.js";
+import { registerRemoteWriteTools } from "./remote/client.js";
 import { registerWriteTools } from "./tools/write.js";
 import { installToolSafety } from "./services/tool-safety.js";
 import {
@@ -39,10 +42,15 @@ const server = new McpServer({
   version: VERSION,
 });
 
-const db = new FlightyDatabase();
-const api = new FlightyApi({ policy });
-
-installToolSafety(server, db);
+let runtime: LinuxRuntime | undefined;
+try {
+  if (runtimeMode() === "replica") runtime = openLinux(readConfig(process.env.FLIGHTY_RUNTIME_CONFIG, "linux"));
+} catch {
+  console.error("Flighty runtime unavailable: invalid configuration or durable continuity. No automatic initialization.");
+  process.exit(1);
+}
+const db = runtime?.db ?? new FlightyDatabase();
+installToolSafety(server, db, runtime ? { replicaReceiver: runtime.receiver, replicaBudget: runtime.config.budget } : undefined);
 registerFlightTools(server, db);
 registerFlightStatusTools(server, db);
 registerFriendTools(server, db);
@@ -51,8 +59,12 @@ registerStatsTools(server, db);
 registerConnectionTools(server, db);
 registerTrackingTools(server, db);
 if (!readOnly) {
-  registerWriteTools(server, db, api);
+  if (runtime) registerRemoteWriteTools(server, { client: runtime.client, policy, macReceiptKey: runtime.macReceiptKey,
+    rememberRequest: request => runtime!.durable.remember(request) });
+  else registerWriteTools(server, db, new FlightyApi({ policy }));
 }
+
+runtime?.durable.registerTools(server);
 
 server.registerTool(
   "flighty_about",
@@ -73,7 +85,7 @@ server.registerTool(
       version: VERSION,
       author: "CPLX",
       repository: "https://github.com/CPLX/flighty-mcp-server",
-      description:
+      description: runtime ? "Verified cached replica reads and authenticated Mac mutation receipts. Copy refresh does not request upstream Flighty sync." :
         "MCP server for the Flighty flight tracking app. Reads flight data from Flighty's local database and syncs changes via Flighty's API.",
       mode: readOnly ? "read-only" : "read-write",
       tools: {
@@ -82,7 +94,7 @@ server.registerTool(
           "flighty_current_flights — active travel context (±24 hours from now)",
           "flighty_get_flight — look up a single flight by ID or flight number",
           "flighty_search_flights — search by airline, airport, or date range",
-          "flighty_get_flight_status — current status, gate, delay, weather",
+          runtime ? "flighty_get_flight_status — cached status, gate, delay, weather" : "flighty_get_flight_status — current status, gate, delay, weather",
           "flighty_get_delay_forecast — historical on-time performance",
           "flighty_get_flight_stats — aggregate stats (miles, airlines, routes)",
           "flighty_get_connections — layover and connection info",
@@ -102,7 +114,10 @@ server.registerTool(
               "flighty_remove_flight — preview a flight, then confirm removal (syncs to all devices)",
             ],
       },
-      requirements: "macOS with Flighty app installed and signed in",
+      runtime: runtime ? "replica" : "local",
+      cache_note: runtime ? "Verified replica of a Mac cache; copy freshness is separate from unverified Flighty source sync. Producer provenance is not signed-in Mac identity." : "Local Flighty cache",
+      replica_actions: runtime ? ["flighty_operation_status", "flighty_request_copy (copy_refresh only)"] : [],
+      requirements: runtime ? "Explicit provisioned private storage, pinned producer and authenticated Mac courier; no upstream refresh claim" : "macOS with Flighty app installed and signed in",
     };
     return {
       content: [{ type: "text", text: JSON.stringify(about, null, 2) }],
@@ -111,14 +126,23 @@ server.registerTool(
 );
 
 async function main() {
+  const ipc = await runtime?.listen();
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) return; stopping = true;
+    try { await ipc?.close(); runtime?.close(); await server.close(); } finally { process.exit(0); }
+  };
+  process.once("SIGTERM", () => void stop()); process.once("SIGINT", () => void stop());
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  const protocolClose = transport.onclose;
+  transport.onclose = () => { protocolClose?.(); void stop(); };
   console.error(
     `Flighty MCP server running via stdio (${readOnly ? "read-only" : "read-write"} mode)`
   );
 }
 
 main().catch((error) => {
-  console.error("Server error:", error);
+  console.error("Flighty server unavailable; inspect private configuration and continuity.");
   process.exit(1);
 });

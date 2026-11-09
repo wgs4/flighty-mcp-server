@@ -11,6 +11,11 @@ export function withSqliteBudget<T>(totalMs: number, perTaskMs: number, fn: () =
   return budgets.run({ deadline: performance.now() + totalMs, perTaskMs }, fn);
 }
 
+export function assertSqliteBudget(): void {
+  const budget = budgets.getStore();
+  if (budget && performance.now() >= budget.deadline) throw createReplicaError("OPERATION_TIMEOUT", "Whole-call SQLite budget exhausted.");
+}
+
 /** A separate killable process bounds native SQLite execution, including backup and checks. */
 export function runSqliteTask<T>(task: unknown, durationMs = 30000): T {
   const budget = budgets.getStore();

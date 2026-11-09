@@ -51,10 +51,10 @@ export function registerRemoteWriteTools(server: McpServer, options: {
       const receipt = verifyReceipt(signed, options.macReceiptKey, request.body);
       if (["not-dispatched", "dispatched"].includes(receipt.state)) return text({ status: "pending", operation_id: receipt.operationId,
         message: "No terminal Mac receipt yet. Check this operation ID; do not repeat the mutation with a new ID." });
-      if (receipt.state === "succeeded") return text(receipt.result);
+      if (receipt.state === "succeeded") return text({ ...(receipt.result as object), operation_id: receipt.operationId });
       return text({ status: receipt.state, operation_id: receipt.operationId, message: sanitizeReceiptError(receipt.error ?? "Outcome has not been established.") }, true);
     } catch {
-      return text({ status: "unavailable_or_unknown", ...(request ? { operation_id: request.body.operationId } : {}),
+      return text({ status: request ? "pending" : "unavailable", ...(request ? { operation_id: request.body.operationId } : {}),
         message: "Remote helper unavailable or request rejected. Inspect the stored operation before any retry." }, true);
     }
   };

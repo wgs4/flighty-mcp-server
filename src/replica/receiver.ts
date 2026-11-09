@@ -1,4 +1,4 @@
-import { runSqliteTask } from "./work.js";
+import { runSqliteTask, assertSqliteBudget } from "./work.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
@@ -404,6 +404,7 @@ export class ReplicaReceiver {
   }
 
   private writeStateFileAtomically(nextState: PersistedReceiverState): void {
+    assertSqliteBudget();
     const tmpPath = join(
       this.stagingDir,
       `state.json.tmp.${Date.now()}-${randomUUID()}`
@@ -893,6 +894,7 @@ export class ReplicaReceiver {
       },
     };
 
+    try { assertSqliteBudget(); } catch (error) { lease.release(); throw error; }
     return Object.freeze(lease);
   }
 

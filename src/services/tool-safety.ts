@@ -262,6 +262,7 @@ export function wrapToolResult(
       ...result,
       queried_at: freshness.queried_at,
       freshness,
+      ...(replica ? { replica } : {}),
       _meta: {
         ...existingMeta,
         queried_at: freshness.queried_at,
@@ -339,6 +340,7 @@ export function wrapToolResult(
         `[owner_identity: label=${ownerIdentity.label} source=${ownerIdentity.source} shared_or_fallback=${ownerIdentity.isSharedOwner}${warningPart}]`
       );
     }
+    if (replica) lines.push(`[replica_copy: ${JSON.stringify(replica)}]`);
     lines.push(freshnessNoticeLine);
     lines.push(trustNoticeLine);
 
@@ -353,6 +355,7 @@ export function wrapToolResult(
     content: wrappedContent,
     queried_at: freshness.queried_at,
     freshness,
+    ...(replica ? { replica } : {}),
     _meta: {
       ...existingMeta,
       queried_at: freshness.queried_at,
