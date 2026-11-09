@@ -65,7 +65,7 @@ it("malformed storage, overlapping paths, changed mount and account pins fail cl
 it("Mac-local reconciliation requires bound independent operator attestation and keeps UNKNOWN historically", async () => {
   const f = setup(); provisionMac(f.macConfig); let calls = 0;
   let mac = openMac(f.macConfig, { readers: readers(), fetchImpl: vi.fn(async () => { calls++; throw new Error("synthetic lost HTTP response"); }), upload: vi.fn() });
-  const request = (operation: any, operationId: string) => makeRequest({ caller: "linux", account: IDS.owner, issuedAt: Date.now(), expiresAt: Date.now() + 300_000, operationId, operation }, f.caller.privateKey);
+  const request = (operation: any, operationId: string) => { const issuedAt = Date.now(); return makeRequest({ caller: "linux", account: IDS.owner, issuedAt, expiresAt: issuedAt + 300_000, operationId, operation }, f.caller.privateKey); };
   const preview = await mac.executor.submit(request({ kind: "remove-preview", flight_id: IDS.uncached }, "preview"));
   const original = request({ kind: "remove-confirm", flight_id: IDS.uncached, confirm_code: (preview.body.result as any).confirm_code }, "unknown");
   const receipt = await mac.executor.submit(original); expect(receipt.body.state).toBe("unknown"); mac.close();
