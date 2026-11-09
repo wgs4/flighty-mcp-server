@@ -11,6 +11,7 @@ import { registerReferenceTools } from "./tools/reference.js";
 import { registerStatsTools } from "./tools/stats.js";
 import { registerConnectionTools } from "./tools/connections.js";
 import { registerWriteTools } from "./tools/write.js";
+import { installToolSafety } from "./services/tool-safety.js";
 
 const VERSION = "1.10.1";
 
@@ -26,6 +27,7 @@ const server = new McpServer({
 const db = new FlightyDatabase();
 const api = new FlightyApi();
 
+installToolSafety(server, db);
 registerFlightTools(server, db);
 registerFlightStatusTools(server, db);
 registerFriendTools(server, db);

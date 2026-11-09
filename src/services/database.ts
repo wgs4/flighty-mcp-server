@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { DatabaseSync as Database } from "node:sqlite";
 import { existsSync } from "fs";
 import {
@@ -8,6 +9,19 @@ import {
   EARTH_CIRCUMFERENCE_KM,
 } from "../constants.js";
 import { readFlightyAuthToken, readJwtSubject } from "./auth-token.js";
+import {
+  DEFAULT_PAGE_LIMIT,
+  DEFAULT_REFERENCE_LIMIT,
+  MAX_PAGE_LIMIT,
+  MAX_REFERENCE_LIMIT,
+  assertValidBoundedQuery,
+  assertValidFlightNumber,
+  assertValidIsoDate,
+  assertValidLimit,
+  assertValidOffset,
+  assertValidYear,
+  isValidUuid,
+} from "./validation.js";
 import type {
   FlightRecord,
   AirportRecord,
@@ -21,6 +35,44 @@ import type {
   GetFlightParams,
   SearchFlightsParams,
 } from "../types.js";
+
+export type OwnerIdentitySource =
+  | "env_override"
+  | "jwt_subject"
+  | "frequency_fallback";
+
+export type OwnerIdentityLabel =
+  | "signed_in_owner"
+  | "pinned_owner_override"
+  | "shared_or_fallback_owner";
+
+export interface OwnerIdentity {
+  userId: string;
+  source: OwnerIdentitySource;
+  label: OwnerIdentityLabel;
+  isFallback: boolean;
+  isSharedOwner: boolean;
+  warning?: string;
+}
+
+export interface PaginationParams {
+  limit?: number;
+  offset?: number;
+}
+
+interface OwnerIdentityStore {
+  identity: OwnerIdentity | null;
+}
+
+const ownerIdentityStorage = new AsyncLocalStorage<OwnerIdentityStore>();
+
+export function runWithOwnerIdentityScope<T>(fn: () => T): T {
+  return ownerIdentityStorage.run({ identity: null }, fn);
+}
+
+export function getScopedOwnerIdentity(): OwnerIdentity | null {
+  return ownerIdentityStorage.getStore()?.identity ?? null;
+}
 
 function tsToIso(ts: number | null | undefined): string | null {
   if (ts == null || ts <= 0) return null;
@@ -160,6 +212,12 @@ export class FlightyDatabase {
   private dbPath: string;
   private authDbPath: string;
   private cachedOwnerId: string | null = null;
+  private cachedOwner: {
+    envOwner: string;
+    token: string | null;
+    identity: OwnerIdentity;
+  } | null = null;
+  private lastOwnerIdentity: OwnerIdentity | null = null;
 
   constructor(
     dbPath: string = MAIN_DB_PATH,
@@ -172,43 +230,75 @@ export class FlightyDatabase {
   private getDb(): Database {
     if (!existsSync(this.dbPath)) {
       throw new Error(
-        `Flighty database not found at ${this.dbPath}. Make sure the Flighty app is installed.`
+        "Flighty database not found at configured path. Make sure the Flighty app is installed."
       );
     }
     return new Database(this.dbPath, { readOnly: true });
   }
 
-  private getOwnerUserId(db: Database): string {
-    if (this.cachedOwnerId) return this.cachedOwnerId;
+  private recordResolvedIdentity(identity: OwnerIdentity): OwnerIdentity {
+    this.cachedOwnerId = identity.userId;
+    this.lastOwnerIdentity = identity;
+    const store = ownerIdentityStorage.getStore();
+    if (store) {
+      store.identity = identity;
+    }
+    return identity;
+  }
 
+  private resolveOwnerIdentity(db: Database): OwnerIdentity {
     // Tier 0: FLIGHTY_OWNER_USER_ID env var — operator pin.
-    // Use case: a friend-share install with multiple owners' flights in the
-    // local DB where the operator wants to pin a specific one, or any install
-    // where the JWT-based lookup and frequency heuristic both pick the wrong
-    // user.
-    const envOwner = process.env.FLIGHTY_OWNER_USER_ID;
+    const envOwner = (process.env.FLIGHTY_OWNER_USER_ID ?? "").trim();
     if (envOwner) {
-      this.cachedOwnerId = envOwner;
-      return envOwner;
+      if (
+        this.cachedOwner &&
+        this.cachedOwner.envOwner === envOwner &&
+        this.cachedOwner.identity.source === "env_override"
+      ) {
+        return this.recordResolvedIdentity(this.cachedOwner.identity);
+      }
+
+      const identity: OwnerIdentity = {
+        userId: envOwner,
+        source: "env_override",
+        label: "pinned_owner_override",
+        isFallback: false,
+        isSharedOwner: true,
+        warning:
+          "Owner identity is pinned via FLIGHTY_OWNER_USER_ID (shared/override owner); records belong to the configured user ID rather than automatic signed-in account resolution.",
+      };
+      this.cachedOwner = { envOwner, token: null, identity };
+      return this.recordResolvedIdentity(identity);
     }
 
-    // Tier 1: JWT `sub` claim from Flighty's auth token. Authoritative for standard
-    // single-account installs. But on friend-share installs the locally
-    // signed-in account may own zero flights and the JWT userId won't match
-    // any UserFlight/UserManualFlight rows — in that case, fall through to
-    // Tier 2 rather than returning a userId that filters every query to zero.
-    const jwtSubject = readJwtSubject(
-      readFlightyAuthToken(this.dbPath, this.authDbPath) ?? ""
-    );
+    // Tier 1: JWT `sub` claim from Flighty's auth token.
+    const token = readFlightyAuthToken(this.dbPath, this.authDbPath);
+    const jwtSubject = readJwtSubject(token ?? "");
+    if (
+      this.cachedOwner &&
+      this.cachedOwner.envOwner === "" &&
+      this.cachedOwner.token === token &&
+      this.cachedOwner.identity.source === "jwt_subject" &&
+      this.cachedOwner.identity.userId === jwtSubject &&
+      jwtSubject !== null &&
+      this.userHasAnyFlights(db, jwtSubject)
+    ) {
+      return this.recordResolvedIdentity(this.cachedOwner.identity);
+    }
+
     if (jwtSubject && this.userHasAnyFlights(db, jwtSubject)) {
-      this.cachedOwnerId = jwtSubject;
-      return jwtSubject;
+      const identity: OwnerIdentity = {
+        userId: jwtSubject,
+        source: "jwt_subject",
+        label: "signed_in_owner",
+        isFallback: false,
+        isSharedOwner: false,
+      };
+      this.cachedOwner = { envOwner: "", token, identity };
+      return this.recordResolvedIdentity(identity);
     }
 
     // Tier 2: frequency fallback across UserFlight ∪ UserManualFlight.
-    // Picks the userId with the most non-deleted rows across both tables.
-    // The UNION covers friend-share installs where the local DB may hold
-    // only manually-entered flights under a friend's userId.
     const fallback = db
       .prepare(
         `SELECT userId, COUNT(*) AS cnt FROM (
@@ -227,8 +317,41 @@ export class FlightyDatabase {
       );
     }
 
-    this.cachedOwnerId = fallback.userId;
-    return fallback.userId;
+    const identity: OwnerIdentity = {
+      userId: fallback.userId,
+      source: "frequency_fallback",
+      label: "shared_or_fallback_owner",
+      isFallback: true,
+      isSharedOwner: true,
+      warning:
+        "Owner identity resolved via heuristic frequency fallback (shared/fallback owner), not the signed-in account. Records may belong to a shared/other user. Set FLIGHTY_OWNER_USER_ID to pin a specific user ID.",
+    };
+    this.cachedOwner = { envOwner: "", token, identity };
+    return this.recordResolvedIdentity(identity);
+  }
+
+  private getOwnerUserId(db: Database): string {
+    return this.resolveOwnerIdentity(db).userId;
+  }
+
+  getOwnerIdentity(existingDb?: Database): OwnerIdentity {
+    if (existingDb) {
+      return this.resolveOwnerIdentity(existingDb);
+    }
+    const db = this.getDb();
+    try {
+      return this.resolveOwnerIdentity(db);
+    } finally {
+      db.close();
+    }
+  }
+
+  getLastOwnerIdentity(): OwnerIdentity | null {
+    return this.lastOwnerIdentity;
+  }
+
+  clearLastOwnerIdentity(): void {
+    this.lastOwnerIdentity = null;
   }
 
   /** True if the given userId has at least one non-deleted flight row across UserFlight ∪ UserManualFlight. */
@@ -246,6 +369,10 @@ export class FlightyDatabase {
   }
 
   listFlights(params: ListFlightsParams = {}): FlightRecord[] {
+    assertValidYear(params.year);
+    assertValidLimit(params.limit, MAX_PAGE_LIMIT);
+    assertValidOffset(params.offset);
+
     const db = this.getDb();
     try {
       const ownerId = this.getOwnerUserId(db);
@@ -265,7 +392,7 @@ export class FlightyDatabase {
 
       const sortDir = params.upcoming_only ? "ASC" : "DESC";
       query += ` ORDER BY f.departureScheduleGateOriginal ${sortDir} LIMIT ? OFFSET ?`;
-      binds.push(params.limit ?? 50, params.offset ?? 0);
+      binds.push(params.limit ?? DEFAULT_PAGE_LIMIT, params.offset ?? 0);
 
       const rows = db.prepare(query).all(...binds) as Record<string, unknown>[];
       return rows.map(buildFlightDict);
@@ -274,16 +401,28 @@ export class FlightyDatabase {
     }
   }
 
-  currentFlights(): FlightRecord[] {
+  currentFlights(params: PaginationParams = {}): FlightRecord[] {
+    assertValidLimit(params.limit, MAX_PAGE_LIMIT);
+    assertValidOffset(params.offset);
+
     const db = this.getDb();
     try {
       const ownerId = this.getOwnerUserId(db);
       const now = Math.floor(Date.now() / 1000);
       const windowSeconds = 24 * 60 * 60;
+      const limit = params.limit ?? DEFAULT_PAGE_LIMIT;
+      const offset = params.offset ?? 0;
+
       let query = FLIGHT_BASE_QUERY + " AND uf.userId = ?";
       query += " AND f.departureScheduleGateOriginal >= ? AND f.departureScheduleGateOriginal <= ?";
-      query += " ORDER BY f.departureScheduleGateOriginal ASC";
-      const binds = [ownerId, now - windowSeconds, now + windowSeconds];
+      query += " ORDER BY f.departureScheduleGateOriginal ASC LIMIT ? OFFSET ?";
+      const binds = [
+        ownerId,
+        now - windowSeconds,
+        now + windowSeconds,
+        limit,
+        offset,
+      ];
       const rows = db.prepare(query).all(...binds) as Record<string, unknown>[];
       return rows.map(buildFlightDict);
     } finally {
@@ -292,6 +431,11 @@ export class FlightyDatabase {
   }
 
   listFriendFlights(params: ListFriendFlightsParams = {}): FlightRecord[] {
+    assertValidBoundedQuery(params.friend_name, "friend_name");
+    assertValidYear(params.year);
+    assertValidLimit(params.limit, MAX_PAGE_LIMIT);
+    assertValidOffset(params.offset);
+
     const db = this.getDb();
     try {
       const ownerId = this.getOwnerUserId(db);
@@ -318,9 +462,10 @@ export class FlightyDatabase {
       const binds: (string | number | null)[] = [ownerId, ownerId];
 
       if (params.friend_name) {
+        const friendName = params.friend_name.trim();
         query +=
           " AND (UPPER(p.fullName) LIKE UPPER(?) OR UPPER(p.firstName) LIKE UPPER(?))";
-        binds.push(`%${params.friend_name}%`, `%${params.friend_name}%`);
+        binds.push(`%${friendName}%`, `%${friendName}%`);
       }
 
       const now = Math.floor(Date.now() / 1000);
@@ -336,7 +481,7 @@ export class FlightyDatabase {
 
       const sortDir = params.upcoming_only ? "ASC" : "DESC";
       query += ` ORDER BY f.departureScheduleGateOriginal ${sortDir} LIMIT ? OFFSET ?`;
-      binds.push(params.limit ?? 50, params.offset ?? 0);
+      binds.push(params.limit ?? DEFAULT_PAGE_LIMIT, params.offset ?? 0);
 
       const rows = db.prepare(query).all(...binds) as Record<string, unknown>[];
       return rows.map(buildFlightDict);
@@ -346,17 +491,34 @@ export class FlightyDatabase {
   }
 
   getFlight(params: GetFlightParams): FlightRecord | null {
-    if (!params.flight_id && !params.flight_number) return null;
+    const hasId = params.flight_id !== undefined && params.flight_id !== "";
+    const hasNumber =
+      params.flight_number !== undefined && params.flight_number !== "";
+
+    if (!hasId && !hasNumber) return null;
+    if (hasId && hasNumber) {
+      throw new Error(
+        "Provide either flight_id or flight_number, not both (selectors are mutually exclusive)."
+      );
+    }
+    if (hasId && !isValidUuid(params.flight_id!)) {
+      throw new Error(
+        "Invalid flight_id: expected 36-character 8-4-4-4-12 hexadecimal UUID format."
+      );
+    }
+    if (hasNumber) {
+      assertValidFlightNumber(params.flight_number!);
+    }
 
     const db = this.getDb();
     try {
       const ownerId = this.getOwnerUserId(db);
       let query = FLIGHT_BASE_QUERY + " AND uf.userId = ?";
-      let binds: (string | number | null)[] = [ownerId];
+      const binds: (string | number | null)[] = [ownerId];
 
-      if (params.flight_id) {
+      if (hasId) {
         query += " AND f.id = ?";
-        binds.push(params.flight_id);
+        binds.push(params.flight_id!.trim());
       } else {
         // Users pass "AA179" or "179" — database stores just "179" with airline in a separate table.
         // Try matching as airline_iata + number first, fall back to number-only.
@@ -382,6 +544,21 @@ export class FlightyDatabase {
   }
 
   searchFlights(params: SearchFlightsParams = {}): FlightRecord[] {
+    assertValidBoundedQuery(params.airline, "airline");
+    assertValidBoundedQuery(params.departure_airport, "departure_airport");
+    assertValidBoundedQuery(params.arrival_airport, "arrival_airport");
+    assertValidIsoDate(params.after, "after");
+    assertValidIsoDate(params.before, "before");
+    assertValidLimit(params.limit, MAX_PAGE_LIMIT);
+
+    const afterDate = params.after?.trim();
+    const beforeDate = params.before?.trim();
+    if (afterDate && beforeDate && afterDate > beforeDate) {
+      throw new Error(
+        "Invalid date range: 'after' date must not be later than 'before' date."
+      );
+    }
+
     const db = this.getDb();
     try {
       const ownerId = this.getOwnerUserId(db);
@@ -389,31 +566,31 @@ export class FlightyDatabase {
       const binds: (string | number | null)[] = [ownerId];
 
       if (params.airline) {
+        const airline = params.airline.trim();
         query +=
           " AND (UPPER(al.iata) = UPPER(?) OR UPPER(al.name) LIKE UPPER(?))";
-        binds.push(params.airline, `%${params.airline}%`);
+        binds.push(airline, `%${airline}%`);
       }
       if (params.departure_airport) {
+        const depAirport = params.departure_airport.trim();
         query +=
           " AND (UPPER(dep.iata) = UPPER(?) OR UPPER(dep.city) LIKE UPPER(?))";
-        binds.push(
-          params.departure_airport,
-          `%${params.departure_airport}%`
-        );
+        binds.push(depAirport, `%${depAirport}%`);
       }
       if (params.arrival_airport) {
+        const arrAirport = params.arrival_airport.trim();
         query +=
           " AND (UPPER(arr.iata) = UPPER(?) OR UPPER(arr.city) LIKE UPPER(?))";
-        binds.push(params.arrival_airport, `%${params.arrival_airport}%`);
+        binds.push(arrAirport, `%${arrAirport}%`);
       }
-      if (params.after) {
-        const ts = Math.floor(new Date(params.after).getTime() / 1000);
+      if (afterDate) {
+        const ts = Math.floor(new Date(afterDate).getTime() / 1000);
         query += " AND f.departureScheduleGateOriginal >= ?";
         binds.push(ts);
       }
-      if (params.before) {
+      if (beforeDate) {
         // "on or before" means up to the end of the given date (next day midnight UTC)
-        const nextDay = new Date(params.before);
+        const nextDay = new Date(beforeDate);
         nextDay.setUTCDate(nextDay.getUTCDate() + 1);
         const ts = Math.floor(nextDay.getTime() / 1000);
         query += " AND f.departureScheduleGateOriginal < ?";
@@ -421,7 +598,7 @@ export class FlightyDatabase {
       }
 
       query += " ORDER BY f.departureScheduleGateOriginal DESC LIMIT ?";
-      binds.push(params.limit ?? 50);
+      binds.push(params.limit ?? DEFAULT_PAGE_LIMIT);
 
       const rows = db.prepare(query).all(...binds) as Record<string, unknown>[];
       return rows.map(buildFlightDict);
@@ -431,7 +608,8 @@ export class FlightyDatabase {
   }
 
   getFlightStatus(flightNumber: string): FlightStatusRecord | null {
-    const flight = this.getFlight({ flight_number: flightNumber });
+    assertValidFlightNumber(flightNumber);
+    const flight = this.getFlight({ flight_number: flightNumber.trim() });
     if (!flight) return null;
 
     let depDelayMin: number | null = null;
@@ -494,7 +672,8 @@ export class FlightyDatabase {
   }
 
   getDelayForecast(flightNumber: string): DelayForecastRecord | null {
-    const flight = this.getFlight({ flight_number: flightNumber });
+    assertValidFlightNumber(flightNumber);
+    const flight = this.getFlight({ flight_number: flightNumber.trim() });
     if (!flight) return null;
 
     const obs = flight.delay_forecast_observations ?? 0;
@@ -518,7 +697,14 @@ export class FlightyDatabase {
     };
   }
 
-  searchAirports(query: string, limit: number = 10): AirportRecord[] {
+  searchAirports(
+    query: string,
+    limit: number = DEFAULT_REFERENCE_LIMIT
+  ): AirportRecord[] {
+    assertValidBoundedQuery(query, "query");
+    assertValidLimit(limit, MAX_REFERENCE_LIMIT);
+    const q = query.trim();
+
     const db = this.getDb();
     try {
       return db
@@ -539,13 +725,20 @@ export class FlightyDatabase {
              relevance DESC
            LIMIT ?`
         )
-        .all(query, query, `%${query}%`, `%${query}%`, query, query, query, limit) as unknown as AirportRecord[];
+        .all(q, q, `%${q}%`, `%${q}%`, q, q, q, limit) as unknown as AirportRecord[];
     } finally {
       db.close();
     }
   }
 
-  searchAirlines(query: string, limit: number = 10): AirlineRecord[] {
+  searchAirlines(
+    query: string,
+    limit: number = DEFAULT_REFERENCE_LIMIT
+  ): AirlineRecord[] {
+    assertValidBoundedQuery(query, "query");
+    assertValidLimit(limit, MAX_REFERENCE_LIMIT);
+    const q = query.trim();
+
     const db = this.getDb();
     try {
       return db
@@ -560,13 +753,15 @@ export class FlightyDatabase {
            ORDER BY relevance DESC
            LIMIT ?`
         )
-        .all(query, query, `%${query}%`, `%${query}%`, limit) as unknown as AirlineRecord[];
+        .all(q, q, `%${q}%`, `%${q}%`, limit) as unknown as AirlineRecord[];
     } finally {
       db.close();
     }
   }
 
   getFlightStats(year?: number): FlightStatsRecord {
+    assertValidYear(year);
+
     const db = this.getDb();
     try {
       const ownerId = this.getOwnerUserId(db);
@@ -640,8 +835,6 @@ export class FlightyDatabase {
         .all(...binds) as Array<{ route: string; flight_count: number }>;
 
       // Countries visited = distinct set of departure and arrival countries.
-      // Previous implementation summed two COUNT(DISTINCT)s, double-counting
-      // any country that appeared as both origin and destination.
       const countries = db
         .prepare(
           `${FLIGHT_UNION_CTE}
@@ -685,10 +878,16 @@ export class FlightyDatabase {
     }
   }
 
-  getConnections(): ConnectionRecord[] {
+  getConnections(params: PaginationParams = {}): ConnectionRecord[] {
+    assertValidLimit(params.limit, MAX_PAGE_LIMIT);
+    assertValidOffset(params.offset);
+
     const db = this.getDb();
     try {
       const ownerId = this.getOwnerUserId(db);
+      const limit = params.limit ?? DEFAULT_PAGE_LIMIT;
+      const offset = params.offset ?? 0;
+
       const rows = db
         .prepare(
           `${FLIGHT_UNION_CTE}
@@ -713,9 +912,10 @@ export class FlightyDatabase {
            JOIN Airport wait ON c.waitingAirportId = wait.id
            JOIN user_flights_combined uf ON f_in.id = uf.flightId
            WHERE c.deleted IS NULL AND uf.deleted IS NULL AND uf.isMyFlight = 1 AND uf.userId = ?
-           ORDER BY f_in.departureScheduleGateOriginal DESC`
+           ORDER BY f_in.departureScheduleGateOriginal DESC
+           LIMIT ? OFFSET ?`
         )
-        .all(ownerId) as Array<Record<string, unknown>>;
+        .all(ownerId, limit, offset) as Array<Record<string, unknown>>;
 
       return rows.map((r) => {
         const arrTs = r.arrival_time as number | null;
@@ -747,6 +947,7 @@ export class FlightyDatabase {
   lookupAirlines(
     iata: string
   ): Array<{ id: string; name: string; iata: string }> {
+    assertValidBoundedQuery(iata, "iata");
     const db = this.getDb();
     try {
       const rows = db
@@ -763,14 +964,14 @@ export class FlightyDatabase {
            WHERE UPPER(a.iata) = ? AND a.deleted IS NULL
            ORDER BY flightCount DESC, a.name`
         )
-        .all(iata.toUpperCase()) as Array<{
+        .all(iata.trim().toUpperCase()) as Array<{
         id: string;
         name: string;
         iata: string;
       }>;
       if (rows.length === 0) {
         throw new Error(
-          `Airline with IATA code '${iata}' not found in Flighty database.`
+          `Airline with IATA code '${iata.trim()}' not found in Flighty database.`
         );
       }
       return rows.map(({ id, name, iata }) => ({ id, name, iata }));

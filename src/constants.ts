@@ -1,6 +1,6 @@
 import { homedir } from "os";
 import { join } from "path";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 
 const FLIGHTY_CONTAINER = join(
   homedir(),
@@ -25,19 +25,52 @@ export const FLIGHTY_API_BASE = "https://api.flightyapp.com";
 
 export const FLIGHTY_USER_AGENT = "Flighty 4.8.0 (4759) com.flightyapp.flighty";
 
-// Read the build token from the installed Flighty app's Info.plist at runtime.
+export const PLUTIL_PATH = "/usr/bin/plutil";
+
+export const FLIGHTY_INFO_PLIST_PATH =
+  "/Applications/Flighty.app/Contents/Info.plist";
+
+export type PlutilExecFileSync = (
+  file: string,
+  args: readonly string[],
+  options: { encoding: BufferEncoding }
+) => string;
+
+let cachedBuildToken: string | null = null;
+
+// Read the build token lazily from the installed Flighty app's Info.plist.
 // This is an app version identifier (not user-specific) that updates automatically
-// when the user updates Flighty.
-export const FLIGHTY_BUILD_TOKEN = (() => {
+// when the user updates Flighty, and is only needed for API write requests.
+export function getFlightyBuildToken(
+  infoPlistPath: string = FLIGHTY_INFO_PLIST_PATH,
+  execFileImpl: PlutilExecFileSync = execFileSync
+): string {
+  const isDefaultCall =
+    infoPlistPath === FLIGHTY_INFO_PLIST_PATH && execFileImpl === execFileSync;
+  if (isDefaultCall && cachedBuildToken !== null) {
+    return cachedBuildToken;
+  }
   try {
-    return execSync(
-      'plutil -extract FlightyBuildToken raw "/Applications/Flighty.app/Contents/Info.plist"',
+    const token = execFileImpl(
+      PLUTIL_PATH,
+      ["-extract", "FlightyBuildToken", "raw", infoPlistPath],
       { encoding: "utf-8" }
     ).trim();
+    if (isDefaultCall && token) {
+      cachedBuildToken = token;
+    }
+    return token;
   } catch {
     return "";
   }
-})();
+}
+
+export function resetFlightyBuildTokenCache(): void {
+  cachedBuildToken = null;
+}
+
+// Inert fallback export kept so unmerged callers compile without running plutil on import.
+export const FLIGHTY_BUILD_TOKEN = "";
 
 export const TIMESTAMP_COLUMNS = [
   "departureScheduleGateOriginal",

@@ -1,11 +1,17 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
 import type { FlightyDatabase } from "../services/database.js";
+import { installToolSafety } from "../services/tool-safety.js";
+import {
+  boundedQuerySchema,
+  referenceLimitSchema,
+} from "../services/validation.js";
 
 export function registerReferenceTools(
   server: McpServer,
   db: FlightyDatabase
 ): void {
+  installToolSafety(server, db);
+
   server.registerTool(
     "flighty_search_airports",
     {
@@ -14,18 +20,10 @@ export function registerReferenceTools(
 
 Returns: id, name, iata, icao, city, country, countryCode, timeZoneIdentifier, latitude, longitude, website.`,
       inputSchema: {
-        query: z
-          .string()
-          .describe(
-            'Search term — IATA code (e.g. "SFO"), ICAO (e.g. "KSFO"), city (e.g. "San Francisco"), or name (e.g. "Heathrow")'
-          ),
-        limit: z
-          .number()
-          .int()
-          .min(1)
-          .max(50)
-          .default(10)
-          .describe("Maximum results"),
+        query: boundedQuerySchema.describe(
+          'Search term — IATA code (e.g. "SFO"), ICAO (e.g. "KSFO"), city (e.g. "San Francisco"), or name (e.g. "Heathrow")'
+        ),
+        limit: referenceLimitSchema.describe("Maximum results"),
       },
       annotations: {
         readOnlyHint: true,
@@ -55,18 +53,10 @@ Returns: id, name, iata, icao, city, country, countryCode, timeZoneIdentifier, l
 
 Returns: id, name, iata, icao, alliance, website, callsign, formattedPhone.`,
       inputSchema: {
-        query: z
-          .string()
-          .describe(
-            'Search term — IATA code (e.g. "UA"), ICAO (e.g. "UAL"), name (e.g. "United"), or alliance (e.g. "Star Alliance")'
-          ),
-        limit: z
-          .number()
-          .int()
-          .min(1)
-          .max(50)
-          .default(10)
-          .describe("Maximum results"),
+        query: boundedQuerySchema.describe(
+          'Search term — IATA code (e.g. "UA"), ICAO (e.g. "UAL"), name (e.g. "United"), or alliance (e.g. "Star Alliance")'
+        ),
+        limit: referenceLimitSchema.describe("Maximum results"),
       },
       annotations: {
         readOnlyHint: true,
