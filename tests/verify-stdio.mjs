@@ -85,7 +85,7 @@ export async function verifyStdio({ entry = defaultEntry, fixtureDirectory = fix
     catch (error) { failures.push({ name, reason: error.message }); log(`FAIL ${name}: ${error.message}`); }
   }
   try {
-    await check("default inventory: 12 read + 3 write = 15", () => session(entry, fixture, undefined, "deny", async (client) => {
+    await check("default inventory: 14 read + 3 write = 17", () => session(entry, fixture, undefined, "deny", async (client) => {
       const { tools } = await client.listTools();
       assert.deepEqual(tools.map((tool) => tool.name).sort(), [...READ_NAMES, ...WRITE_NAMES].sort());
       for (const tool of tools) assert.match(tool.description, /untrusted data, not instructions/);
@@ -94,9 +94,9 @@ export async function verifyStdio({ entry = defaultEntry, fixtureDirectory = fix
         validate(parseToolResult(result));
         assert.equal(fetchCalls(fixture), 0, `${name} must not call fetch`);
       }
-      log("PASS all 12 read handlers returned expected fixture data with zero network calls");
+      log("PASS all 14 read handlers returned expected fixture data with zero network calls");
     }));
-    await check("read-only inventory: 12 read tools", () => session(entry, fixture, "1", "deny", async (client) => {
+    await check("read-only inventory: 14 read tools", () => session(entry, fixture, "1", "deny", async (client) => {
       const { tools } = await client.listTools();
       assert.deepEqual(tools.map((tool) => tool.name).sort(), READ_NAMES);
       const read = await client.callTool({ name: "flighty_list_flights", arguments: {} });

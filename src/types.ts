@@ -56,7 +56,11 @@ export interface FlightRecord {
   booking_reference: string | null;
   flight_reason: string | null;
   import_source: string | null;
-  friend_name?: string;
+  friend_name?: string | null;
+  tracking_source?: TrackingSource;
+  friendship_status?: "unverified";
+  passenger_name_source?: "profile" | "unknown";
+  passenger_name_unknown_reason?: string | null;
 }
 
 export interface AirportRecord {
@@ -86,7 +90,9 @@ export interface AirlineRecord {
 
 export interface FlightStatusRecord {
   flight_number: string;
-  status: "scheduled" | "delayed" | "in_air" | "landed" | "cancelled";
+  status: "scheduled" | "delayed" | "taxi_out" | "in_air" | "landed" | "cancelled" | "unknown";
+  phase: FlightPhase;
+  phase_reason: string;
   is_cancelled: boolean;
   departure_airport: string;
   arrival_airport: string;
@@ -180,4 +186,40 @@ export interface SearchFlightsParams {
   after?: string;
   before?: string;
   limit?: number;
+}
+
+export type TrackingSource = "owner_passenger" | "owner_followed" | "cached_shared_passenger";
+export type FlightPhase = "scheduled" | "taxi_out" | "airborne" | "taxi_in" | "at_gate" | "cancelled" | "unknown";
+
+export interface TrackingAssociation {
+  user_id: string;
+  tracking_source: TrackingSource;
+  friendship_status: "unverified";
+  passenger_name: string | null;
+  passenger_name_source: "profile" | "unknown";
+  passenger_name_unknown_reason: string | null;
+  seat_number: string | null;
+  seat_position: string | null;
+  cabin_class: string | null;
+  booking_reference: string | null;
+  flight_reason: string | null;
+  import_source: string | null;
+}
+
+export interface TrackedFlight {
+  flight: FlightRecord;
+  associations: TrackingAssociation[];
+  identity_ambiguous: boolean;
+  attribution_notice: string;
+  departure_airport_id: string | null;
+  arrival_airport_id: string | null;
+  departure_code_unambiguous: boolean;
+  arrival_code_unambiguous: boolean;
+  timestamp_issues: Record<string, string>;
+}
+
+export interface CachedConnectionMinimum {
+  minutes: number | null;
+  basis: "cached_exact_pair" | null;
+  reason: string | null;
 }
