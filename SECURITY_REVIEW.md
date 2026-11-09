@@ -1,10 +1,12 @@
 # Security review and hardening assessment
 
-## Local wishlist extension: evidence snapshot
+## Local wishlist extension: accepted runtime evidence
 
 The local extension adds cache-only `flighty_get_tracking_status` and `flighty_check_connection` plus freshness metadata to source base `42100cc`: 17 default / 14 read-only tools. Read-only removes exactly the same three writes. Default writes, full booking-data access, owner fallback, trust notices and guarded removal remain intentional. Profile/membership provenance does not verify friendship or a common traveler. Invocation time, database sync markers and individual-flight freshness remain distinct; numeric sync formats are unverified. No true refresh, new API use, verified telemetry source or safe-connection guarantee is added.
 
-**Current evidence does not establish combined release acceptance.** Freshness revision `50a55b5` has dual independent PASS; both MEDIUM and all three LOW findings are resolved. Tracking revision 2 `f9d0377` contains the prior corrections, including the contradictory-original-departure bound fix; its final independent review is outstanding at this snapshot. Only Airport soft-deleted-row ambiguity is retained as a wishlist LOW. Standalone reports record 262 tracking tests and 178 freshness tests plus full stdio; no combined suite/count/PASS or new installed SHA is asserted. See [verification evidence and limits](FORK-NOTES.md#wishlist-verification-evidence-and-limits). No real API/account/database/schema or Mac lifecycle verification is established. Existing dependency advisories and historical hardening residuals remain in [DEFERRED.md](docs/DEFERRED.md); no clean audit or dependency remediation is claimed.
+**Runtime `9412c5ec95fe66d28724b7fa2a7c880eed03d3ef` passed dual independent integration review: 0 HIGH, 0 MEDIUM, 1 retained wishlist LOW.** Tracking `f9d0377` and freshness `50a55b5` both have dual independent PASS; the chronology/departure-bound corrections and all freshness MEDIUM/LOW findings are resolved. Airport soft-deleted-row ambiguity remains the sole wishlist LOW and can conservatively produce unknown continuity. PM and Codex each passed **294 tests / 17 files** and full stdio **5/5**, **17 default / 14 read-only**, with zero read-network calls. Codex also passed **11/11** combined-tool probe groups; Gemini passed **292 targeted tests / 15 files** and a separate source-level cross-packet probe. API/policy, credential/URL/redirect, removal and dependency guards remain preserved. See [verification evidence and limits](FORK-NOTES.md#wishlist-verification-evidence-and-limits).
+
+These source/synthetic results do not verify real API/account/database/schema or Mac app/helper lifecycle. Exact final documentation dual review, source equality and PM acceptance remain separate gates before installation; no new installed SHA or production-readiness claim is made. Linux, mux and live-feed orders are separate future work outside this release. Existing dependency advisories and historical hardening residuals remain in [DEFERRED.md](docs/DEFERRED.md); no clean audit or dependency remediation is claimed.
 
 ## Earlier hardening assessment (before wishlist)
 
@@ -27,7 +29,7 @@ Assessment date: **2026-11-08**. The original static review is preserved below a
 
 All runtime SQLite opens request `readOnly: true`; account mutations are remote API operations. No SQL mutation/injection path was identified. This is not an OS sandbox or proof of zero SQLite/WAL filesystem side effects.
 
-## Synthetic validation and independent review evidence
+## Historical pre-wishlist synthetic validation and independent review evidence
 
 The integration builder and PM each ran the full **146 tests in 14 files**, source build and full MCP stdio verifier successfully. Each independent integrated reviewer ran **145 tests in 13 files**, omitting only `tests/packaging.test.ts` because it deliberately mutates build output, and independently passed full stdio verification. Codex also compared in-memory compiler output with the existing build: **38 JavaScript/declaration files matched**; source maps were excluded for the documented LOW. Both reviews confirmed all **91 production lock entries unchanged** from upstream.
 

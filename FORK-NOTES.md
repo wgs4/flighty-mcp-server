@@ -16,18 +16,22 @@ There is no true refresh action or new API use. Rereading cache does not sync it
 
 ## Wishlist verification evidence and limits
 
-Reported standalone checks, not a combined-release result:
+The reviewed runtime is `9412c5ec95fe66d28724b7fa2a7c880eed03d3ef`, tree `49fc190b882836b086f8166ea0d9ea0558056f25`, integrating tracking `f9d0377` and freshness `50a55b5` on base `42100cc`. Both packets and the exact combined runtime passed independent Codex SOL and Gemini Argon review: **0 HIGH, 0 MEDIUM, 1 retained wishlist LOW**.
 
-| Packet | Source pin | Reported synthetic checks |
-| --- | --- | --- |
-| Tracking revision 2 | `f9d0377` | 262 tests / 16 files; full stdio 5/5, 17 default / 14 read-only |
-| Freshness revision | `50a55b5` | 178 tests / 15 files; full stdio 5/5, standalone 15 default / 12 read-only; original 13-check reproducer passed |
+| Verification | Accepted source/synthetic evidence |
+| --- | --- |
+| PM and independent Codex full suite | Each passed **294 tests / 17 files**, including the normal source build and packaging check |
+| PM and independent Codex full MCP stdio | Each passed **5/5 groups**, **17 default / 14 read-only**; all 14 read handlers returned expected fixtures with zero network calls; policy and mocked removal/confirmation/replay passed |
+| Independent Codex additional SDK probes | **11/11 groups** passed: combined-tool membership, chronology, freshness, concurrent invocation isolation and removal invariance; zero network or app/external-process attempts |
+| Independent Gemini targeted suite | **292 tests / 15 files** passed, excluding packaging and stdio files; its separate source-level cross-packet probe passed with zero socket/read-fetch attempts and one injected mocked write |
 
-Freshness passed both independent revision reviews; its two MEDIUM findings and all three LOW findings are resolved. Tracking's prior chronology, estimated-departure, provenance, MCT context and legacy-status corrections are in the pinned source, including the revision-2 contradictory-original-departure correction. Final independent review of that tracking packet is still outstanding at this evidence snapshot. Its only retained LOW is Airport soft-deleted-row ambiguity. No combined test count or integrated PASS is claimed. No new installed SHA is identified by these records.
+Full-suite commands were `npm test` and `node tests/verify-stdio.mjs --checks all`, run sequentially on the reviewed runtime. These are reported execution results; this documentation pass did not rerun them. Gemini's targeted suite is not a second full-suite or full-stdio run, and overlapping packet counts are not added.
 
-After combining runtime packets, verification commands are `npm test` and `node tests/verify-stdio.mjs --checks all`, run sequentially from the combined source checkout. The documentation pass did not run these commands. Standalone counts overlap and must not be added. Combined runtime and exact final documentation review remain required before publication/installation.
+Tracking chronology/departure-bound, provenance, exact-pair MCT context and legacy-status corrections passed dual review. Freshness mixed-marker/overflow corrections and all three freshness LOWs are resolved. The sole retained wishlist LOW is **Airport soft-deleted-row ambiguity**: joins/counts can conservatively prevent IATA fallback when stable IDs are unavailable, yielding unknown continuity rather than a favorable connection result. Earlier hardening residuals still apply. Reviewers confirmed preserved API/policy, credential/URL/redirect, removal, validation and dependency guards; the legacy connection list and raw removal records remain unchanged.
 
-Tests use synthetic databases and mocked mutation transport; read handlers made zero network attempts in reported stdio checks. Real API/account behavior, real database/schema/cardinality, numeric sync semantics, app/helper lifecycle and individual-flight accuracy remain untested. All existing dependency advisories and residual risks remain in [DEFERRED.md](docs/DEFERRED.md). The earlier 146-test hardening result below is historical, not wishlist verification.
+Tests use synthetic databases and mocked mutation transport. Real API/account behavior, real database/schema/cardinality, numeric sync semantics, app/helper lifecycle and individual-flight accuracy remain untested. All existing dependency advisories and residual risks remain in [DEFERRED.md](docs/DEFERRED.md); no clean audit is claimed. The earlier 146-test hardening record is historical, not wishlist verification.
+
+This runtime PASS does not establish installation or production readiness. The exact documentation commit still requires separate dual review and source-equality verification, followed by PM acceptance before any installation update. No new installed SHA is asserted. This release retains the existing Mac stdio registration, client names, entry path, settings and default writes. Linux, mux and live-feed orders are separate future work and are not implemented by this release.
 
 ## Capability and guards
 

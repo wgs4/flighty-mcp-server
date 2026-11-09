@@ -1,6 +1,6 @@
 # Flighty MCP Server
 
-> **Local wishlist extension.** Adds cached UUID tracking, proposed connection checks and honest freshness metadata to source base `42100cc`. See [verification evidence and limits](FORK-NOTES.md#wishlist-verification-evidence-and-limits) for the scope of reported checks; this reference does not identify a new installed release.
+> **Local wishlist extension.** Provides cached UUID tracking, proposed connection checks and database-level freshness metadata. Runtime `9412c5e` passed dual independent review with no HIGH/MEDIUM findings and one retained LOW; PM and Codex each passed 294 tests / 17 files and full stdio 5/5 (17 default / 14 read-only, zero read-network calls). See [verification evidence and limits](FORK-NOTES.md#wishlist-verification-evidence-and-limits). This is source/synthetic evidence, not installation or real-account validation.
 
 For this fork's source installation, guarded writes, existing-client updates and lifecycle commands, follow [FORK-NOTES.md](FORK-NOTES.md). The earlier hardening assessment and retained dependency advisories are in [SECURITY_REVIEW.md](SECURITY_REVIEW.md).
 
@@ -458,7 +458,7 @@ src/
 
 ## Limitations
 
-- **macOS only** — relies on the Flighty macOS app's sandboxed data
+- **macOS runtime** — relies on the Flighty macOS app's sandboxed data; Linux, mux and live-feed work are separate future scope
 - **Flighty app must be installed and signed in** — the server reads its local databases for both flight data and authentication
 - **Read data freshness** — cached status may be stale; a database sync marker does not guarantee any individual flight was updated
 - **Write operations require network** — add/remove flights call the Flighty API
