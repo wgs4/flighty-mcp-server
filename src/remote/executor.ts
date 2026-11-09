@@ -204,7 +204,13 @@ export class MacExecutor {
             const stepApi: WriteApi = {
               searchFlight: async (...args) => {
                 const current = await this.sameContext(req, stored.contextHash);
-                return this.step((signal, activity) => this.deps.createApi(current, signal, activity).searchFlight(...args), { request: stored.request, expiresAt: req.expiresAt });
+                return this.step(async (signal, activity) => {
+                  const api = this.deps.createApi(current, signal, activity);
+                  const validated = await this.sameContext(req, stored.contextHash);
+                  if (this.fingerprint(validated) !== this.fingerprint(current)) throw new ProtocolError();
+                  verifyRequest(stored.request, this.deps.callers, this.now()); activity.assertActive();
+                  return api.searchFlight(...args);
+                }, { request: stored.request, expiresAt: req.expiresAt });
               },
               subscribeFlight: async () => { throw new ProtocolError(); }, followFlight: async () => { throw new ProtocolError(); }, deleteFlight: async () => { throw new ProtocolError(); },
             };
@@ -279,23 +285,28 @@ export class MacExecutor {
       } catch { return finish("failed", undefined, "Authorization expired or changed before the API step. Nothing dispatched; confirmation remains consumed."); }
       try {
         const options = { request: stored.request, mutation: true, expiresAt: authorizationExpiry, started: () => mutationInvoked };
+        await this.step(async (signal, activity) => {
+          const preparedContext = ctx;
+          const api = this.deps.createApi(preparedContext, signal, activity);
+          // Preparation may block while an independent updater changes the authoritative source.
+          const validated = await this.sameContext(req, stored.contextHash);
+          if (this.fingerprint(validated) !== this.fingerprint(preparedContext)) throw new ProtocolError();
+          if (op.kind === "remove-confirm" && digest(substantiveRemoval(this.target(validated, op.flight_id))) !== authorizationLocalHash) throw new ProtocolError();
+          verifyRequest(stored.request, this.deps.callers, this.now());
+          activity.assertActive();
+          mutationInvoked = true;
+          if (op.kind === "add") return api.subscribeFlight(serverUuid!);
+          if (op.kind === "follow") return api.followFlight(serverUuid!);
+          return api.deleteFlight(op.flight_id);
+        }, options);
         if (op.kind === "add" || op.kind === "follow") {
-          await this.step((signal, activity) => {
-            const api = this.deps.createApi(ctx, signal, activity);
-            activity.assertActive(); mutationInvoked = true;
-            if (op.kind === "add") return api.subscribeFlight(serverUuid!);
-            return api.followFlight(serverUuid!);
-          }, options);
           result = { status: op.kind === "add" ? "added" : "followed", flight_code: assertFlightCode(op.flight_code), date: op.date,
             airline: airlineName!, server_flight_uuid: serverUuid!, message: "API accepted the request. Later app/replica reconciliation is not yet verified." };
         } else {
-          await this.step((signal, activity) => {
-            const api = this.deps.createApi(ctx, signal, activity); activity.assertActive(); mutationInvoked = true; return api.deleteFlight(op.flight_id);
-          }, options);
           result = { status: "removed", flight_id: op.flight_id, message: "API accepted removal. Later app/replica reconciliation is not yet verified." };
         }
       } catch (error) {
-        if (error instanceof AuthorizationExpiredError && !mutationInvoked) return finish("failed", undefined, "Authorization expired before the API step. Nothing dispatched; confirmation remains consumed.");
+        if (!mutationInvoked) return finish("failed", undefined, "Authorization or preparation failed before the API method. Nothing dispatched; confirmation remains consumed.");
         return finish("unknown", undefined, "Dispatch outcome is unknown; do not automatically retry. A stale cache or missing row is not proof of failure.");
       }
       this.deps.boundary?.("response");
@@ -309,12 +320,13 @@ export class MacExecutor {
     const remaining = Math.min(15_000, (options.expiresAt ?? Infinity) - this.now());
     if (remaining <= 0) throw new AuthorizationExpiredError();
     const account = options.request?.body.account ?? options.account;
+    const budgetDeadline = performance.now() + remaining;
     const controller = new AbortController();
     let pending = 0, blocked = false;
     const activity: StepActivity = {
       assertActive: () => {
         controller.signal.throwIfAborted();
-        if (options.expiresAt !== undefined && options.expiresAt <= this.now()) throw new AuthorizationExpiredError();
+        if ((options.expiresAt !== undefined && options.expiresAt <= this.now()) || performance.now() >= budgetDeadline) throw new AuthorizationExpiredError();
       },
       retain: () => {
         pending++;
@@ -405,7 +417,9 @@ export class MacExecutor {
   }
   private receipt(req: Request, state: Receipt["state"], result?: unknown, error?: string, context?: CredentialContext): Signed<Receipt> {
     const secrets = context ? [context.authToken, ...privateBuildValue(context.buildToken), context.session, context.syncUrl ?? ""] : [];
-    const credentials = context ? [context.authToken, context.syncUrl ?? ""] : [];
+    // Long private session IDs and classified private build values are sensitive in every source
+    // field, including typed booking/identity fields. Short context labels remain collision-safe.
+    const credentials = context ? [context.authToken, context.syncUrl ?? "", ...privateBuildValue(context.buildToken), ...(context.session.length >= 12 ? [context.session] : [])] : [];
     if (context?.syncUrl) {
       try { new URL(context.syncUrl).searchParams.forEach((value, key) => { if (/token|secret|auth|key/i.test(key)) { secrets.push(value); credentials.push(value); } }); } catch { /* Exact URL redaction still applies. */ }
     }
