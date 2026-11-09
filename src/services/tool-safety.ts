@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { homedir } from "node:os";
 import { z, type ZodTypeAny } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -12,6 +13,51 @@ import {
   type FlightyDatabase,
   type OwnerIdentity,
 } from "./database.js";
+import {
+  FRESHNESS_ACCOUNT_SCOPE_NOTE,
+  FRESHNESS_ERROR_SCOPE_NOTE,
+  FRESHNESS_LOCAL_CACHE_NOTE,
+  FRESHNESS_STATIC_SCOPE_NOTE,
+  QUERIED_AT_MEANING,
+  STATIC_OR_REFERENCE_TOOLS,
+  createErrorFreshness,
+  createNotApplicableFreshness,
+  formatFreshnessNoticeLine,
+  isStaticOrReferenceTool,
+  parseSyncTimestamp,
+  readDatabaseFreshness,
+  resolveNowMs,
+  type FreshnessMetadata,
+  type FreshnessScope,
+  type FreshnessStatus,
+  type FreshnessUnknownReasonCode,
+  type NowInput,
+  type ParsedSyncMarker,
+  type ReadFreshnessOptions,
+} from "./freshness.js";
+
+export {
+  FRESHNESS_ACCOUNT_SCOPE_NOTE,
+  FRESHNESS_ERROR_SCOPE_NOTE,
+  FRESHNESS_LOCAL_CACHE_NOTE,
+  FRESHNESS_STATIC_SCOPE_NOTE,
+  QUERIED_AT_MEANING,
+  STATIC_OR_REFERENCE_TOOLS,
+  createErrorFreshness,
+  createNotApplicableFreshness,
+  formatFreshnessNoticeLine,
+  isStaticOrReferenceTool,
+  parseSyncTimestamp,
+  readDatabaseFreshness,
+  resolveNowMs,
+  type FreshnessMetadata,
+  type FreshnessScope,
+  type FreshnessStatus,
+  type FreshnessUnknownReasonCode,
+  type NowInput,
+  type ParsedSyncMarker,
+  type ReadFreshnessOptions,
+};
 
 export const DATA_TRUST_LABEL = "untrusted_external_data";
 
@@ -31,6 +77,8 @@ export const OWNER_SCOPED_TOOLS = new Set<string>([
   "flighty_list_friend_flights",
   "flighty_get_flight_stats",
   "flighty_get_connections",
+  "flighty_get_tracking_status",
+  "flighty_check_connection",
 ]);
 
 const MAX_ERROR_MESSAGE_LENGTH = 300;
@@ -109,6 +157,9 @@ export interface WrapToolResultOptions {
   toolName?: string;
   isOwnerScoped?: boolean;
   ownerIdentity?: OwnerIdentity | null;
+  freshness?: FreshnessMetadata;
+  dbPath?: string | null;
+  now?: NowInput;
 }
 
 export interface McpTextContent {
@@ -120,8 +171,20 @@ export interface McpTextContent {
 export interface McpToolResult {
   content: McpTextContent[];
   isError?: boolean;
+  queried_at?: string;
+  freshness?: FreshnessMetadata;
+  _meta?: Record<string, unknown>;
   [key: string]: unknown;
 }
+
+interface ToolInvocationContext {
+  toolName: string;
+  isOwnerScoped: boolean;
+  dbPath: string | null | undefined;
+  nowMs: number;
+}
+
+const toolInvocationStorage = new AsyncLocalStorage<ToolInvocationContext>();
 
 export function buildOwnerIdentityEnvelope(identity: OwnerIdentity) {
   return {
@@ -149,15 +212,54 @@ export function wrapToolResult(
     return result;
   }
 
-  const isOwnerScoped = Boolean(options.isOwnerScoped);
+  const invocationStore = toolInvocationStorage.getStore();
+  const effectiveToolName = options.toolName ?? invocationStore?.toolName;
+  const isOwnerScoped =
+    options.isOwnerScoped !== undefined
+      ? Boolean(options.isOwnerScoped)
+      : Boolean(
+          invocationStore?.isOwnerScoped ??
+            (effectiveToolName ? isOwnerScopedTool(effectiveToolName) : false)
+        );
   const ownerIdentity = isOwnerScoped ? (options.ownerIdentity ?? null) : null;
   const isError = Boolean(result.isError);
+  const effectiveDbPath =
+    options.dbPath !== undefined ? options.dbPath : invocationStore?.dbPath;
+  const effectiveNow =
+    options.now !== undefined ? options.now : invocationStore?.nowMs;
+
+  const freshness =
+    options.freshness ??
+    readDatabaseFreshness({
+      toolName: effectiveToolName,
+      isError,
+      dbPath: effectiveDbPath,
+      now: effectiveNow,
+    });
+
+  const existingMeta =
+    result._meta &&
+    typeof result._meta === "object" &&
+    !Array.isArray(result._meta)
+      ? (result._meta as Record<string, unknown>)
+      : {};
 
   if (!Array.isArray(result.content)) {
-    wrappedResultObjects.add(result);
-    return result;
+    const nonArrayWrapped: McpToolResult = {
+      ...result,
+      queried_at: freshness.queried_at,
+      freshness,
+      _meta: {
+        ...existingMeta,
+        queried_at: freshness.queried_at,
+        freshness,
+      },
+    };
+    wrappedResultObjects.add(nonArrayWrapped);
+    return nonArrayWrapped;
   }
 
+  const freshnessNoticeLine = formatFreshnessNoticeLine(freshness);
   const trustNoticeLine = `[${DATA_TRUST_LABEL}: ${UNTRUSTED_DATA_ENVELOPE_NOTICE}]`;
 
   const wrappedContent = result.content.map((item) => {
@@ -169,7 +271,7 @@ export function wrapToolResult(
       const sanitized = sanitizeToolErrorMessage(item.text);
       return {
         ...item,
-        text: `${sanitized}\n${trustNoticeLine}`,
+        text: `${sanitized}\n${freshnessNoticeLine}\n${trustNoticeLine}`,
       };
     }
 
@@ -187,6 +289,8 @@ export function wrapToolResult(
           untrusted_data: true,
           data_trust_label: DATA_TRUST_LABEL,
           trust_notice: UNTRUSTED_DATA_ENVELOPE_NOTICE,
+          queried_at: freshness.queried_at,
+          freshness,
         };
 
         if (isOwnerScoped && ownerIdentity) {
@@ -211,7 +315,7 @@ export function wrapToolResult(
       // Plain-text response (e.g. "No flight found...") — fall through to text labeling
     }
 
-    const lines = [item.text];
+    const lines = item.text.length > 0 ? [item.text] : [];
     if (isOwnerScoped && ownerIdentity) {
       const warningPart =
         ownerIdentity.isSharedOwner && ownerIdentity.warning
@@ -221,6 +325,7 @@ export function wrapToolResult(
         `[owner_identity: label=${ownerIdentity.label} source=${ownerIdentity.source} shared_or_fallback=${ownerIdentity.isSharedOwner}${warningPart}]`
       );
     }
+    lines.push(freshnessNoticeLine);
     lines.push(trustNoticeLine);
 
     return {
@@ -232,12 +337,22 @@ export function wrapToolResult(
   const wrapped: McpToolResult = {
     ...result,
     content: wrappedContent,
+    queried_at: freshness.queried_at,
+    freshness,
+    _meta: {
+      ...existingMeta,
+      queried_at: freshness.queried_at,
+      freshness,
+    },
   };
   wrappedResultObjects.add(wrapped);
   return wrapped;
 }
 
-export function createSanitizedToolError(error: unknown): McpToolResult {
+export function createSanitizedToolError(
+  error: unknown,
+  options?: { toolName?: string; now?: NowInput }
+): McpToolResult {
   const rawMessage =
     error instanceof Error ? error.message : String(error ?? "Unknown error");
   return wrapToolResult(
@@ -245,7 +360,11 @@ export function createSanitizedToolError(error: unknown): McpToolResult {
       content: [{ type: "text", text: `Error: ${rawMessage}` }],
       isError: true,
     },
-    { isOwnerScoped: false }
+    {
+      toolName: options?.toolName,
+      isOwnerScoped: false,
+      now: options?.now,
+    }
   );
 }
 
@@ -268,8 +387,31 @@ function isZodRawShape(
   );
 }
 
+export interface InstallToolSafetyOptions {
+  dbPath?: string | null;
+  now?: NowInput;
+}
+
 interface SafetyState {
   db?: FlightyDatabase;
+  dbPath?: string | null;
+  now?: NowInput;
+}
+
+function resolveDbPathForSafetyState(
+  state: SafetyState
+): string | null | undefined {
+  if (state.dbPath !== undefined) {
+    return state.dbPath;
+  }
+  if (state.db !== undefined) {
+    const candidate = (state.db as unknown as { dbPath?: unknown })?.dbPath;
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate;
+    }
+    return null;
+  }
+  return MAIN_DB_PATH;
 }
 
 const installedServers = new WeakMap<object, SafetyState>();
@@ -277,23 +419,34 @@ const installedServers = new WeakMap<object, SafetyState>();
 /**
  * Installs a shared wrapper around `server.registerTool` (and `server.createToolError`
  * when present) so every tool description includes the untrusted-data warning,
- * every tool result uses the shared trust envelope, owner-scoped read tools include
- * invocation-local owner identity metadata without adding DB reads to reference/about tools,
+ * every tool result uses the shared trust and freshness envelopes, owner-scoped read tools
+ * include invocation-local owner identity metadata without adding DB reads to reference/about tools,
  * and errors are sanitized. Idempotent per server instance.
  */
 export function installToolSafety(
   server: McpServer,
-  db?: FlightyDatabase
+  db?: FlightyDatabase,
+  options?: InstallToolSafetyOptions
 ): McpServer {
   const existing = installedServers.get(server as object);
   if (existing) {
     if (db) {
       existing.db = db;
     }
+    if (options?.dbPath !== undefined) {
+      existing.dbPath = options.dbPath;
+    }
+    if (options?.now !== undefined) {
+      existing.now = options.now;
+    }
     return server;
   }
 
-  const state: SafetyState = { db };
+  const state: SafetyState = {
+    db,
+    dbPath: options?.dbPath,
+    now: options?.now,
+  };
   installedServers.set(server as object, state);
 
   const serverAny = server as unknown as {
@@ -316,7 +469,16 @@ export function installToolSafety(
     const origCreateToolError = serverAny.createToolError.bind(server);
     serverAny.createToolError = (errorMessage: string): McpToolResult => {
       const base = origCreateToolError(errorMessage);
-      return wrapToolResult(base, { isOwnerScoped: false });
+      return wrapToolResult(
+        {
+          ...base,
+          isError: base?.isError ?? true,
+        },
+        {
+          isOwnerScoped: false,
+          now: state.now,
+        }
+      );
     };
   }
 
@@ -337,6 +499,9 @@ export function installToolSafety(
       rawArgs: Record<string, unknown> = {},
       extra?: unknown
     ): Promise<McpToolResult> => {
+      const invocationNowMs = resolveNowMs(state.now);
+      const invocationDbPath = resolveDbPathForSafetyState(state);
+
       let effectiveArgs = rawArgs ?? {};
       if (inputValidator) {
         const parsed = inputValidator.safeParse(effectiveArgs);
@@ -355,44 +520,62 @@ export function installToolSafety(
               ],
               isError: true,
             },
-            { toolName: name, isOwnerScoped: false }
+            {
+              toolName: name,
+              isOwnerScoped: false,
+              now: invocationNowMs,
+            }
           );
         }
         effectiveArgs = parsed.data;
       }
 
-      return runWithOwnerIdentityScope(async () => {
-        try {
-          if (isOwnerScoped) {
-            state.db?.clearLastOwnerIdentity?.();
-          }
+      return toolInvocationStorage.run(
+        {
+          toolName: name,
+          isOwnerScoped,
+          dbPath: invocationDbPath,
+          nowMs: invocationNowMs,
+        },
+        () =>
+          runWithOwnerIdentityScope(async () => {
+            try {
+              if (isOwnerScoped) {
+                state.db?.clearLastOwnerIdentity?.();
+              }
 
-          const callbackPromise = cb(effectiveArgs, extra);
+              const callbackPromise = cb(effectiveArgs, extra);
 
-          // Capture synchronously immediately after invoking cb and before awaiting
-          // callbackPromise so concurrent requests cannot clear or overwrite it.
-          const preAwaitIdentity = isOwnerScoped
-            ? (getScopedOwnerIdentity() ??
-              state.db?.getLastOwnerIdentity?.() ??
-              null)
-            : null;
+              // Capture synchronously immediately after invoking cb and before awaiting
+              // callbackPromise so concurrent requests cannot clear or overwrite it.
+              const preAwaitIdentity = isOwnerScoped
+                ? (getScopedOwnerIdentity() ??
+                  state.db?.getLastOwnerIdentity?.() ??
+                  null)
+                : null;
 
-          const rawResult = await callbackPromise;
+              const rawResult = await callbackPromise;
 
-          const ownerIdentity =
-            isOwnerScoped && !rawResult?.isError
-              ? (getScopedOwnerIdentity() ?? preAwaitIdentity)
-              : null;
+              const ownerIdentity =
+                isOwnerScoped && !rawResult?.isError
+                  ? (getScopedOwnerIdentity() ?? preAwaitIdentity)
+                  : null;
 
-          return wrapToolResult(rawResult, {
-            toolName: name,
-            isOwnerScoped,
-            ownerIdentity,
-          });
-        } catch (error) {
-          return createSanitizedToolError(error);
-        }
-      });
+              return wrapToolResult(rawResult, {
+                toolName: name,
+                isOwnerScoped,
+                ownerIdentity,
+                dbPath: invocationDbPath,
+                now: invocationNowMs,
+              });
+            } catch (error) {
+              return createSanitizedToolError(error, {
+                toolName: name,
+                now: invocationNowMs,
+              });
+            }
+          })
+      );
     };
 
     return originalRegisterTool(name, safeConfig, wrappedHandler);
