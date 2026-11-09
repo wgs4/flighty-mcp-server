@@ -54,14 +54,15 @@ export class DurableClient {
   }
   async status(id: string): Promise<unknown> {
     idSchema.parse(id);
-    const row = this.store.get<ClientRow>("client", id) ?? this.store.archived<ClientRow>("client", id);
+    const live = this.store.get<ClientRow>("client", id);
+    const row = live ?? this.store.archived<ClientRow>("client", id);
     if (!row || row.request.body.caller !== this.caller || row.request.body.account !== this.account) {
       return { status: "unavailable", operation_id: id, message: "No retained operation for this configured caller/account. Absence does not prove failure." };
     }
     try {
       const status = await this.client.status(row.request);
       // Retain authenticated receipts even if the mailbox later expires its copy.
-      if (!row.status?.receipt) { row.status = status; this.store.put("client", id, row); }
+      if (!row.status?.receipt) { row.status = status; if (live) this.store.put("client", id, row); }
     } catch { /* The exact request and any authenticated result remain durable. */ }
     const receipt = row.status?.receipt?.body;
     return { operation_id: id, status: receipt?.state ?? (row.request.body.expiresAt <= this.now() ? "expired" : "pending"),
