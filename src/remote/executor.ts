@@ -1,5 +1,5 @@
 import type { RemovalLocalRecord } from "../services/database.js";
-import { createHmac, randomBytes, type KeyObject } from "node:crypto";
+import { createHmac, createPublicKey, randomBytes, type KeyObject } from "node:crypto";
 import { findFlight, notFoundMessage, removalTarget, resolveRemoval, type WriteApi, type WriteDatabase } from "../tools/write.js";
 import { assertFlightCode, assertIsoDate, assertUuid } from "../services/bounds.js";
 import { parseFlightCode, FlightyApi } from "../services/flighty-api.js";
@@ -27,9 +27,7 @@ export type ExecutorDeps = {
   /** Fixture crash hook: throws outside recovery so persisted boundary can be restarted. */
   boundary?: (name: "queued" | "preview" | "dispatch" | "response" | "receipt") => void;
 };
-type StoredOperation = { request: SignedRequest; contextHash: string; receipt: Signed<Receipt>; retainUntil: number };
-type Preview = { flightId: string; caller: string; account: string; capability: "remove-confirm"; contextHash: string; localHash: string; expiresAt: number; consumed: boolean };
-const RETENTION_MS = 24 * 60 * 60_000;
+import { executorStateValidator, pinnedCallers, RETENTION_MS, type StoredOperation, type Preview } from "./state.js";
 const MAX_PREVIEWS = 32;
 
 /** Bounded API instances use exactly the captured token; discovery stays in the injected capture. */
@@ -55,6 +53,7 @@ export class MacExecutor {
     if (deps.bindingKey.length < 32) throw new ProtocolError("Private binding key is too short.");
     this.now = deps.now ?? Date.now;
     deps.store.claimConsumer("mac-executor");
+    deps.store.setValidator(executorStateValidator(pinnedCallers(deps.callers), createPublicKey(deps.receiptKey), this.now));
     // A previous process may have crossed the HTTP boundary. Never replay its operations.
     deps.store.transaction(() => {
       this.prune();
@@ -80,7 +79,7 @@ export class MacExecutor {
     const context = await this.context(req);
     const contextHash = this.fingerprint(context);
     const op: StoredOperation = { request: input, contextHash,
-      receipt: this.receipt(req, "not-dispatched"), retainUntil: req.expiresAt + RETENTION_MS };
+      receipt: this.receipt(req, "not-dispatched") };
     this.deps.store.transaction(() => {
       const concurrent = this.deps.store.get<StoredOperation>("operation", req.operationId);
       if (concurrent) {
@@ -141,7 +140,7 @@ export class MacExecutor {
               if (!this.deps.store.get("preview", candidate)) { code = candidate; break; }
             }
             if (!code) throw new ProtocolError();
-            this.deps.store.put("preview", code, { flightId: target.flightId.toLowerCase(), caller: req.caller,
+            this.deps.store.put("preview", code, { requestId: req.operationId, flightId: target.flightId.toLowerCase(), caller: req.caller,
               account: ctx.account, capability: "remove-confirm", contextHash: stored.contextHash,
               localHash: digest(substantiveRemoval(target)), expiresAt: Math.min(this.now() + 300_000, req.expiresAt), consumed: false } satisfies Preview);
             finish("succeeded", { status: "confirmation_required", flight_id: target.flightId, confirm_code: code,
@@ -298,7 +297,7 @@ export class MacExecutor {
   }
   private prune(): void {
     const now = this.now();
-    for (const { id, value } of this.deps.store.list<StoredOperation>("operation")) if (value.retainUntil <= now) this.deps.store.delete("operation", id);
+    for (const { id, value } of this.deps.store.list<StoredOperation>("operation")) if (value.request.body.expiresAt + RETENTION_MS <= now) this.deps.store.delete("operation", id);
     for (const { id, value } of this.deps.store.list<Preview>("preview")) if (value.expiresAt <= now) this.deps.store.delete("preview", id);
   }
 }

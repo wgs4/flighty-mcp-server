@@ -5,8 +5,8 @@ import { parseFlightCode } from "../services/flighty-api.js";
 
 export const MAX_WIRE_BYTES = 64 * 1024;
 export const MAX_LIFETIME_MS = 5 * 60_000;
-const id = z.string().regex(/^[A-Za-z0-9_-]{1,80}$/);
-const time = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+export const idSchema = z.string().regex(/^[A-Za-z0-9_-]{1,80}$/);
+export const timeSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 export const operationSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("add"), flight_code: z.string().max(20), date: z.string().max(10) }).strict(),
   z.object({ kind: z.literal("follow"), flight_code: z.string().max(20), date: z.string().max(10) }).strict(),
@@ -17,8 +17,8 @@ export const operationSchema = z.discriminatedUnion("kind", [
 export type Operation = z.infer<typeof operationSchema>;
 export type Capability = Operation["kind"];
 export const requestSchema = z.object({
-  version: z.literal(1), operationId: id, caller: id, account: id,
-  issuedAt: time, expiresAt: time, operation: operationSchema,
+  version: z.literal(1), operationId: idSchema, caller: idSchema, account: idSchema,
+  issuedAt: timeSchema, expiresAt: timeSchema, operation: operationSchema,
   payloadDigest: z.string().regex(/^[a-f0-9]{64}$/),
 }).strict();
 export type Request = z.infer<typeof requestSchema>;
@@ -27,10 +27,13 @@ export type SignedRequest = Signed<Request>;
 export type CallerPolicy = { publicKey: KeyObject; account: string; capabilities: readonly Capability[] };
 export type Callers = Readonly<Record<string, CallerPolicy>>;
 export type OperationState = "not-dispatched" | "dispatched" | "succeeded" | "failed" | "unknown";
-export type Receipt = {
-  version: 1; operationId: string; caller: string; account: string; requestDigest: string;
-  state: OperationState; updatedAt: number; result?: unknown; error?: string;
-};
+export const receiptSchema = z.object({
+  version: z.literal(1), operationId: idSchema, caller: idSchema, account: idSchema,
+  requestDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  state: z.enum(["not-dispatched", "dispatched", "succeeded", "failed", "unknown"]),
+  updatedAt: timeSchema, result: z.unknown().optional(), error: z.string().max(4096).optional(),
+}).strict();
+export type Receipt = z.infer<typeof receiptSchema>;
 export class ProtocolError extends Error {
   constructor(message = "Remote request rejected.") { super(message); this.name = "ProtocolError"; }
 }
@@ -52,6 +55,7 @@ export function boundedJson(value: unknown): string {
   return json;
 }
 export function parseWire(json: string): unknown {
+  if (typeof json !== "string") throw new ProtocolError();
   if (Buffer.byteLength(json) > MAX_WIRE_BYTES) throw new ProtocolError("Remote message too large.");
   try { return JSON.parse(json); } catch { throw new ProtocolError(); }
 }
@@ -60,17 +64,28 @@ export function seal<T>(domain: "request" | "receipt", body: T, key: KeyObject):
   if (key.asymmetricKeyType !== "ed25519" || key.type !== "private") throw new ProtocolError();
   return { body, signature: sign(null, Buffer.from(`flighty-remote-v1:${domain}:${boundedJson(body)}`), key).toString("base64") };
 }
-export function open<T>(domain: "request" | "receipt", signed: Signed<T>, key: KeyObject): T {
-  boundedJson(signed);
-  if (Object.keys(signed).sort().join(",") !== "body,signature" ||
-      typeof signed.signature !== "string" || !/^[A-Za-z0-9+/]{86}==$/.test(signed.signature) ||
-      key.asymmetricKeyType !== "ed25519" || !verify(null, Buffer.from(`flighty-remote-v1:${domain}:${boundedJson(signed.body)}`), key, Buffer.from(signed.signature, "base64"))) {
+export function signedEnvelope(input: unknown): Signed<unknown> {
+  boundedJson(input);
+  if (!input || typeof input !== "object" || Array.isArray(input) ||
+      Object.keys(input).sort().join(",") !== "body,signature") throw new ProtocolError("Remote envelope rejected.");
+  const signed = input as Signed<unknown>;
+  if (typeof signed.signature !== "string" || !/^[A-Za-z0-9+/]{86}==$/.test(signed.signature)) throw new ProtocolError("Remote signature rejected.");
+  return signed;
+}
+export function open<T>(domain: "request" | "receipt", input: Signed<T> | unknown, key: KeyObject): T {
+  const signed = signedEnvelope(input);
+  if (key.asymmetricKeyType !== "ed25519" || !verify(null, Buffer.from(`flighty-remote-v1:${domain}:${boundedJson(signed.body)}`), key, Buffer.from(signed.signature, "base64"))) {
     throw new ProtocolError("Remote signature rejected.");
   }
-  return signed.body;
+  return signed.body as T;
+}
+export function parseSchema<T>(schema: z.ZodType<T>, input: unknown): T {
+  const result = schema.safeParse(input);
+  if (!result.success) throw new ProtocolError("Remote record schema rejected.");
+  return result.data;
 }
 export function validateOperation(input: unknown): Operation {
-  const op = operationSchema.parse(input);
+  const op = parseSchema(operationSchema, input);
   if (op.kind === "add" || op.kind === "follow") {
     assertFlightCode(op.flight_code); assertIsoDate(op.date); parseFlightCode(op.flight_code);
   } else if (op.kind === "remove-preview" || op.kind === "remove-confirm") {
@@ -79,9 +94,9 @@ export function validateOperation(input: unknown): Operation {
   }
   return op;
 }
-export function verifyRequest(input: SignedRequest, callers: Callers, now: number, allowExpired = false): Request {
-  boundedJson(input);
-  const req = requestSchema.parse(input.body);
+export function verifyRequest(input: unknown, callers: Callers, now: number, allowExpired = false): Request {
+  const envelope = signedEnvelope(input);
+  const req = parseSchema(requestSchema, envelope.body);
   const policy = Object.hasOwn(callers, req.caller) ? callers[req.caller] : undefined;
   if (!policy || policy.account !== req.account || !policy.capabilities.includes(req.operation.kind)) throw new ProtocolError("Caller capability rejected.");
   open("request", input, policy.publicKey);
@@ -94,11 +109,9 @@ export function makeRequest(input: Omit<Request, "version" | "payloadDigest">, k
   validateOperation(input.operation);
   return seal("request", { version: 1, ...input, payloadDigest: digest(input.operation) }, key);
 }
-export function verifyReceipt(signed: Signed<Receipt>, key: KeyObject, req: Request): Receipt {
-  const receipt = open("receipt", signed, key);
+export function verifyReceipt(signed: unknown, key: KeyObject, req: Request): Receipt {
+  const receipt = parseSchema(receiptSchema, open<unknown>("receipt", signed, key));
   if (receipt.version !== 1 || receipt.operationId !== req.operationId || receipt.caller !== req.caller ||
-      receipt.account !== req.account || receipt.requestDigest !== digest(req) ||
-      !["not-dispatched", "dispatched", "succeeded", "failed", "unknown"].includes(receipt.state) ||
-      !Number.isSafeInteger(receipt.updatedAt)) throw new ProtocolError("Receipt binding rejected.");
+      receipt.account !== req.account || receipt.requestDigest !== digest(req)) throw new ProtocolError("Receipt binding rejected.");
   return receipt;
 }

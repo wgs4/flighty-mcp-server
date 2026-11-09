@@ -2,6 +2,7 @@ import { generateKeyPairSync } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync } from "node:fs";
 import { resolve } from "node:path";
 import { vi } from "vitest";
+import { executorStateValidator, mailboxStateValidator, pinnedCallers } from "../src/remote/state.js";
 import { PrivateStore } from "../src/remote/store.js";
 import { MacExecutor, type CredentialContext, type ExecutorDeps } from "../src/remote/executor.js";
 import { makeRequest, type Callers, type Operation, type SignedRequest } from "../src/remote/protocol.js";
@@ -30,7 +31,15 @@ export function fixture() {
   const api = { searchFlight: vi.fn(async () => FLIGHT as string | null), subscribeFlight: vi.fn(async (_id: string) => {}),
     followFlight: vi.fn(async (_id: string) => {}), deleteFlight: vi.fn(async (_id: string) => {}) };
   const stores: PrivateStore[] = [];
-  const storeAt = (name: string, maxRows?: number) => { const store = new PrivateStore({ path: resolve(dir, name + ".sqlite"), checkLocation: () => {}, maxRows }); stores.push(store); return store; };
+  const provisioned = new Set<string>();
+  const storeOptions = (name: string, maxRows?: number) => ({ path: resolve(dir, name + ".sqlite"), continuityPath: resolve(dir, name + ".continuity"), identity: "synthetic-" + name, authenticationKey: Buffer.alloc(32, 9), checkLocation: () => {}, maxRows,
+    validateState: name === "mac" ? executorStateValidator(pinnedCallers(callers), mac.publicKey, () => now) :
+      ["mailbox", "small"].includes(name) ? mailboxStateValidator(pinnedCallers(callers), mac.publicKey, () => now) : () => {} });
+  const storeAt = (name: string, maxRows?: number) => {
+    const options = storeOptions(name, maxRows);
+    if (!provisioned.has(name)) { PrivateStore.initialize(options); provisioned.add(name); }
+    const store = new PrivateStore(options); stores.push(store); return store;
+  };
   let store = storeAt("mac");
   const deps: ExecutorDeps = { store, callers, receiptKey: mac.privateKey, bindingKey: Buffer.alloc(32, 7),
     captureContext: vi.fn(async () => context), createApi: vi.fn(() => api), openDatabase: vi.fn(() => ({ db, removalCandidates: () => record ? [record] : [], close: vi.fn() })),
@@ -39,7 +48,7 @@ export function fixture() {
   const request = (operation: Operation, overrides: Partial<SignedRequest["body"]> = {}) => makeRequest({ operationId: "op-" + ++sequence,
     caller: "linux", account: "synthetic-account", issuedAt: now, expiresAt: now + 300_000, operation, ...overrides }, caller.privateKey);
   return {
-    dir, caller, mac, other, callers, db, api, deps, storeAt, request,
+    dir, caller, mac, other, callers, db, api, deps, storeAt, storeOptions, request,
     get executor() { return executor; }, get store() { return store; }, get now() { return now; },
     set now(value: number) { now = value; }, get context() { return context; }, set context(value) { context = value; },
     set record(value: RemovalLocalRecord | null) { record = value; },

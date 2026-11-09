@@ -138,23 +138,25 @@ describe("durable Linux mailbox", () => {
 describe("private state and staged transport adapters", () => {
   it("enforces private directory/file permissions and one live process writer", () => {
     const { f } = setup(); expect(lstatSync(f.dir + "/mac.sqlite").mode & 0o777).toBe(0o600);
-    expect(() => new PrivateStore({ path: f.dir + "/mac.sqlite", checkLocation: () => {} })).toThrow(/live writer/);
+    expect(() => new PrivateStore(f.storeOptions("mac"))).toThrow(/live writer/);
     const publicDir = f.dir + "/public"; mkdirSync(publicDir, { mode: 0o755 }); chmodSync(publicDir, 0o755);
-    expect(() => new PrivateStore({ path: publicDir + "/state.sqlite", checkLocation: () => {} })).toThrow(/private/);
+    expect(() => new PrivateStore({ ...f.storeOptions("public"), path: publicDir + "/state.sqlite" })).toThrow(/private/);
     symlinkSync(f.dir + "/mac.sqlite", f.dir + "/linked.sqlite");
-    expect(() => new PrivateStore({ path: f.dir + "/linked.sqlite", checkLocation: () => {} })).toThrow();
-    expect(() => new PrivateStore({ path: f.dir + "/unmounted.sqlite", checkLocation: () => { throw new Error("unmounted"); } })).toThrow("unmounted");
+    expect(() => new PrivateStore({ ...f.storeOptions("mac"), path: f.dir + "/linked.sqlite" })).toThrow();
+    expect(() => new PrivateStore({ ...f.storeOptions("unmounted"), checkLocation: () => { throw new Error("unmounted"); } })).toThrow("unmounted");
   });
   it("recovers a committed database after its writer process exits without releasing ownership", () => {
     const { f } = setup(), path = f.dir + "/crashed-writer.sqlite";
     const code = `import { PrivateStore } from './build/remote/store.js';
-      const store = new PrivateStore({path:${JSON.stringify(path)},checkLocation:()=>{}});
+      const options = {path:${JSON.stringify(path)},continuityPath:${JSON.stringify(f.dir + "/crashed-writer.continuity")},identity:'synthetic-crashed-writer',authenticationKey:Buffer.alloc(32,9),checkLocation:()=>{},validateState:()=>{}};
+      PrivateStore.initialize(options);
+      const store = new PrivateStore(options);
       store.put('fixture','boundary',{state:'committed-before-process-exit'});
       process.exit(0);`;
     const child = spawnSync(process.execPath, ["--input-type=module", "-e", code], { encoding: "utf8", timeout: 5000 });
     expect(child.status).toBe(0);
-    const reopened = f.storeAt("crashed-writer");
-    expect(reopened.get("fixture", "boundary")).toEqual({ state: "committed-before-process-exit" });
+    const reopened = new PrivateStore(f.storeOptions("crashed-writer"));
+    expect(reopened.get("fixture", "boundary")).toEqual({ state: "committed-before-process-exit" }); reopened.close();
   });
   it("serves exactly the fixed bounded stdin protocol with no raw error disclosure", async () => {
     const { f, mailbox } = setup(); let output = "";

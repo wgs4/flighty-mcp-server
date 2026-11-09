@@ -11,14 +11,17 @@ const commandSchema = z.discriminatedUnion("verb", [
   z.object({ verb: z.literal("lease"), limit: z.number().int().min(1).max(16) }).strict(),
   z.object({ verb: z.literal("receipt"), receipt: z.unknown() }).strict(),
 ]);
-type Queued = { request: SignedRequest; leaseUntil: number; receipt: Signed<Receipt> | null; retainUntil: number };
+import { mailboxStateValidator, pinnedCallers, RETENTION_MS, type Queued } from "./state.js";
 export type MailboxStatus = { queue: "queued" | "leased" | "expired" | "receipted" | "absent"; receipt: Signed<Receipt> | null };
 export type MailboxOptions = { store: PrivateStore; callers: Callers; macReceiptKey: KeyObject; now?: () => number };
 
 /** Linux mailbox stores mutation-capability requests, but cannot sign Mac results. */
 export class Mailbox {
   private readonly now: () => number;
-  constructor(private readonly options: MailboxOptions) { this.now = options.now ?? Date.now; }
+  constructor(private readonly options: MailboxOptions) {
+    this.now = options.now ?? Date.now;
+    options.store.setValidator(mailboxStateValidator(pinnedCallers(options.callers), options.macReceiptKey, this.now));
+  }
   handle(principal: MailboxPrincipal, wire: string): string {
     const cmd = commandSchema.parse(parseWire(wire));
     return this.options.store.transaction(() => {
@@ -32,7 +35,7 @@ export class Mailbox {
         if (row && digest(row.request.body) !== digest(req)) throw new ProtocolError("Conflicting operation ID.");
         if (!row && cmd.verb === "submit") {
           verifyRequest(signed, this.options.callers, this.now());
-          row = { request: signed, leaseUntil: 0, receipt: null, retainUntil: req.expiresAt + 86_400_000 };
+          row = { request: signed, leaseUntil: 0, receipt: null };
           this.options.store.put("mail", req.operationId, row);
         }
         const queue = !row ? "absent" : row.receipt ? "receipted" : req.expiresAt <= this.now() ? "expired" : row.leaseUntil > this.now() ? "leased" : "queued";
@@ -48,7 +51,7 @@ export class Mailbox {
           try { verifyRequest(value.request, this.options.callers, this.now()); } catch { continue; }
           const candidate = [...requests, value.request];
           try { boundedJson({ requests: candidate }); } catch { break; }
-          requests.push(value.request); value.leaseUntil = this.now() + 30_000;
+          requests.push(value.request); value.leaseUntil = Math.min(this.now() + 30_000, value.request.body.expiresAt);
           this.options.store.put("mail", id, value);
         }
         return boundedJson({ requests });
@@ -67,7 +70,7 @@ export class Mailbox {
   /** Explicit retention sweep for an approved scheduler; no background work starts here. */
   maintenance(): void { this.options.store.transaction(() => this.prune()); }
   private prune(): void {
-    for (const { id, value } of this.options.store.list<Queued>("mail")) if (value.retainUntil <= this.now()) this.options.store.delete("mail", id);
+    for (const { id, value } of this.options.store.list<Queued>("mail")) if (value.request.body.expiresAt + RETENTION_MS <= this.now()) this.options.store.delete("mail", id);
   }
 }
 
