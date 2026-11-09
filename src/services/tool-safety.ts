@@ -15,9 +15,11 @@ import {
 } from "./database.js";
 import {
   FRESHNESS_ACCOUNT_SCOPE_NOTE,
+  FRESHNESS_DATABASE_SCOPE_NOTE,
   FRESHNESS_ERROR_SCOPE_NOTE,
   FRESHNESS_LOCAL_CACHE_NOTE,
   FRESHNESS_STATIC_SCOPE_NOTE,
+  MAX_SYNC_INFO_ROWS,
   QUERIED_AT_MEANING,
   STATIC_OR_REFERENCE_TOOLS,
   createErrorFreshness,
@@ -38,9 +40,11 @@ import {
 
 export {
   FRESHNESS_ACCOUNT_SCOPE_NOTE,
+  FRESHNESS_DATABASE_SCOPE_NOTE,
   FRESHNESS_ERROR_SCOPE_NOTE,
   FRESHNESS_LOCAL_CACHE_NOTE,
   FRESHNESS_STATIC_SCOPE_NOTE,
+  MAX_SYNC_INFO_ROWS,
   QUERIED_AT_MEANING,
   STATIC_OR_REFERENCE_TOOLS,
   createErrorFreshness,
@@ -469,14 +473,16 @@ export function installToolSafety(
     const origCreateToolError = serverAny.createToolError.bind(server);
     serverAny.createToolError = (errorMessage: string): McpToolResult => {
       const base = origCreateToolError(errorMessage);
+      const activeInvocation = toolInvocationStorage.getStore();
       return wrapToolResult(
         {
           ...base,
           isError: base?.isError ?? true,
         },
         {
+          toolName: activeInvocation?.toolName,
           isOwnerScoped: false,
-          now: state.now,
+          now: activeInvocation?.nowMs ?? state.now,
         }
       );
     };

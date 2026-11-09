@@ -5,7 +5,7 @@ import { MAIN_DB_PATH } from "../constants.js";
 export type FreshnessStatus = "known" | "unknown" | "not_applicable";
 
 export type FreshnessScope =
-  | "account_database_sync"
+  | "database_sync"
   | "static_or_reference_data"
   | "error_or_validation";
 
@@ -24,12 +24,14 @@ export type FreshnessUnknownReasonCode =
 
 export interface FreshnessMetadata {
   /**
-   * UTC ISO-8601 timestamp when this MCP server handled the tool request / read the local cache.
-   * This is the local query time, NOT when Flighty synced with remote servers.
+   * UTC ISO-8601 timestamp when this MCP server handled the tool invocation
+   * (or constructed an early error response), not an exact SQLite snapshot timestamp
+   * and not when Flighty synced with remote servers.
    */
   queried_at: string;
   /**
-   * Clarifies that queried_at is the local MCP read time, not a remote sync timestamp.
+   * Clarifies that queried_at is the local MCP invocation/error handling time,
+   * not an exact SQLite snapshot read time and not a remote sync timestamp.
    */
   queried_at_meaning: string;
   /**
@@ -48,7 +50,7 @@ export interface FreshnessMetadata {
    */
   sync_age_minutes: number | null;
   /**
-   * Whether account/database sync timestamp is "known", "unknown", or "not_applicable".
+   * Whether database sync timestamp is "known", "unknown", or "not_applicable".
    */
   status: FreshnessStatus;
   /**
@@ -56,12 +58,12 @@ export interface FreshnessMetadata {
    */
   source: "SyncInfo.lastSync" | "none";
   /**
-   * Scope of the sync marker: always account/database level, never a per-flight live confirmation.
+   * Scope of the sync marker: database-level marker, never an identified account or per-flight confirmation.
    */
   scope: FreshnessScope;
   /**
-   * Explicit statement that SyncInfo.lastSync reflects global account/database sync state,
-   * not proof that any individual flight record was refreshed from live aircraft telemetry.
+   * Explicit statement that SyncInfo.lastSync is a database-level marker that does not select
+   * an account identifier and does not confirm that any individual flight record was refreshed.
    */
   scope_note: string;
   /**
@@ -74,7 +76,7 @@ export interface FreshnessMetadata {
    */
   unknown_reason: string | null;
   /**
-   * True only when SyncInfo.lastSync was a valid ISO-8601 timestamp that lies in the future
+   * True only when SyncInfo.lastSync contained a valid ISO-8601 timestamp that lies in the future
    * relative to queried_at (clock skew or invalid future marker).
    */
   is_future_marker: boolean;
@@ -86,13 +88,15 @@ export interface FreshnessMetadata {
 }
 
 export const QUERIED_AT_MEANING =
-  "UTC timestamp when this MCP server handled the request and read the local cache; not when Flighty last synced with remote servers.";
+  "UTC timestamp when this MCP server handled the tool invocation (or constructed an early error response), not an exact SQLite snapshot timestamp and not when Flighty last synced with remote servers.";
 
-export const FRESHNESS_ACCOUNT_SCOPE_NOTE =
-  "Global account/database sync marker from SyncInfo.lastSync only; does not confirm that any individual flight record was recently refreshed.";
+export const FRESHNESS_DATABASE_SCOPE_NOTE =
+  "Database-level sync marker from SyncInfo.lastSync only (does not select or verify an account identifier, and does not confirm that any individual flight record was recently refreshed).";
+
+export const FRESHNESS_ACCOUNT_SCOPE_NOTE = FRESHNESS_DATABASE_SCOPE_NOTE;
 
 export const FRESHNESS_STATIC_SCOPE_NOTE =
-  "Static server metadata and bundled airport/airline reference lookups do not depend on per-account or per-flight sync state.";
+  "Static server metadata and bundled airport/airline reference lookups do not depend on SyncInfo.lastSync or per-flight sync state.";
 
 export const FRESHNESS_ERROR_SCOPE_NOTE =
   "Tool execution returned an error or failed input validation; database sync state was not queried.";
@@ -100,13 +104,15 @@ export const FRESHNESS_ERROR_SCOPE_NOTE =
 export const FRESHNESS_LOCAL_CACHE_NOTE =
   "Reads come from the local Flighty SQLite cache on disk and do not trigger a live network refresh. Re-querying reads the latest committed local cache without resetting last_synced_at.";
 
+export const MAX_SYNC_INFO_ROWS = 32;
+
 const STATIC_UNKNOWN_REASONS: Readonly<Record<FreshnessUnknownReasonCode, string>> = {
   unverified_numeric_sync_format:
     "unverified_numeric_sync_format: SyncInfo.lastSync is stored in a numeric format whose epoch or unit definition (Unix seconds, Unix milliseconds, Apple Core Data 2001 reference time, or sequence counter) is unverified.",
   future_sync_timestamp:
     "future_sync_timestamp: SyncInfo.lastSync timestamp is in the future relative to queried_at; refusing to report a negative or fresh sync age.",
   invalid_or_ambiguous_sync_timestamp:
-    "invalid_or_ambiguous_sync_timestamp: SyncInfo.lastSync is not a valid ISO-8601 timestamp with an explicit timezone designator.",
+    "invalid_or_ambiguous_sync_timestamp: SyncInfo.lastSync is not an unambiguous ISO-8601 timestamp with an explicit timezone designator within the bounded SyncInfo scan.",
   missing_database:
     "missing_database: Local Flighty SQLite database file is unavailable at the configured path.",
   missing_sync_table:
@@ -120,7 +126,7 @@ const STATIC_UNKNOWN_REASONS: Readonly<Record<FreshnessUnknownReasonCode, string
   database_read_error:
     "database_read_error: Could not read SyncInfo.lastSync from the local Flighty SQLite database.",
   not_applicable_static_or_reference_tool:
-    "not_applicable_static_or_reference_tool: Static server info and reference catalog lookups do not depend on account flight sync state; database sync state was not queried.",
+    "not_applicable_static_or_reference_tool: Static server info and reference catalog lookups do not depend on Flighty database sync state; SyncInfo.lastSync was not queried.",
   error_response_sync_not_queried:
     "error_response_sync_not_queried: Tool returned an error or failed input validation; database sync state was not queried.",
 };
@@ -318,7 +324,8 @@ export function parseSyncTimestamp(
     };
   }
 
-  if (parsedMs > nowMs) {
+  const effectiveNowMs = resolveNowMs(nowMs);
+  if (parsedMs > effectiveNowMs) {
     return {
       kind: "unknown",
       reasonCode: "future_sync_timestamp",
@@ -326,7 +333,7 @@ export function parseSyncTimestamp(
     };
   }
 
-  const diffMs = nowMs - parsedMs;
+  const diffMs = effectiveNowMs - parsedMs;
   const syncAgeSeconds = Math.floor(diffMs / 1000);
   const syncAgeMinutes = Math.round((diffMs / 60000) * 100) / 100;
 
@@ -352,8 +359,8 @@ function buildUnknownDatabaseFreshness(
     sync_age_minutes: null,
     status: "unknown",
     source: "SyncInfo.lastSync",
-    scope: "account_database_sync",
-    scope_note: FRESHNESS_ACCOUNT_SCOPE_NOTE,
+    scope: "database_sync",
+    scope_note: FRESHNESS_DATABASE_SCOPE_NOTE,
     unknown_reason_code: reasonCode,
     unknown_reason: STATIC_UNKNOWN_REASONS[reasonCode],
     is_future_marker: isFutureMarker,
@@ -451,11 +458,18 @@ export function readDatabaseFreshness(
   try {
     db = new Database(dbPath, { readOnly: true });
     const rows = db
-      .prepare("SELECT lastSync FROM SyncInfo LIMIT 32")
+      .prepare(`SELECT lastSync FROM SyncInfo LIMIT ${MAX_SYNC_INFO_ROWS + 1}`)
       .all() as Array<{ lastSync?: unknown }>;
 
     if (rows.length === 0) {
       return buildUnknownDatabaseFreshness(queriedAt, "missing_sync_row");
+    }
+
+    if (rows.length > MAX_SYNC_INFO_ROWS) {
+      return buildUnknownDatabaseFreshness(
+        queriedAt,
+        "invalid_or_ambiguous_sync_timestamp"
+      );
     }
 
     const nonEmptyMarkers = rows
@@ -478,57 +492,50 @@ export function readDatabaseFreshness(
       parseSyncTimestamp(marker, nowMs)
     );
 
-    // If all non-empty rows are valid known ISO timestamps, pick the most recent one.
+    const unknownMarkers = parsedList.filter(
+      (p): p is Extract<ParsedSyncMarker, { kind: "unknown" }> =>
+        p.kind === "unknown"
+    );
+    if (unknownMarkers.length > 0) {
+      const hasFutureMarker = unknownMarkers.some((p) => p.isFutureMarker);
+      const reasonCode: FreshnessUnknownReasonCode = unknownMarkers.some(
+        (p) => p.reasonCode === "future_sync_timestamp"
+      )
+        ? "future_sync_timestamp"
+        : unknownMarkers.some(
+              (p) => p.reasonCode === "unverified_numeric_sync_format"
+            )
+          ? "unverified_numeric_sync_format"
+          : "invalid_or_ambiguous_sync_timestamp";
+      return buildUnknownDatabaseFreshness(
+        queriedAt,
+        reasonCode,
+        hasFutureMarker
+      );
+    }
+
     const knownMarkers = parsedList.filter(
       (p): p is Extract<ParsedSyncMarker, { kind: "known" }> =>
         p.kind === "known"
     );
-    if (knownMarkers.length === parsedList.length && knownMarkers.length > 0) {
-      const latest = knownMarkers.reduce((best, cur) =>
-        cur.parsedMs >= best.parsedMs ? cur : best
-      );
-      return {
-        queried_at: queriedAt,
-        queried_at_meaning: QUERIED_AT_MEANING,
-        last_synced_at: latest.lastSyncedAt,
-        sync_age_seconds: latest.syncAgeSeconds,
-        sync_age_minutes: latest.syncAgeMinutes,
-        status: "known",
-        source: "SyncInfo.lastSync",
-        scope: "account_database_sync",
-        scope_note: FRESHNESS_ACCOUNT_SCOPE_NOTE,
-        unknown_reason_code: null,
-        unknown_reason: null,
-        is_future_marker: false,
-        cache_note: FRESHNESS_LOCAL_CACHE_NOTE,
-      };
-    }
-
-    // Otherwise evaluate the latest non-empty row in table order.
-    const lastParsed = parsedList[parsedList.length - 1];
-    if (lastParsed.kind === "known") {
-      return {
-        queried_at: queriedAt,
-        queried_at_meaning: QUERIED_AT_MEANING,
-        last_synced_at: lastParsed.lastSyncedAt,
-        sync_age_seconds: lastParsed.syncAgeSeconds,
-        sync_age_minutes: lastParsed.syncAgeMinutes,
-        status: "known",
-        source: "SyncInfo.lastSync",
-        scope: "account_database_sync",
-        scope_note: FRESHNESS_ACCOUNT_SCOPE_NOTE,
-        unknown_reason_code: null,
-        unknown_reason: null,
-        is_future_marker: false,
-        cache_note: FRESHNESS_LOCAL_CACHE_NOTE,
-      };
-    }
-
-    return buildUnknownDatabaseFreshness(
-      queriedAt,
-      lastParsed.reasonCode,
-      lastParsed.isFutureMarker
+    const latest = knownMarkers.reduce((best, cur) =>
+      cur.parsedMs > best.parsedMs ? cur : best
     );
+    return {
+      queried_at: queriedAt,
+      queried_at_meaning: QUERIED_AT_MEANING,
+      last_synced_at: latest.lastSyncedAt,
+      sync_age_seconds: latest.syncAgeSeconds,
+      sync_age_minutes: latest.syncAgeMinutes,
+      status: "known",
+      source: "SyncInfo.lastSync",
+      scope: "database_sync",
+      scope_note: FRESHNESS_DATABASE_SCOPE_NOTE,
+      unknown_reason_code: null,
+      unknown_reason: null,
+      is_future_marker: false,
+      cache_note: FRESHNESS_LOCAL_CACHE_NOTE,
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error ?? "");
     if (/no such table:\s*SyncInfo/i.test(message)) {

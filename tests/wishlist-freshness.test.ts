@@ -9,7 +9,9 @@ import { FlightyDatabase } from "../src/services/database.js";
 import { FlightyApi } from "../src/services/flighty-api.js";
 import {
   FRESHNESS_ACCOUNT_SCOPE_NOTE,
+  FRESHNESS_DATABASE_SCOPE_NOTE,
   FRESHNESS_LOCAL_CACHE_NOTE,
+  MAX_SYNC_INFO_ROWS,
   QUERIED_AT_MEANING,
   formatFreshnessNoticeLine,
   parseSyncTimestamp,
@@ -78,14 +80,18 @@ describe("Freshness parsing and isolated SQLite SyncInfo.lastSync reader", () =>
       sync_age_minutes: 15,
       status: "known",
       source: "SyncInfo.lastSync",
-      scope: "account_database_sync",
-      scope_note: FRESHNESS_ACCOUNT_SCOPE_NOTE,
+      scope: "database_sync",
+      scope_note: FRESHNESS_DATABASE_SCOPE_NOTE,
       unknown_reason_code: null,
       unknown_reason: null,
       is_future_marker: false,
       cache_note: FRESHNESS_LOCAL_CACHE_NOTE,
     });
-    expect(freshness.scope_note).toMatch(/account\/database/i);
+    expect(FRESHNESS_ACCOUNT_SCOPE_NOTE).toBe(FRESHNESS_DATABASE_SCOPE_NOTE);
+    expect(freshness.queried_at_meaning).toMatch(/handled the tool invocation/i);
+    expect(freshness.queried_at_meaning).toMatch(/not an exact SQLite snapshot/i);
+    expect(freshness.scope_note).toMatch(/database-level sync marker/i);
+    expect(freshness.scope_note).toMatch(/does not select or verify an account identifier/i);
     expect(freshness.scope_note).toMatch(/not confirm.*individual flight/i);
     expect(freshness.cache_note).toMatch(/local Flighty SQLite cache/i);
     expect(freshness.cache_note).toMatch(/do not trigger a live network refresh/i);
@@ -295,7 +301,7 @@ describe("Freshness parsing and isolated SQLite SyncInfo.lastSync reader", () =>
     expect(JSON.stringify(missingTable)).not.toContain(fixture.directory);
   });
 
-  it("supports direct parseSyncTimestamp unit checks", () => {
+  it("supports direct parseSyncTimestamp unit checks including non-finite nowMs fallback", () => {
     const valid = parseSyncTimestamp("2026-11-08T19:00:00Z", FIXED_NOW_MS);
     expect(valid).toEqual({
       kind: "known",
@@ -310,6 +316,195 @@ describe("Freshness parsing and isolated SQLite SyncInfo.lastSync reader", () =>
       reasonCode: "unverified_numeric_sync_format",
       isFutureMarker: false,
     });
+
+    for (const nonFiniteNow of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      const fallbackParsed = parseSyncTimestamp("2020-01-01T00:00:00Z", nonFiniteNow);
+      expect(fallbackParsed.kind).toBe("known");
+      if (fallbackParsed.kind === "known") {
+        expect(Number.isFinite(fallbackParsed.syncAgeSeconds)).toBe(true);
+        expect(Number.isFinite(fallbackParsed.syncAgeMinutes)).toBe(true);
+        expect(fallbackParsed.syncAgeSeconds).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it.each([
+    [
+      "future mixed with valid",
+      ["2026-11-08T21:00:00Z", "2026-11-08T19:29:00Z"],
+      ["2026-11-08T19:29:00Z", "2026-11-08T21:00:00Z"],
+      "future_sync_timestamp",
+      true,
+    ],
+    [
+      "numeric mixed with valid",
+      [784406400.5, "2026-11-08T19:29:00Z"],
+      ["2026-11-08T19:29:00Z", 784406400.5],
+      "unverified_numeric_sync_format",
+      false,
+    ],
+    [
+      "invalid mixed with valid",
+      ["synthetic-invalid-secret-marker", "2026-11-08T19:29:00Z"],
+      ["2026-11-08T19:29:00Z", "synthetic-invalid-secret-marker"],
+      "invalid_or_ambiguous_sync_timestamp",
+      false,
+    ],
+    [
+      "future + numeric + valid",
+      ["2026-11-08T21:00:00Z", 784406400.5, "2026-11-08T19:29:00Z"],
+      ["2026-11-08T19:29:00Z", 784406400.5, "2026-11-08T21:00:00Z"],
+      "future_sync_timestamp",
+      true,
+    ],
+  ] as const)(
+    "keeps mixed marker rows (%s) unknown and permutation-invariant in both orders",
+    (_label, orderA, orderB, expectedReason, expectedFuture) => {
+      const runOrder = (markers: readonly unknown[]) => {
+        withRawDb((raw) => {
+          raw.exec("DELETE FROM SyncInfo");
+          const stmt = raw.prepare(
+            "INSERT INTO SyncInfo (nextURL, lastSync) VALUES (?, ?)"
+          );
+          for (const marker of markers) {
+            stmt.run("https://sync.flightyapp.com/synthetic", marker);
+          }
+        });
+        return readDatabaseFreshness({
+          dbPath: fixture.mainPath,
+          now: FIXED_NOW_MS,
+        });
+      };
+
+      const resA = runOrder(orderA);
+      const resB = runOrder(orderB);
+
+      expect(resA).toEqual(resB);
+      expect(resA.status).toBe("unknown");
+      expect(resA.last_synced_at).toBeNull();
+      expect(resA.sync_age_seconds).toBeNull();
+      expect(resA.sync_age_minutes).toBeNull();
+      expect(resA.unknown_reason_code).toBe(expectedReason);
+      expect(resA.is_future_marker).toBe(expectedFuture);
+      expect(JSON.stringify(resA)).not.toContain("synthetic-invalid-secret-marker");
+      expect(JSON.stringify(resA)).not.toContain("784406400.5");
+    }
+  );
+
+  it("selects the chronological maximum across all-valid ISO-8601 markers with different timezone offsets regardless of order", () => {
+    // 19:10Z, 19:25Z (13:25-06:00), and 19:20Z (20:20+01:00 — lexically larger but chronologically earlier than 19:25Z)
+    const markersForward = [
+      "2026-11-08T19:10:00Z",
+      "2026-11-08T13:25:00-06:00",
+      "2026-11-08T20:20:00+01:00",
+    ];
+    const markersReverse = [...markersForward].reverse();
+
+    const runOrder = (markers: string[]) => {
+      withRawDb((raw) => {
+        raw.exec("DELETE FROM SyncInfo");
+        const stmt = raw.prepare(
+          "INSERT INTO SyncInfo (nextURL, lastSync) VALUES (?, ?)"
+        );
+        for (const marker of markers) {
+          stmt.run("https://sync.flightyapp.com/synthetic", marker);
+        }
+      });
+      return readDatabaseFreshness({
+        dbPath: fixture.mainPath,
+        now: FIXED_NOW_MS,
+      });
+    };
+
+    const forwardRes = runOrder(markersForward);
+    const reverseRes = runOrder(markersReverse);
+
+    expect(forwardRes).toEqual(reverseRes);
+    expect(forwardRes.status).toBe("known");
+    expect(forwardRes.last_synced_at).toBe("2026-11-08T19:25:00.000Z");
+    expect(forwardRes.sync_age_seconds).toBe(300);
+    expect(forwardRes.sync_age_minutes).toBe(5);
+  });
+
+  it("evaluates up to MAX_SYNC_INFO_ROWS (32) and returns unknown when SyncInfo overflows (33+ rows)", () => {
+    // 1. Exactly at limit (32 rows): 31 older ISO rows + 32nd newer ISO row -> known with chronological max
+    withRawDb((raw) => {
+      raw.exec("DELETE FROM SyncInfo");
+      const stmt = raw.prepare(
+        "INSERT INTO SyncInfo (nextURL, lastSync) VALUES (?, ?)"
+      );
+      for (let i = 0; i < MAX_SYNC_INFO_ROWS - 1; i++) {
+        stmt.run("https://sync.flightyapp.com/synthetic", "2026-11-08T19:00:00Z");
+      }
+      stmt.run("https://sync.flightyapp.com/synthetic", "2026-11-08T19:29:00Z");
+    });
+    const atLimitKnown = readDatabaseFreshness({
+      dbPath: fixture.mainPath,
+      now: FIXED_NOW_MS,
+    });
+    expect(atLimitKnown.status).toBe("known");
+    expect(atLimitKnown.last_synced_at).toBe("2026-11-08T19:29:00.000Z");
+    expect(atLimitKnown.sync_age_seconds).toBe(60);
+
+    // 2. Over limit (33 rows): 32 older ISO rows + 33rd newer ISO row -> unknown (never silently truncates)
+    withRawDb((raw) => {
+      raw.exec("DELETE FROM SyncInfo");
+      const stmt = raw.prepare(
+        "INSERT INTO SyncInfo (nextURL, lastSync) VALUES (?, ?)"
+      );
+      for (let i = 0; i < MAX_SYNC_INFO_ROWS; i++) {
+        stmt.run("https://sync.flightyapp.com/synthetic", "2026-11-08T19:00:00Z");
+      }
+      stmt.run("https://sync.flightyapp.com/synthetic", "2026-11-08T19:29:00Z");
+    });
+    const overLimitNewer = readDatabaseFreshness({
+      dbPath: fixture.mainPath,
+      now: FIXED_NOW_MS,
+    });
+    expect(overLimitNewer.status).toBe("unknown");
+    expect(overLimitNewer.last_synced_at).toBeNull();
+    expect(overLimitNewer.sync_age_seconds).toBeNull();
+    expect(overLimitNewer.unknown_reason_code).toBe(
+      "invalid_or_ambiguous_sync_timestamp"
+    );
+
+    // 3. Over limit (33 rows): 32 valid ISO rows + 33rd future row -> unknown
+    withRawDb((raw) => {
+      raw.exec("DELETE FROM SyncInfo");
+      const stmt = raw.prepare(
+        "INSERT INTO SyncInfo (nextURL, lastSync) VALUES (?, ?)"
+      );
+      for (let i = 0; i < MAX_SYNC_INFO_ROWS; i++) {
+        stmt.run("https://sync.flightyapp.com/synthetic", "2026-11-08T19:29:00Z");
+      }
+      stmt.run("https://sync.flightyapp.com/synthetic", "2026-11-08T21:00:00Z");
+    });
+    const overLimitFuture = readDatabaseFreshness({
+      dbPath: fixture.mainPath,
+      now: FIXED_NOW_MS,
+    });
+    expect(overLimitFuture.status).toBe("unknown");
+    expect(overLimitFuture.last_synced_at).toBeNull();
+    expect(overLimitFuture.sync_age_seconds).toBeNull();
+
+    // 4. Over limit (33 rows): 32 valid ISO rows + 33rd numeric/invalid row -> unknown
+    withRawDb((raw) => {
+      raw.exec("DELETE FROM SyncInfo");
+      const stmt = raw.prepare(
+        "INSERT INTO SyncInfo (nextURL, lastSync) VALUES (?, ?)"
+      );
+      for (let i = 0; i < MAX_SYNC_INFO_ROWS; i++) {
+        stmt.run("https://sync.flightyapp.com/synthetic", "2026-11-08T19:29:00Z");
+      }
+      stmt.run("https://sync.flightyapp.com/synthetic", 784406400.5);
+    });
+    const overLimitNumeric = readDatabaseFreshness({
+      dbPath: fixture.mainPath,
+      now: FIXED_NOW_MS,
+    });
+    expect(overLimitNumeric.status).toBe("unknown");
+    expect(overLimitNumeric.last_synced_at).toBeNull();
+    expect(overLimitNumeric.sync_age_seconds).toBeNull();
   });
 });
 
@@ -596,7 +791,7 @@ describe("Shared safety wrapper: envelopes, reference/about isolation, hostile p
         sync_age_seconds: null,
         status: "unknown",
         source: "SyncInfo.lastSync",
-        scope: "account_database_sync",
+        scope: "database_sync",
         unknown_reason_code: "missing_database",
       });
     } finally {
@@ -652,6 +847,7 @@ describe("Shared safety wrapper: envelopes, reference/about isolation, hostile p
       expect(listBody.freshness.sync_age_seconds).toBe(1800);
       expect(listBody.freshness.sync_age_minutes).toBe(30);
       expect(listBody.freshness.status).toBe("known");
+      expect(listBody.freshness.scope).toBe("database_sync");
       expect(listBody.untrusted_data).toBe(true);
       expect(listBody.owner_label).toBe("signed_in_owner");
 
@@ -667,7 +863,7 @@ describe("Shared safety wrapper: envelopes, reference/about isolation, hostile p
       expect(missingText).toContain("No flight found for 'ZZ999'");
       expect(missingText).toContain("[owner_identity: label=signed_in_owner");
       expect(missingText).toContain(
-        "[freshness: queried_at=2026-11-08T19:30:00.000Z | last_synced_at=2026-11-08T19:00:00.000Z | sync_age_seconds=1800 | sync_age_minutes=30 | status=known | source=SyncInfo.lastSync | scope=account_database_sync"
+        "[freshness: queried_at=2026-11-08T19:30:00.000Z | last_synced_at=2026-11-08T19:00:00.000Z | sync_age_seconds=1800 | sync_age_minutes=30 | status=known | source=SyncInfo.lastSync | scope=database_sync"
       );
       expect(missingText).toContain(
         `[${DATA_TRUST_LABEL}: ${UNTRUSTED_DATA_ENVELOPE_NOTICE}]`
@@ -708,7 +904,7 @@ describe("Shared safety wrapper: envelopes, reference/about isolation, hostile p
         "unknown_reason_code=error_response_sync_not_queried"
       );
 
-      // 5. Direct SDK createToolError path
+      // 5. Direct SDK createToolError path (outside and inside an active invocation with stateful clock)
       const serverWithCreateError = server as unknown as {
         createToolError?: (msg: string) => ReturnType<typeof createSanitizedToolError>;
       };
@@ -722,6 +918,47 @@ describe("Shared safety wrapper: envelopes, reference/about isolation, hostile p
         );
         expect(sdkErr.content[0].text).not.toContain(fixture.mainPath);
         expect(sdkErr.content[0].text).toContain("[freshness:");
+      }
+      let clockTicks = 0;
+      const statefulClockServer = new McpServer({
+        name: "stateful-create-tool-error",
+        version: "1.10.1",
+      });
+      installToolSafety(statefulClockServer, db, {
+        now: () => FIXED_NOW_MS + clockTicks++ * 60_000,
+      });
+      const statefulServerAny = statefulClockServer as unknown as {
+        createToolError: (msg: string) => ReturnType<typeof createSanitizedToolError>;
+      };
+      statefulClockServer.registerTool(
+        "synthetic_create_error_tool",
+        {
+          title: "Create Error Tool",
+          description: "Returns server.createToolError inside handler",
+          inputSchema: {},
+        },
+        async () => statefulServerAny.createToolError("Handler invoked createToolError")
+      );
+      const [errClientTransport, errServerTransport] =
+        InMemoryTransport.createLinkedPair();
+      const errClient = new Client({ name: "err-client", version: "1.0.0" });
+      await Promise.all([
+        statefulClockServer.connect(errServerTransport),
+        errClient.connect(errClientTransport),
+      ]);
+      try {
+        const inHandlerErr = await errClient.callTool({
+          name: "synthetic_create_error_tool",
+          arguments: {},
+        });
+        expect(inHandlerErr.isError).toBe(true);
+        expect((inHandlerErr as { queried_at?: string }).queried_at).toBe(
+          FIXED_NOW_ISO
+        );
+        expect(clockTicks).toBe(1);
+      } finally {
+        await errClient.close();
+        await statefulClockServer.close();
       }
 
       // 6. Empty content result
