@@ -3,6 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerWriteToolFacade, type WriteToolResult } from "../tools/write.js";
 import { assertWritesEnabled, type RuntimePolicy } from "../services/policy.js";
 import { boundedJson, makeRequest, parseWire, ProtocolError, verifyReceipt, type Operation, type Receipt, type Signed, type SignedRequest } from "./protocol.js";
+import { sanitizeReceiptError } from "./redaction.js";
 import type { MailboxStatus, MailboxTransport } from "./mailbox.js";
 
 /** Retain the same signed request/operation ID through disconnects; never silently create a retry. */
@@ -48,8 +49,10 @@ export function registerRemoteWriteTools(server: McpServer, options: {
       if (!signed) return text({ status: "pending", operation_id: request.body.operationId,
         message: "No terminal Mac receipt yet. Check this operation ID; do not repeat the mutation with a new ID." });
       const receipt = verifyReceipt(signed, options.macReceiptKey, request.body);
+      if (["not-dispatched", "dispatched"].includes(receipt.state)) return text({ status: "pending", operation_id: receipt.operationId,
+        message: "No terminal Mac receipt yet. Check this operation ID; do not repeat the mutation with a new ID." });
       if (receipt.state === "succeeded") return text(receipt.result);
-      return text({ status: receipt.state, operation_id: receipt.operationId, message: receipt.error ?? "Outcome has not been established." }, true);
+      return text({ status: receipt.state, operation_id: receipt.operationId, message: sanitizeReceiptError(receipt.error ?? "Outcome has not been established.") }, true);
     } catch {
       return text({ status: "unavailable_or_unknown", ...(request ? { operation_id: request.body.operationId } : {}),
         message: "Remote helper unavailable or request rejected. Inspect the stored operation before any retry." }, true);

@@ -119,8 +119,10 @@ describe("durable Linux mailbox", () => {
     const { f, options, store, caller } = setup(), req = f.request(add);
     await caller(wire({ verb: "submit", request: req })); f.now += 300_001;
     store.close(); const restarted = new Mailbox({ ...options, store: f.storeAt("mailbox") });
-    expect(parseWire(restarted.handle({ role: "mac" }, wire({ verb: "lease", limit: 16 })))).toEqual({ requests: [] });
-    expect((parseWire(restarted.handle({ role: "caller", caller: "linux" }, wire({ verb: "status", request: req }))) as any).queue).toBe("expired");
+    const mac = localTransport(restarted, { role: "mac" });
+    expect(await pollMailbox(mac, f.executor)).toBe(1);
+    expect((parseWire(restarted.handle({ role: "caller", caller: "linux" }, wire({ verb: "status", request: req }))) as any).receipt.body.state).toBe("failed");
+    expect((parseWire(restarted.handle({ role: "caller", caller: "linux" }, wire({ verb: "status", request: req }))) as any).queue).toBe("receipted");
     expect(f.api.searchFlight).not.toHaveBeenCalled();
     await expect(localTransport(restarted, { role: "caller", caller: "linux" })(wire({ verb: "submit", request: f.request(add, { expiresAt: f.now }) }))).rejects.toThrow();
   });

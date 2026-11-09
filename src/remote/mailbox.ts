@@ -1,6 +1,6 @@
 import type { KeyObject } from "node:crypto";
 import { z } from "zod";
-import { boundedJson, digest, parseWire, ProtocolError, verifyReceipt, verifyRequest, type Callers, type Receipt, type Signed, type SignedRequest } from "./protocol.js";
+import { boundedJson, digest, parseWire, parseSchema, receiptSchema, signedEnvelope, ProtocolError, verifyReceipt, verifyRequest, type Callers, type Receipt, type Signed, type SignedRequest } from "./protocol.js";
 import { PrivateStore } from "./store.js";
 
 /** Supplied by the authenticated transport/forced command configuration, never the message body. */
@@ -23,7 +23,7 @@ export class Mailbox {
     options.store.setValidator(mailboxStateValidator(pinnedCallers(options.callers), options.macReceiptKey, this.now));
   }
   handle(principal: MailboxPrincipal, wire: string): string {
-    const cmd = commandSchema.parse(parseWire(wire));
+    const cmd = parseSchema(commandSchema, parseWire(wire));
     return this.options.store.transaction(() => {
       this.prune();
       if (cmd.verb === "submit" || cmd.verb === "status") {
@@ -46,18 +46,21 @@ export class Mailbox {
         const requests: SignedRequest[] = [];
         for (const { id, value } of this.options.store.list<Queued>("mail")) {
           if (requests.length >= cmd.limit) break;
-          if (value.receipt || value.request.body.expiresAt <= this.now() || value.leaseUntil > this.now()) continue;
+          if (value.receipt || value.leaseUntil > this.now()) continue;
+          // Expired requests are leased only for a signed terminal expiry; the executor never dispatches them.
           // Revoked callers/capabilities cannot dispatch previously queued work.
-          try { verifyRequest(value.request, this.options.callers, this.now()); } catch { continue; }
+          try { verifyRequest(value.request, this.options.callers, this.now(), true); } catch { continue; }
           const candidate = [...requests, value.request];
           try { boundedJson({ requests: candidate }); } catch { break; }
-          requests.push(value.request); value.leaseUntil = Math.min(this.now() + 30_000, value.request.body.expiresAt);
+          requests.push(value.request); value.leaseUntil = this.now() + 30_000;
           this.options.store.put("mail", id, value);
         }
         return boundedJson({ requests });
       }
+      const envelope = signedEnvelope(cmd.receipt);
+      const shape = parseSchema(receiptSchema, envelope.body);
       const signed = cmd.receipt as Signed<Receipt>;
-      const row = this.options.store.get<Queued>("mail", signed?.body?.operationId);
+      const row = this.options.store.get<Queued>("mail", shape.operationId);
       if (!row) throw new ProtocolError("Receipt has no queued request.");
       const receipt = verifyReceipt(signed, this.options.macReceiptKey, row.request.body);
       if (!["succeeded", "failed", "unknown"].includes(receipt.state)) throw new ProtocolError("Only terminal receipts are publishable.");
@@ -83,7 +86,7 @@ export function localTransport(mailbox: Mailbox, principal: MailboxPrincipal): M
 export async function pollMailbox(transport: MailboxTransport, executor: {
   submit: (request: SignedRequest) => Promise<Signed<Receipt>>;
 }, limit = 8): Promise<number> {
-  const result = z.object({ requests: z.array(z.unknown()).max(16) }).strict().parse(parseWire(await transport(boundedJson({ verb: "lease", limit }))));
+  const result = parseSchema(z.object({ requests: z.array(z.unknown()).max(16) }).strict(), parseWire(await transport(boundedJson({ verb: "lease", limit }))));
   let published = 0;
   for (const input of result.requests) {
     const receipt = await executor.submit(input as SignedRequest);

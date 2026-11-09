@@ -6,6 +6,7 @@ import { parseFlightCode, FlightyApi } from "../services/flighty-api.js";
 import { assertWritesEnabled, type RuntimePolicy } from "../services/policy.js";
 import { generateConfirmCode } from "../services/removal-confirm.js";
 import { digest, canonical, ProtocolError, seal, verifyRequest, type Callers, type Request, type Receipt, type Signed, type SignedRequest } from "./protocol.js";
+import { sanitizeReceiptError, redactResultSecrets } from "./redaction.js";
 import { PrivateStore } from "./store.js";
 
 /** Captured independently on Mac, never from a replica/request account. Never persist this object. */
@@ -13,7 +14,7 @@ export type CredentialContext = Readonly<{ account: string; session: string; aut
 export type ExecutorDeps = {
   store: PrivateStore; callers: Callers; receiptKey: KeyObject; bindingKey: Buffer;
   captureContext: (signal: AbortSignal) => Promise<CredentialContext | null>;
-  createApi: (context: CredentialContext) => WriteApi;
+  createApi: (context: CredentialContext, signal: AbortSignal) => WriteApi;
   /** Reopen current local source per call. The adapter must bind owner to context.account. */
   openDatabase: (context: CredentialContext) => {
     db: WriteDatabase;
@@ -27,20 +28,28 @@ export type ExecutorDeps = {
   /** Fixture crash hook: throws outside recovery so persisted boundary can be restarted. */
   boundary?: (name: "queued" | "preview" | "dispatch" | "response" | "receipt") => void;
 };
-import { executorStateValidator, pinnedCallers, RETENTION_MS, type StoredOperation, type Preview } from "./state.js";
+import { executorStateValidator, pinnedCallers, RETENTION_MS, type StoredOperation, type Preview, type AccountFence } from "./state.js";
 const MAX_PREVIEWS = 32;
 
 /** Bounded API instances use exactly the captured token; discovery stays in the injected capture. */
-export function capturedApiFactory(options: { policy: RuntimePolicy; fetchImpl: typeof fetch }): (context: CredentialContext) => WriteApi {
-  return context => new FlightyApi({ policy: options.policy, fetchImpl: options.fetchImpl,
-    readAuthToken: () => context.authToken, getBuildToken: () => context.buildToken,
-    readSyncUrl: () => context.syncUrl });
+export function capturedApiFactory(options: { policy: RuntimePolicy; fetchImpl: typeof fetch }): (context: CredentialContext, signal: AbortSignal) => WriteApi {
+  return (context, signal) => {
+    const captured = { ...context };
+    return new FlightyApi({ policy: options.policy,
+      fetchImpl: (url, init) => {
+        signal.throwIfAborted();
+        const combined = init?.signal ? AbortSignal.any([signal, init.signal]) : signal;
+        return options.fetchImpl(url, { ...init, signal: combined });
+      },
+      readAuthToken: () => captured.authToken, getBuildToken: () => captured.buildToken,
+      readSyncUrl: () => captured.syncUrl });
+  };
 }
 
 /** Substantive removal identity excludes telemetry, fetch/copy times and volatile enrichment. */
 export function substantiveRemoval(target: ReturnType<typeof removalTarget>): unknown {
   const fields = ["id", "flight_number", "airline_iata", "departure_airport_iata", "arrival_airport_iata",
-    "departureScheduleGateOriginal", "arrivalScheduleGateOriginal", "seat_number", "seat_position", "cabin_class",
+    "departureScheduleGateOriginal", "arrivalScheduleGateOriginal", "departureScheduleRunwayOriginal", "arrivalScheduleRunwayOriginal", "seat_number", "seat_position", "cabin_class",
     "booking_reference", "flight_reason", "friend_name", "tracking_source", "passenger_name_source", "is_cancelled"];
   const flight = Object.fromEntries(fields.filter(k => Object.hasOwn(target.preview, k)).map(k => [k, target.preview[k]]));
   return { flight, localDetails: target.localDetails, localRecord: target.localRecord,
@@ -49,6 +58,7 @@ export function substantiveRemoval(target: ReturnType<typeof removalTarget>): un
 
 export class MacExecutor {
   private readonly now: () => number;
+  private readonly unresolvedAccounts = new Set<string>();
   constructor(private readonly deps: ExecutorDeps) {
     if (deps.bindingKey.length < 32) throw new ProtocolError("Private binding key is too short.");
     this.now = deps.now ?? Date.now;
@@ -59,7 +69,8 @@ export class MacExecutor {
       this.prune();
       for (const { id, value } of deps.store.list<StoredOperation>("operation")) {
         if (value.receipt.body.state === "dispatched") {
-          value.receipt = this.receipt(value.request.body, "unknown", undefined, "Dispatch outcome is unknown; do not automatically retry.");
+          this.fence(value.request);
+          value.receipt = this.receipt(value.request.body, "unknown", undefined, "Dispatch outcome is unknown; account is fenced pending operator recovery. Do not automatically retry.");
           deps.store.put("operation", id, value);
         }
       }
@@ -72,7 +83,12 @@ export class MacExecutor {
     const saved = this.deps.store.get<StoredOperation>("operation", req.operationId);
     if (saved) {
       if (digest(saved.request.body) !== digest(req)) throw new ProtocolError("Operation ID conflicts with its durable binding.");
-      return saved.receipt;
+      return ["not-dispatched", "dispatched"].includes(saved.receipt.body.state) ? this.run(req.operationId) : saved.receipt;
+    }
+    if (req.expiresAt <= this.now()) {
+      const receipt = this.receipt(req, "failed", undefined, "Request expired. Nothing dispatched.");
+      this.deps.store.put("operation", req.operationId, { request: input, contextHash: "0".repeat(64), receipt } satisfies StoredOperation);
+      return receipt;
     }
     verifyRequest(input, this.deps.callers, this.now());
     // Capture before durable acceptance. Missing/unestablished sessions never enter dispatch.
@@ -110,16 +126,21 @@ export class MacExecutor {
   maintenance(): void { this.deps.store.transaction(() => this.prune()); }
   private async run(id: string): Promise<Signed<Receipt>> {
     return this.deps.store.exclusive(async () => {
-      const stored = this.deps.store.get<StoredOperation>("operation", id)!;
+      const stored = this.deps.store.get<StoredOperation>("operation", id);
+      if (!stored) throw new ProtocolError("Operation receipt is no longer retained; absence is not proof of failure. No dispatch.");
       if (stored.receipt.body.state !== "not-dispatched") return stored.receipt;
       const req = stored.request.body;
+      let redactionContext: CredentialContext | undefined;
       const finish = (state: Receipt["state"], result?: unknown, error?: string) => {
-        stored.receipt = this.receipt(req, state, result, error);
+        stored.receipt = this.receipt(req, state, result, error, redactionContext);
         this.deps.store.put("operation", id, stored);
         return stored.receipt;
       };
+      if (this.unresolvedAccounts.has(req.account) || this.deps.store.get<AccountFence>("fence", req.account)) {
+        return finish("failed", undefined, "Account is fenced by an unresolved earlier step; operator recovery is required. Nothing dispatched.");
+      }
       let ctx: CredentialContext;
-      try { verifyRequest(stored.request, this.deps.callers, this.now()); ctx = await this.sameContext(req, stored.contextHash); }
+      try { verifyRequest(stored.request, this.deps.callers, this.now()); ctx = await this.sameContext(req, stored.contextHash); redactionContext = ctx; }
       catch { return finish("failed", undefined, "Request expired or current Mac account/session/capability is unavailable or changed. Nothing dispatched."); }
       const op = req.operation;
       if (op.kind === "remove-preview") {
@@ -164,7 +185,7 @@ export class MacExecutor {
             const stepApi: WriteApi = {
               searchFlight: async (...args) => {
                 const current = await this.sameContext(req, stored.contextHash);
-                return this.step(() => this.deps.createApi(current).searchFlight(...args));
+                return this.step(signal => this.deps.createApi(current, signal).searchFlight(...args), stored.request);
               },
               subscribeFlight: async () => { throw new ProtocolError(); }, followFlight: async () => { throw new ProtocolError(); }, deleteFlight: async () => { throw new ProtocolError(); },
             };
@@ -182,10 +203,8 @@ export class MacExecutor {
           } finally { source.close(); }
         } catch { return finish("failed", undefined, "Flight search failed before mutation dispatch."); }
       }
-      let api: WriteApi;
       try {
         ctx = await this.sameContext(req, stored.contextHash);
-        api = this.deps.createApi(ctx);
         this.deps.store.transaction(() => {
           if (op.kind === "remove-confirm") {
             const preview = this.deps.store.get<Preview>("preview", op.confirm_code.trim());
@@ -214,14 +233,14 @@ export class MacExecutor {
       let result: unknown;
       try {
         if (op.kind === "add" || op.kind === "follow") {
-          if (op.kind === "add") await this.step(() => api.subscribeFlight(serverUuid!)); else await this.step(() => api.followFlight(serverUuid!));
+          if (op.kind === "add") await this.step(signal => this.deps.createApi(ctx, signal).subscribeFlight(serverUuid!), stored.request); else await this.step(signal => this.deps.createApi(ctx, signal).followFlight(serverUuid!), stored.request);
           result = { status: op.kind === "add" ? "added" : "followed", flight_code: assertFlightCode(op.flight_code), date: op.date,
             airline: airlineName!, server_flight_uuid: serverUuid!, message: "API accepted the request. Later app/replica reconciliation is not yet verified." };
         } else if (op.kind === "remove-confirm") {
-          await this.step(() => api.deleteFlight(op.flight_id));
+          await this.step(signal => this.deps.createApi(ctx, signal).deleteFlight(op.flight_id), stored.request);
           result = { status: "removed", flight_id: op.flight_id, message: "API accepted removal. Later app/replica reconciliation is not yet verified." };
         } else {
-          const response = await this.step(signal => this.deps.requestSnapshot(ctx, signal));
+          const response = await this.step(signal => this.deps.requestSnapshot(ctx, signal), stored.request);
           if (!/^[A-Za-z0-9_-]{1,80}$/.test(response.snapshotId)) throw new ProtocolError();
           result = { status: "snapshot_requested", snapshot_id: response.snapshotId };
         }
@@ -232,7 +251,7 @@ export class MacExecutor {
       return receipt;
     });
   }
-  private async step<T>(fn: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  private async step<T>(fn: (signal: AbortSignal) => Promise<T>, request?: SignedRequest): Promise<T> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_, reject) => {
@@ -243,7 +262,19 @@ export class MacExecutor {
       timer.unref?.();
     });
     try { return await Promise.race([fn(controller.signal), deadline]); }
+    catch (error) {
+      controller.abort();
+      // Even a provider that ignores cancellation cannot release dispatch authority for this account.
+      if (request) this.fence(request);
+      throw error;
+    }
     finally { clearTimeout(timer); }
+  }
+  private fence(request: SignedRequest): void {
+    this.unresolvedAccounts.add(request.body.account);
+    try {
+      this.deps.store.put("fence", request.body.account, { request, state: "unresolved" } satisfies AccountFence);
+    } catch (error) { this.deps.store.quarantine(); throw error; }
   }
   private async context(req: Request): Promise<CredentialContext> {
     this.deps.checkSource();
@@ -291,9 +322,13 @@ export class MacExecutor {
       }
     });
   }
-  private receipt(req: Request, state: Receipt["state"], result?: unknown, error?: string): Signed<Receipt> {
+  private receipt(req: Request, state: Receipt["state"], result?: unknown, error?: string, context?: CredentialContext): Signed<Receipt> {
+    const secrets = context ? [context.authToken, context.buildToken, context.session, context.syncUrl ?? ""] : [];
+    if (context?.syncUrl) {
+      try { new URL(context.syncUrl).searchParams.forEach((value, key) => { if (/token|secret|auth|key/i.test(key)) secrets.push(value); }); } catch { /* Exact URL redaction still applies. */ }
+    }
     return seal("receipt", { version: 1, operationId: req.operationId, caller: req.caller, account: req.account,
-      requestDigest: digest(req), state, updatedAt: this.now(), ...(result === undefined ? {} : { result }), ...(error ? { error } : {}) }, this.deps.receiptKey);
+      requestDigest: digest(req), state, updatedAt: this.now(), ...(result === undefined ? {} : { result: redactResultSecrets(result, secrets) }), ...(error ? { error: sanitizeReceiptError(error, secrets) } : {}) }, this.deps.receiptKey);
   }
   private prune(): void {
     const now = this.now();

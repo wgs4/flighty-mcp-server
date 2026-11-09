@@ -114,6 +114,26 @@ describe("bounds on preexisting state before parsing", () => {
     }
     expect(() => new PrivateStore(options)).toThrow(ProtocolError);
   });
+  it("revalidates the authenticated snapshot after obtaining the write lock", async () => {
+    const f = setup(), req = f.request(add); f.deps.boundary = name => { if (name === "queued") throw new Error("queued snapshot"); };
+    await expect(f.executor.submit(req)).rejects.toThrow("queued snapshot"); f.deps.boundary = undefined;
+    const read = new DatabaseSync(f.storeOptions("mac").path);
+    const oldRows = read.prepare("SELECT kind,id,doc,tag FROM state").all();
+    const oldMeta = read.prepare("SELECT revision,root FROM metadata").get()!; read.close();
+    await f.executor.submit(req); expect(f.api.subscribeFlight).toHaveBeenCalledTimes(1);
+    const db = (f.store as any).db as DatabaseSync, exec = db.exec.bind(db); let restored = false;
+    const spy = vi.spyOn(db, "exec").mockImplementation(sql => {
+      if (sql === "BEGIN IMMEDIATE" && !restored) {
+        restored = true; const attacker = new DatabaseSync(f.storeOptions("mac").path); attacker.exec("BEGIN; DELETE FROM state");
+        const insert = attacker.prepare("INSERT INTO state VALUES(?,?,?,?)");
+        for (const row of oldRows) insert.run(row.kind, row.id, row.doc, row.tag);
+        attacker.prepare("UPDATE metadata SET revision=?,root=?").run(oldMeta.revision, oldMeta.root); attacker.exec("COMMIT"); attacker.close();
+      }
+      return exec(sql);
+    });
+    try { await expect(f.executor.submit(f.request(add))).rejects.toThrow(ProtocolError); } finally { spy.mockRestore(); }
+    expect(restored).toBe(true); expect(f.api.subscribeFlight).toHaveBeenCalledTimes(1);
+  });
   it("preserves the original exception when SQLite rollback also fails", () => {
     const f = setup(), db = (f.store as any).db as DatabaseSync, exec = db.exec.bind(db);
     const spy = vi.spyOn(db, "exec").mockImplementation(sql => { if (sql === "ROLLBACK") { exec(sql); throw new Error("secondary rollback failure"); } return exec(sql); });
@@ -123,7 +143,7 @@ describe("bounds on preexisting state before parsing", () => {
 });
 
 describe("strict protocol failure types", () => {
-  it.each([null, true, 1, "text", [], {}])("rejects primitive or malformed envelope %j safely", input => {
+  it.each([[null], [true], [1], ["text"], [[]], [{}]])("rejects primitive or malformed envelope %j safely", input => {
     const f = setup(), req = f.request(add);
     expect(() => open("request", input as any, f.caller.publicKey)).toThrow(ProtocolError);
     expect(() => verifyRequest(input as any, f.callers, f.now)).toThrow(ProtocolError);

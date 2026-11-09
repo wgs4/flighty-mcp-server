@@ -195,11 +195,11 @@ describe("authenticated Mac executor", () => {
   it("fresh captured API never reads discovery and uses captured sync URL for deletion", async () => {
     const f = setup(); const fetchImpl = vi.fn(async () => new Response(null, { status: 200 }));
     const factory = capturedApiFactory({ policy: loadRuntimePolicy({}), fetchImpl });
-    await factory(f.context!).deleteFlight(FLIGHT);
+    await factory(f.context!, new AbortController().signal).deleteFlight(FLIGHT);
     expect(fetchImpl).toHaveBeenCalledTimes(1); expect(fetchImpl.mock.calls[0][0]).toContain("SYNTHETIC-SYNC-SECRET");
     expect(fetchImpl.mock.calls[0][1].headers.Authorization).toBe("Bearer SYNTHETIC-LOGIN-SECRET");
     const captured = f.context!; f.context = { ...captured, authToken: "new-synthetic-token" };
-    await factory(f.context).subscribeFlight(FLIGHT); expect(fetchImpl.mock.calls[1][1].headers.Authorization).toBe("Bearer new-synthetic-token");
+    await factory(f.context, new AbortController().signal).subscribeFlight(FLIGHT); expect(fetchImpl.mock.calls[1][1].headers.Authorization).toBe("Bearer new-synthetic-token");
   });
 });
 

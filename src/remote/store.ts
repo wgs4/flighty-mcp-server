@@ -238,6 +238,8 @@ export class PrivateStore {
     this.db.exec("BEGIN IMMEDIATE"); this.inTransaction = true;
     let committed = false;
     try {
+      // Revalidate under the write lock: pre-lock validation alone permits a restored-state race.
+      try { this.validateSnapshot(); } catch (error) { this.faulted = true; throw error; }
       const result = fn(), rows = this.rows();
       this.validateState?.(this.parsed(rows));
       const revision = this.meta().revision + 1;
@@ -263,6 +265,8 @@ export class PrivateStore {
     try { writeFileSync(fd, canonical(anchor)); fsyncSync(fd); } finally { closeSync(fd); }
     renameSync(stage, this.options.continuityPath); syncParent(this.options.continuityPath);
   }
+  /** A failed security-state publication cannot leave this process authorized to continue. */
+  quarantine(): void { this.faulted = true; }
   exclusive<T>(fn: () => Promise<T>): Promise<T> {
     this.pending++;
     const next = this.tail.then(() => { this.ready(); return fn(); }).finally(() => { this.pending--; });

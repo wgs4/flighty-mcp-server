@@ -10,6 +10,9 @@ export function sshTransport(inputConfig: {
   checkConfiguration: () => void;
 }, spawnImpl: typeof spawn = spawn): MailboxTransport {
   const config = Object.freeze({ ...inputConfig });
+  if (![config.identityFile, config.knownHostsFile].every(path => typeof path === "string" && isAbsolute(path) && /^[A-Za-z0-9._/-]+$/.test(path))) {
+    throw new ProtocolError("SSH paths must be absolute and use only letters, digits, '.', '_', '-' or '/'.");
+  }
   if (config.enabled !== true || !/^[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}$/.test(config.host) ||
       !/^[a-z_][a-z0-9_-]{0,31}$/.test(config.user) || !Number.isInteger(config.port) || config.port < 1 || config.port > 65535 ||
       !isAbsolute(config.identityFile) || !isAbsolute(config.knownHostsFile) ||
@@ -32,11 +35,16 @@ export function sshTransport(inputConfig: {
       };
       const timer = setTimeout(() => finish(new ProtocolError("Mailbox transport unavailable; inspect operation status before retrying.")), 20_000);
       child.stdout.on("data", (chunk: Buffer) => {
+        if (finished) return;
         total += chunk.length;
         if (total > MAX_WIRE_BYTES) finish(new ProtocolError("Mailbox response too large."));
         else chunks.push(chunk);
       });
-      child.stderr.on("data", () => { /* Drain without logging host details or remote errors. */ });
+      child.stderr.on("data", (chunk: Buffer) => {
+        if (finished) return;
+        total += chunk.length;
+        if (total > MAX_WIRE_BYTES) finish(new ProtocolError("Mailbox transport output too large."));
+      });
       child.on("error", () => finish(new ProtocolError("Mailbox transport unavailable.")));
       child.stdin.on("error", () => finish(new ProtocolError("Mailbox transport unavailable.")));
       child.on("close", code => finish(code === 0 ? undefined : new ProtocolError("Mailbox transport unavailable; dispatch may be unknown.")));

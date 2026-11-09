@@ -112,6 +112,6 @@ export function makeRequest(input: Omit<Request, "version" | "payloadDigest">, k
 export function verifyReceipt(signed: unknown, key: KeyObject, req: Request): Receipt {
   const receipt = parseSchema(receiptSchema, open<unknown>("receipt", signed, key));
   if (receipt.version !== 1 || receipt.operationId !== req.operationId || receipt.caller !== req.caller ||
-      receipt.account !== req.account || receipt.requestDigest !== digest(req)) throw new ProtocolError("Receipt binding rejected.");
+      receipt.account !== req.account || receipt.requestDigest !== digest(req) || receipt.updatedAt < req.issuedAt) throw new ProtocolError("Receipt binding rejected.");
   return receipt;
 }

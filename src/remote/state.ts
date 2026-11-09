@@ -8,9 +8,11 @@ const hash = z.string().regex(/^[a-f0-9]{64}$/);
 const operationSchema = z.object({ request: z.unknown(), contextHash: hash, receipt: z.unknown() }).strict();
 const previewSchema = z.object({ requestId: idSchema, flightId: z.string().uuid(), caller: idSchema, account: idSchema,
   capability: z.literal("remove-confirm"), contextHash: hash, localHash: hash, expiresAt: timeSchema, consumed: z.boolean() }).strict();
+const fenceSchema = z.object({ request: z.unknown(), state: z.literal("unresolved") }).strict();
 const queuedSchema = z.object({ request: z.unknown(), leaseUntil: timeSchema, receipt: z.unknown().nullable() }).strict();
 export type StoredOperation = { request: SignedRequest; contextHash: string; receipt: Signed<Receipt> };
 export type Preview = z.infer<typeof previewSchema>;
+export type AccountFence = { request: SignedRequest; state: "unresolved" };
 export type Queued = { request: SignedRequest; leaseUntil: number; receipt: Signed<Receipt> | null };
 
 /** Preserve pinned verification keys for retained records; dispatch checks current authorization separately. */
@@ -22,6 +24,11 @@ export function executorStateValidator(callers: Callers, macKey: KeyObject, now:
     const operations = new Map<string, StoredOperation>();
     for (const row of rows) {
       if (row.kind === "preview") continue;
+      if (row.kind === "fence") {
+        const fence = parseSchema(fenceSchema, row.value), request = verifyRequest(fence.request, callers, now(), true);
+        if (row.id !== request.account) throw new ProtocolError("Durable unresolved account fence rejected.");
+        continue;
+      }
       if (row.kind !== "operation") throw new ProtocolError("Unexpected executor state kind.");
       const parsed = parseSchema(operationSchema, row.value);
       const request = verifyRequest(parsed.request, callers, now(), true);
@@ -33,9 +40,11 @@ export function executorStateValidator(callers: Callers, macKey: KeyObject, now:
       if (row.kind !== "preview") continue;
       const preview = parseSchema(previewSchema, row.value);
       const operation = operations.get(preview.requestId), request = operation?.request.body;
+      const issued = operation?.receipt.body.result as { confirm_code?: string; flight_id?: string } | undefined;
       if (!/^[A-HJ-NP-Z2-9]{8}$/.test(row.id) || !operation || !request || request.operation.kind !== "remove-preview" ||
           request.operation.flight_id.toLowerCase() !== preview.flightId || request.caller !== preview.caller || request.account !== preview.account ||
-          operation.contextHash !== preview.contextHash || preview.expiresAt !== request.expiresAt) throw new ProtocolError("Durable preview binding rejected.");
+          operation.contextHash !== preview.contextHash || preview.expiresAt !== request.expiresAt ||
+          operation.receipt.body.state !== "succeeded" || !issued || issued.confirm_code !== row.id || issued.flight_id?.toLowerCase() !== preview.flightId) throw new ProtocolError("Durable preview binding rejected.");
     }
   };
 }
@@ -44,7 +53,7 @@ export function mailboxStateValidator(callers: Callers, macKey: KeyObject, now: 
     for (const row of rows) {
       if (row.kind !== "mail") throw new ProtocolError("Unexpected mailbox state kind.");
       const value = parseSchema(queuedSchema, row.value), request = verifyRequest(value.request, callers, now(), true);
-      if (row.id !== request.operationId || (value.leaseUntil !== 0 && (value.leaseUntil < request.issuedAt || value.leaseUntil > request.expiresAt + 30_000))) throw new ProtocolError("Durable mailbox binding rejected.");
+      if (row.id !== request.operationId || (value.leaseUntil !== 0 && (value.leaseUntil < request.issuedAt || value.leaseUntil > request.expiresAt + RETENTION_MS + 30_000))) throw new ProtocolError("Durable mailbox binding rejected.");
       if (value.receipt !== null) {
         const receipt = verifyReceipt(value.receipt, macKey, request);
         if (!["succeeded", "failed", "unknown"].includes(receipt.state) || receipt.updatedAt < request.issuedAt) throw new ProtocolError("Durable terminal receipt rejected.");
