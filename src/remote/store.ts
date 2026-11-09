@@ -16,6 +16,8 @@ export type StoreOptions = {
   /** Required pure role validator; runs before writer recovery and every committed-state decision. */
   validateState: (rows: readonly StateRow[]) => void;
 };
+/** Internal move handoff: preparation must finish before rerunning the caller-owned validator. */
+export type RetirementMove = (path: string, validateSelection: () => void) => void;
 export type StateRow = { kind: string; id: string; value: unknown };
 const activeStores = new Set<string>();
 const MAX_FILE_BYTES = 32 * 1024 * 1024;
@@ -208,9 +210,9 @@ export class PrivateStore {
       // DB rows, writer, revision, sequence and all cloud outcomes are untouched.
     });
   }
-  static retireRecoveryAudits(options: StoreOptions, authority: { key: KeyObject; role: string }, limit: number, trash: (path: string) => void): number {
+  static retireRecoveryAudits(options: StoreOptions, authority: { key: KeyObject; role: string }, limit: number, trash: RetirementMove): number {
     if (!Number.isInteger(limit) || limit < 1 || limit > 16) throw new ProtocolError();
-    return PrivateStore.inspectLocked(options, (_view, current) => {
+    return PrivateStore.inspectLocked(options, (view, current) => {
       const root = options.continuityPath + ".recovery"; if (!existsSync(root)) return 0;
       privateParent(root + "/entry"); const entries = readdirSync(root); if (entries.length > 128) fail();
       let retired = 0;
@@ -223,8 +225,14 @@ export class PrivateStore {
           !verify(null, Buffer.from("flighty-continuity-recovery-v1:" + canonical(body)), authority.key, Buffer.from(signed.signature, "base64"))) fail();
         if (body.expiresAt + 86_400_000 > Date.now() || current.anchorRevision < body.observation.revision ||
           current.anchorDevice !== current.device || current.anchorInode !== current.inode) continue;
-        recheckRetirementFile(options, path, identity, bytes);
-        trash(path); retired++;
+        const validateSelection = () => {
+          view.validateSnapshot();
+          if (body.expiresAt + 86_400_000 > Date.now() || current.anchorRevision < body.observation.revision ||
+            current.anchorDevice !== current.device || current.anchorInode !== current.inode ||
+            !verify(null, Buffer.from("flighty-continuity-recovery-v1:" + canonical(body)), authority.key, Buffer.from(signed.signature, "base64"))) fail();
+          recheckRetirementFile(options, path, identity, bytes);
+        };
+        validateSelection(); trash(path, validateSelection); retired++;
       }
       return retired;
     });
@@ -431,7 +439,7 @@ export class PrivateStore {
     return structuredClone(this.archiveCandidate(path).value) as T;
   }
 
-  retireArchive(limit: number, trash: (path: string) => void): number {
+  retireArchive(limit: number, trash: RetirementMove): number {
     if (!Number.isInteger(limit) || limit < 1 || limit > 16) throw new ProtocolError();
     this.ready(); const root = this.options.path + ".archive";
     if (!existsSync(root)) return 0;
@@ -470,8 +478,20 @@ export class PrivateStore {
           if ([...remaining].some(other => other !== candidate && !proof(other) && requestKey(other) === key)) continue;
         } else if (state !== "succeeded" && state !== "failed" && !resolved.has(key)) continue;
       }
-      recheckRetirementFile(this.options, path, candidate.identity, candidate.bytes);
-      trash(path); retired++; remaining.delete(candidate);
+      const validateSelection = () => {
+        this.ready();
+        // Bind every remaining authenticated dependency to the original selection plan.
+        const names = readdirSync(root).sort(), expected = [...remaining].map(c => basename(c.path)).sort();
+        if (canonical(names) !== canonical(expected)) fail();
+        for (const other of remaining) {
+          if (other.body) this.archiveCandidate(other.path);
+          recheckRetirementFile(this.options, other.path, other.identity, other.bytes);
+        }
+        if (!body && Date.now() - lstatSync(path).mtimeMs < 86_400_000) fail();
+        if (body && (body.value as any).request.body.expiresAt + 86_400_000 > Date.now()) fail();
+        recheckRetirementFile(this.options, path, candidate.identity, candidate.bytes);
+      };
+      validateSelection(); trash(path, validateSelection); retired++; remaining.delete(candidate);
     }
     return retired;
   }

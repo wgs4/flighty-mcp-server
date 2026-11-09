@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { z } from "zod";
-import { PrivateStore, type StoreOptions } from "../remote/store.js";
+import { PrivateStore, type RetirementMove, type StoreOptions } from "../remote/store.js";
 import { verifyAttestation, verifyAudit } from "../remote/recovery.js";
 import { callersFor, type LinuxConfig } from "./config.js";
 import { verifyClientResolution, type ClientRow } from "./client-state.js";
@@ -64,6 +64,7 @@ export function archiveResolvedClient(config: LinuxConfig, input: unknown): void
 export class RetirementError extends ProtocolError {
   constructor(readonly retired: number) { super("Retirement helper or validation stopped the batch; completed moves remain recoverable. Inspect private evidence before retrying."); }
 }
+class CompletedMoveFailure extends Error {}
 function treeSnapshot(config: Config, path: string) {
   let bytes = 0, entries = 0, newest = 0;
   const nodes: { relative: string; directory: boolean }[] = [];
@@ -81,8 +82,8 @@ function treeSnapshot(config: Config, path: string) {
   };
   visit(path, ""); return { identity: canonical(identities), nodes, newest };
 }
-function retirementHelper(config: Config, trash?: (path: string) => void): (path: string) => void {
-  return path => {
+function retirementHelper(config: Config, trash?: (path: string) => void): RetirementMove {
+  return (path, validateSelection) => {
     const before = treeSnapshot(config, path);
     const command = config.retirementCommand;
     if (!trash) {
@@ -100,20 +101,28 @@ function retirementHelper(config: Config, trash?: (path: string) => void): (path
     assertNoSymlinkChain(path, "retirement");
     assertPrivatePath(path, config.storage.privateRootDir, config.storage.expectedDevice);
     if (treeSnapshot(config, path).identity !== before.identity) throw new ProtocolError("Artifact changed during retirement validation.");
-    // Recheck AFTER blocking tree/helper validation, immediately before the trusted side effect.
+    // A helper-created baseline cannot authorize a replacement of the caller's selection.
+    // Rerun its original validator AFTER all blocking helper preparation, before any move.
+    validateSelection();
     checkStorage(config, [dirname(path)]);
-    if (trash) trash(path);
-    else execFileSync(command!, [path], { timeout: 10_000, maxBuffer: 4096, stdio: "pipe" });
+    try {
+      if (trash) trash(path);
+      else execFileSync(command!, [path], { timeout: 10_000, maxBuffer: 4096, stdio: "pipe" });
+    } catch (error) {
+      // Absence counts only after invoking the trusted move, never after preparation fails.
+      if (!existsSync(path)) throw new CompletedMoveFailure();
+      throw error;
+    }
   };
 }
 function retirementBatch(config: Config, trash: ((path: string) => void) | undefined,
-  work: (retire: (path: string) => void) => void): number {
+  work: (retire: RetirementMove) => void): number {
   let retired = 0;
   const helper = retirementHelper(config, trash);
   try {
-    work(path => {
-      try { helper(path); }
-      catch (error) { if (!existsSync(path)) retired++; throw error; }
+    work((path, validateSelection) => {
+      try { helper(path, validateSelection); }
+      catch (error) { if (error instanceof CompletedMoveFailure) retired++; throw error; }
       if (existsSync(path)) throw new ProtocolError("Retirement helper did not move the artifact.");
       retired++;
     });
@@ -158,8 +167,14 @@ export function retireArtifacts(config: Config, category: ArtifactCategory, limi
             validateArtifactLayout(name, snapshot.nodes);
             // The complete artifact must be aged, including every descendant.
             if (Date.now() - snapshot.newest < 86_400_000) continue;
-            if (treeSnapshot(config, path).identity !== snapshot.identity) throw new ProtocolError("Artifact changed during selection.");
-            retire(path); retired++;
+            const validateSelection = () => {
+              const current = treeSnapshot(config, path);
+              if (current.identity !== snapshot.identity) throw new ProtocolError("Artifact changed during selection.");
+              validateArtifactLayout(name, current.nodes);
+              if (Date.now() - current.newest < 86_400_000) throw new ProtocolError("Artifact is no longer aged.");
+              checkStorage(config, [root]);
+            };
+            validateSelection(); retire(path, validateSelection); retired++;
           }
         }
       }
