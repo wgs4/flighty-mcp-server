@@ -1,7 +1,7 @@
 import { verifyAudit } from "./recovery.js";
 import { z } from "zod";
 import type { KeyObject } from "node:crypto";
-import { digest, idSchema, parseSchema, ProtocolError, timeSchema, verifyReceipt, verifyRequest, type Callers, type Receipt, type Signed, type SignedRequest } from "./protocol.js";
+import { digest, idSchema, parseSchema, ProtocolError, timeSchema, verifyReceipt, verifyRequest, verifyRetainedRequest, type Callers, type Receipt, type Signed, type SignedRequest } from "./protocol.js";
 import type { StateRow } from "./store.js";
 
 export const RETENTION_MS = 86_400_000;
@@ -18,7 +18,7 @@ export type Queued = { request: SignedRequest; leaseUntil: number; receipt: Sign
 
 /** Preserve pinned verification keys for retained records; dispatch checks current authorization separately. */
 export function pinnedCallers(callers: Callers): Callers {
-  return Object.fromEntries(Object.entries(callers).map(([id, policy]) => [id, { ...policy, capabilities: [...policy.capabilities] }]));
+  return Object.fromEntries(Object.entries(callers).map(([id, policy]) => [id, { ...policy, capabilities: [...policy.capabilities], historicalPublicKeys: [...(policy.historicalPublicKeys ?? [])] }]));
 }
 /** Cache only exact cryptographic proofs with immutable pinned keys, never state/authorization decisions.
  * Every scan still authenticates the current DB/root and checks IDs, schemas, bindings and clock. */
@@ -29,7 +29,7 @@ function retainedProofs(callers: Callers, macKey: KeyObject, now: () => number) 
     const keys = Object.keys(callers);
     if (keys.length !== Object.keys(trust).length || keys.some(id => {
       const current = callers[id], previous = trust[id];
-      return !current || !previous || current.publicKey !== previous.publicKey || current.account !== previous.account ||
+      return !current || !previous || current.publicKey !== previous.publicKey || (current.historicalPublicKeys ?? []).some((key, i) => key !== previous.historicalPublicKeys?.[i]) || (current.historicalPublicKeys?.length ?? 0) !== (previous.historicalPublicKeys?.length ?? 0) || current.account !== previous.account ||
         current.capabilities.length !== previous.capabilities.length || current.capabilities.some((capability, index) => capability !== previous.capabilities[index]);
     })) {
       requests.clear(); receipts.clear(); trust = pinnedCallers(callers);
@@ -43,7 +43,7 @@ function retainedProofs(callers: Callers, macKey: KeyObject, now: () => number) 
     request(input: unknown) {
       checkTrust();
       const proof = digest(input);
-      if (!requests.has(proof)) { const value = verifyRequest(input, callers, now(), true); remember(requests, proof); return value; }
+      if (!requests.has(proof)) { const value = verifyRetainedRequest(input, callers, now()); remember(requests, proof); return value; }
       const value = (input as SignedRequest).body;
       if (value.issuedAt > now()) throw new ProtocolError("Retained request clock rejected.");
       return value;

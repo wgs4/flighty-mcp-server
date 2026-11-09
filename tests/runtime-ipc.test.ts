@@ -47,3 +47,7 @@ it.each(["reservation", "mkdir-fault"])("%s rejection releases upload admission 
 it("closing the original owner leaves a replacement live published socket reachable", async () => {
   const r = await scenario("replacement", false); expect(r.exists).toBe(true); expect(r.response).toBe("replacement");
 });
+
+it("normal close/new startup and idempotent old close preserve the new socket", async () => {
+  const r = await scenario("normal-reopen", false); expect(JSON.parse(r.response).requests).toEqual([]);
+});

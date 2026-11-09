@@ -54,6 +54,9 @@ try {
     const small={...large,dbBytes:db.length};
     const accepted=await raw([JSON.stringify({endpoint:'upload',header:small})+'\n',manifest,db]);
     result={rejected,mailbox,accepted,highwater:runtime.receiver.getStateSnapshot().highwaterSequence};
+  } else if(scenario === 'normal-reopen') {
+    await listener.close(); const next=await runtime.listen(); await listener.close();
+    result={response:await raw(['{"endpoint":"mailbox"}\n','{"verb":"lease","limit":1}'])}; await next.close();
   } else if(scenario === 'replacement') {
     fs.renameSync(config.socketPath, config.socketPath+'.moved');
     const replacement=createServer(s=>s.end('replacement'));

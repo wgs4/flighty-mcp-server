@@ -13,8 +13,8 @@ import { executorStateValidator } from "../remote/state.js";
 import { ProtocolError } from "../remote/protocol.js";
 import { exportReplicaBundle } from "../replica/exporter.js";
 import { withSqliteBudget } from "../replica/work.js";
-import { assertNoSymlinkChain, assertPrivatePath, assertRegularFileNoSymlink, measureStorageGroups } from "../replica/cleanup.js";
-import { checkStorage, callersFor, privateKey, privateRead, publicKey, storageAuthority, type MacConfig } from "./config.js";
+import { assertNoSymlinkChain, assertPrivatePath, assertRegularFileNoSymlink, measureStorageGroups, retirePath } from "../replica/cleanup.js";
+import { validateConfig, checkStorage, callersFor, privateKey, privateRead, publicKey, storageAuthority, type MacConfig } from "./config.js";
 
 export function checkMacSource(config: MacConfig): void {
   checkStorage(config, [config.transferParent, config.rawQuarantine]);
@@ -75,10 +75,12 @@ export function sequenceValidator(rows: readonly StateRow[]): void {
     Object.keys(row.value as object).join(",") !== "next" || !Number.isSafeInteger((row.value as { next: number }).next) || (row.value as { next: number }).next < 1)) throw new ProtocolError("Snapshot sequence continuity rejected.");
 }
 export function macStoreOptions(config: MacConfig): StoreOptions {
+  validateConfig(config);
   return { ...config.store, authenticationKey: Buffer.from(config.store.authenticationKey, "hex"), checkLocation: () => checkStorage(config),
     validateState: executorStateValidator(callersFor(config), createPublicKey(privateKey(config.receiptPrivateKey)), Date.now, publicKey(config.operatorPublicKey)) };
 }
 export function sequenceStoreOptions(config: MacConfig): StoreOptions {
+  validateConfig(config);
   return { ...config.sequenceStore, authenticationKey: Buffer.from(config.sequenceStore.authenticationKey, "hex"),
     checkLocation: () => checkStorage(config), validateState: sequenceValidator };
 }
@@ -120,11 +122,14 @@ export function openMac(config: MacConfig, options: { fetchImpl: typeof fetch; r
       requiredMountPath: config.storage.mountPath, producerId: config.pins.producerId,
       accountId: context.account, ownerUserId: context.account, epoch: config.pins.epoch, sequence: next,
       signingPrivateKey: privateKey(config.snapshotPrivateKey), approvedSourceDbPath: config.source.dbPath, limits: { maxDbBytes: config.budget.maxDbBytes, maxOperationDurationMs: config.budget.sqliteTaskMs } }));
+    try {
     if (performance.now() >= deadline) throw new ProtocolError("Snapshot preparation budget exceeded. No upload.");
     const after = await captureContext(signal);
     if (!after || JSON.stringify(after) !== JSON.stringify(context)) throw new ProtocolError("Mac context changed during snapshot. No upload.");
+    if (performance.now() >= deadline) throw new ProtocolError("Snapshot preparation exceeded its budget.");
     signal.throwIfAborted(); await options.upload(bundle.bundleDir, signal); signal.throwIfAborted();
     return { snapshotId: createHash("sha256").update(JSON.stringify([config.pins.producerId, config.pins.epoch, next, bundle.manifest.dbSha256])).digest("hex") };
+    } catch (error) { retirePath(bundle.bundleDir, config.rawQuarantine); throw error; }
   };
   const deps: ExecutorDeps = { store, callers: callersFor(config), receiptKey: privateKey(config.receiptPrivateKey),
     operatorKey: publicKey(config.operatorPublicKey), cancellation: options.signal, bindingKey: Buffer.from(config.bindingKey, "hex"), policy,

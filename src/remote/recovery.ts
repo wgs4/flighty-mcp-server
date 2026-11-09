@@ -1,6 +1,6 @@
 import { verify, type KeyObject } from "node:crypto";
 import { z } from "zod";
-import { boundedJson, canonical, digest, idSchema, timeSchema, ProtocolError, verifyRequest, verifyReceipt, type Callers, type SignedRequest, type Signed, type Receipt } from "./protocol.js";
+import { boundedJson, canonical, digest, idSchema, timeSchema, ProtocolError, verifyRequest, verifyRetainedRequest, verifyReceipt, type Callers, type SignedRequest, type Signed, type Receipt } from "./protocol.js";
 import type { PrivateStore } from "./store.js";
 
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -20,7 +20,7 @@ export function verifyAttestation(input: unknown, key: KeyObject): OperatorAttes
 }
 export function verifyAudit(input: unknown, id: string, callers: Callers, receiptKey: KeyObject, operatorKey: KeyObject): void {
   const value = z.object({ attestation: z.unknown(), request: z.unknown(), unknownReceipt: z.unknown() }).strict().parse(input);
-  const signed = verifyAttestation(value.attestation, operatorKey), req = verifyRequest(value.request, callers, Date.now(), true);
+  const signed = verifyAttestation(value.attestation, operatorKey), req = verifyRetainedRequest(value.request, callers, Date.now());
   const receipt = verifyReceipt(value.unknownReceipt, receiptKey, req);
   const a = signed.body;
   if (id !== a.auditId || a.operationId !== req.operationId || a.account !== req.account || a.requestDigest !== digest(req) || receipt.state !== "unknown" ||

@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
-import { closeSync, constants, existsSync, fsyncSync, lstatSync, openSync, readSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fsyncSync, lstatSync, openSync, readSync, realpathSync, renameSync, writeFileSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
-import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual, verify, type KeyObject } from "node:crypto";
 import { z } from "zod";
 import { boundedJson, canonical, MAX_WIRE_BYTES, ProtocolError } from "./protocol.js";
 
@@ -17,6 +17,7 @@ export type StoreOptions = {
   validateState: (rows: readonly StateRow[]) => void;
 };
 export type StateRow = { kind: string; id: string; value: unknown };
+const activeStores = new Set<string>();
 const MAX_FILE_BYTES = 32 * 1024 * 1024;
 const schemas = {
   state: "CREATE TABLE state (kind TEXT NOT NULL, id TEXT NOT NULL, doc TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(kind,id))",
@@ -30,6 +31,16 @@ const anchorSchema = z.object({ version: z.literal(2), identity: z.string().rege
 type Anchor = z.infer<typeof anchorSchema>;
 type Meta = { version: number; identity: string; revision: number; root: string };
 type RawRow = { kind: string; id: string; doc: string; tag: string };
+
+const observationSchema = z.object({ identity: z.string().regex(/^[A-Za-z0-9_-]{1,80}$/), revision: z.number().int().nonnegative(), root: hex,
+  device: z.string().regex(/^\d+$/), inode: z.string().regex(/^\d+$/), dbSha256: hex, anchorSha256: hex,
+  anchorRevision: z.number().int().nonnegative(), anchorRoot: hex, anchorDevice: z.string().regex(/^\d+$/), anchorInode: z.string().regex(/^\d+$/) }).strict();
+export type ContinuityObservation = z.infer<typeof observationSchema>;
+export const continuityAttestationSchema = z.object({ body: z.object({ version: z.literal(1), action: z.literal("recover-continuity"),
+  mode: z.enum(["repair-ahead", "migrate"]), role: z.enum(["linux-mailbox", "linux-client", "mac-executor", "mac-sequence"]),
+  configDigest: hex, observation: observationSchema, nonce: z.string().regex(/^[A-Za-z0-9_-]{1,80}$/),
+  issuedAt: z.number().int().nonnegative(), expiresAt: z.number().int().nonnegative() }).strict(),
+  signature: z.string().regex(/^[A-Za-z0-9+/]{86}==$/) }).strict();
 
 function fail(): never { throw new ProtocolError("Durable state continuity or authentication failed; operator recovery required. No dispatch is authorized."); }
 function equal(a: string, b: string): boolean {
@@ -63,6 +74,7 @@ export class PrivateStore {
   private transactionView?: Map<string, StateRow>;
   private pending = 0;
   private resources = 0;
+  private archiveUsage?: { bytes: number; entries: number };
   private readonly consumers = new Set<string>();
   private validateState?: (rows: readonly StateRow[]) => void;
 
@@ -114,11 +126,93 @@ export class PrivateStore {
         if (owner) {
           let alive = true;
           try { process.kill(owner.pid, 0); } catch (error) { alive = (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+          if (owner.pid === process.pid && !activeStores.has(resolve(input.path))) alive = false;
           if (alive) throw new ProtocolError("State already has a live writer; no automatic takeover.");
         }
         this.db.prepare("INSERT OR REPLACE INTO writer VALUES(1,?,?)").run(process.pid, this.instance);
       });
+      activeStores.add(resolve(input.path));
     } catch (error) { this.db.close(); throw error; }
+  }
+  /** Inspect only fully authenticated bounded state under an exclusive SQLite lock. No dispatch owner is acquired. */
+  private static inspectLocked<T>(options: StoreOptions, fn: (view: PrivateStore, observation: ContinuityObservation) => T): T {
+    PrivateStore.checkOptions(options);
+    privateFile(options.path, MAX_FILE_BYTES, 4096); privateFile(options.continuityPath, 4096);
+    for (const suffix of ["-wal", "-shm", "-journal"]) if (existsSync(options.path + suffix)) fail();
+    if (activeStores.has(resolve(options.path))) throw new ProtocolError("Stop the active writer before operator recovery.");
+    const db = new DatabaseSync(options.path);
+    const view = Object.create(PrivateStore.prototype) as PrivateStore;
+    Object.assign(view, { db, options, maxRows: options.maxRows ?? 512, validateState: options.validateState });
+    try {
+      db.exec("PRAGMA trusted_schema=OFF; PRAGMA busy_timeout=1000; BEGIN EXCLUSIVE;");
+      const rows = view.rows(), meta = view.meta();
+      if (!equal(meta.root, PrivateStore.root(options, db, rows, meta.revision))) fail();
+      options.validateState(view.parsed(rows));
+      const owner = db.prepare("SELECT pid FROM writer WHERE id=1").get() as { pid: number } | undefined;
+      if (owner && owner.pid !== process.pid) {
+        let alive = true; try { process.kill(owner.pid, 0); } catch (error) { alive = (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+        if (alive) throw new ProtocolError("Stop the active or ambiguous writer before operator recovery.");
+      }
+      const anchorBytes = readFileSync(options.continuityPath), { tag, ...anchor } = anchorSchema.parse(JSON.parse(anchorBytes.toString("utf8")));
+      if (anchor.identity !== options.identity || !equal(tag, PrivateStore.mac(options, "anchor", canonical(anchor)))) fail();
+      const info = lstatSync(options.path, { bigint: true });
+      const observation: ContinuityObservation = { identity: options.identity, revision: meta.revision, root: meta.root,
+        device: String(info.dev), inode: String(info.ino), dbSha256: createHash("sha256").update(readFileSync(options.path)).digest("hex"),
+        anchorSha256: createHash("sha256").update(anchorBytes).digest("hex"), anchorRevision: anchor.revision,
+        anchorRoot: anchor.root, anchorDevice: anchor.device, anchorInode: anchor.inode };
+      return fn(view, observation);
+    } finally { try { db.exec("ROLLBACK"); } finally { db.close(); } }
+  }
+  static inspectContinuity(options: StoreOptions): ContinuityObservation {
+    return PrivateStore.inspectLocked(options, (_view, observation) => observation);
+  }
+  /** Local explicit independent operator authorization only; no generic reset or row reconstruction. */
+  static recoverContinuity(options: StoreOptions, input: unknown, authority: { key: KeyObject; role: string; configDigest: string; now?: number }): void {
+    const signed = continuityAttestationSchema.parse(input), body = signed.body, now = authority.now ?? Date.now();
+    if (authority.key.asymmetricKeyType !== "ed25519" || body.role !== authority.role || body.configDigest !== authority.configDigest ||
+      body.issuedAt > now || body.expiresAt <= now || body.expiresAt - body.issuedAt > 300_000 || body.expiresAt <= body.issuedAt ||
+      !verify(null, Buffer.from("flighty-continuity-recovery-v1:" + canonical(body)), authority.key, Buffer.from(signed.signature, "base64"))) throw new ProtocolError("Independent continuity authorization rejected.");
+    PrivateStore.inspectLocked(options, (view, observed) => {
+      if (canonical(observed) !== canonical(body.observation)) throw new ProtocolError("Continuity observation changed; re-inspect before authorization.");
+      const sameFile = observed.device === observed.anchorDevice && observed.inode === observed.anchorInode;
+      const ahead = sameFile && observed.revision === observed.anchorRevision + 1;
+      const migration = !sameFile && observed.revision === observed.anchorRevision && observed.root === observed.anchorRoot;
+      if (!(body.mode === "repair-ahead" ? ahead : migration)) throw new ProtocolError("Unsupported continuity loss/rollback; no reset or dispatch is authorized.");
+      const root = options.continuityPath + ".recovery";
+      if (!existsSync(root)) mkdirSync(root, { mode: 0o700 });
+      privateParent(root + "/entry");
+      if (readdirSync(root).length >= 128) throw new ProtocolError("Recovery audit capacity reached.");
+      const file = root + "/" + body.nonce + ".json", doc = canonical(signed);
+      if (existsSync(file)) { privateFile(file, 16 * 1024); if (readFileSync(file, "utf8") !== doc) fail(); }
+      else { writeFileSync(file, doc, { mode: 0o600, flag: "wx" }); const fd = openSync(file, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } syncParent(file); }
+      if (Date.now() >= body.expiresAt) throw new ProtocolError("Continuity authorization expired before publication.");
+      options.checkLocation(); privateFile(options.path, MAX_FILE_BYTES, 4096); privateFile(options.continuityPath, 4096);
+      const current = lstatSync(options.path, { bigint: true });
+      if (String(current.dev) !== observed.device || String(current.ino) !== observed.inode ||
+        createHash("sha256").update(readFileSync(options.path)).digest("hex") !== observed.dbSha256 ||
+        createHash("sha256").update(readFileSync(options.continuityPath)).digest("hex") !== observed.anchorSha256) throw new ProtocolError("Continuity paths changed before publication.");
+      view.publishAnchor(observed.revision, observed.root);
+      // DB rows, writer, revision, sequence and all cloud outcomes are untouched.
+    });
+  }
+  static retireRecoveryAudits(options: StoreOptions, authority: { key: KeyObject; role: string }, limit: number, trash: (path: string) => void): number {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 16) throw new ProtocolError();
+    return PrivateStore.inspectLocked(options, (_view, current) => {
+      const root = options.continuityPath + ".recovery"; if (!existsSync(root)) return 0;
+      privateParent(root + "/entry"); const entries = readdirSync(root); if (entries.length > 128) fail();
+      let retired = 0;
+      for (const name of entries) {
+        if (retired >= limit) break;
+        if (!/^[A-Za-z0-9_-]{1,80}\.json$/.test(name)) fail(); const path = root + "/" + name; privateFile(path, 16384);
+        const signed = continuityAttestationSchema.parse(JSON.parse(readFileSync(path, "utf8"))), body = signed.body;
+        if (body.role !== authority.role || body.observation.identity !== options.identity || name !== body.nonce + ".json" ||
+          !verify(null, Buffer.from("flighty-continuity-recovery-v1:" + canonical(body)), authority.key, Buffer.from(signed.signature, "base64"))) fail();
+        if (body.expiresAt + 86_400_000 > Date.now() || current.anchorRevision < body.observation.revision ||
+          current.anchorDevice !== current.device || current.anchorInode !== current.inode) continue;
+        trash(path); retired++;
+      }
+      return retired;
+    });
   }
   private static checkOptions(options: StoreOptions): void {
     options.checkLocation();
@@ -265,9 +359,10 @@ export class PrivateStore {
       if (!committed) { try { this.db.exec("ROLLBACK"); } catch { /* Preserve the original disk/transaction error. */ } }
       else this.faulted = true;
       throw error;
-    } finally { this.inTransaction = false; this.transactionView = undefined; }
+    } finally { this.inTransaction = false; this.transactionView = undefined; this.archiveUsage = undefined; }
   }
   private publishAnchor(revision: number, root: string): void {
+    this.options.checkLocation();
     const info = lstatSync(this.options.path, { bigint: true });
     const body = { version: 2 as const, identity: this.options.identity, revision, root, device: String(info.dev), inode: String(info.ino) };
     const anchor: Anchor = { ...body, tag: PrivateStore.mac(this.options, "anchor", canonical(body)) };
@@ -276,6 +371,73 @@ export class PrivateStore {
     try { writeFileSync(fd, canonical(anchor)); fsyncSync(fd); } finally { closeSync(fd); }
     renameSync(stage, this.options.continuityPath); syncParent(this.options.continuityPath);
   }
+  /** Recoverable bounded evidence archive; does not authorize dispatch or initialize state. */
+  archive(kind: string, id: string): void {
+    const value = this.get(kind, id);
+    if (value === undefined) return;
+    const root = this.options.path + ".archive";
+    if (!existsSync(root)) { mkdirSync(root, { mode: 0o700 }); syncParent(root); }
+    privateParent(root + "/entry");
+    const entries = this.inTransaction && this.archiveUsage ? [] : readdirSync(root);
+    let total = this.archiveUsage?.bytes ?? 0;
+    const count = this.archiveUsage?.entries ?? entries.length;
+    for (const name of entries) { if (!/^(?:[a-f0-9]{64}\.json|\.partial-[a-f0-9-]{36})$/.test(name)) fail(); privateFile(root + "/" + name, MAX_WIRE_BYTES + 4096); total += lstatSync(root + "/" + name).size; }
+    if (this.inTransaction && !this.archiveUsage) this.archiveUsage = { bytes: total, entries: count };
+    const body = { version: 1, identity: this.options.identity, kind, id, value };
+    const doc = canonical({ ...body, tag: PrivateStore.mac(this.options, "archive", canonical(body)) });
+    const path = root + "/" + createHash("sha256").update(kind + "\0" + id).digest("hex") + ".json";
+    if (existsSync(path)) { if (readFileSync(path, "utf8") !== doc) fail(); const fd = openSync(path, "r"); try { fsyncSync(fd); } finally { closeSync(fd); } syncParent(path); return; }
+    if (count >= 4096) throw new ProtocolError("Evidence archive capacity reached; explicit retirement required.");
+    if (total + Buffer.byteLength(doc) > 64 * 1024 * 1024) throw new ProtocolError("Evidence archive byte capacity reached; explicit retirement required.");
+    if (this.archiveUsage) { this.archiveUsage.bytes += Buffer.byteLength(doc); this.archiveUsage.entries++; }
+    const stage = root + "/.partial-" + randomUUID();
+    writeFileSync(stage, doc, { mode: 0o600, flag: "wx" });
+    const fd = openSync(stage, constants.O_RDONLY | constants.O_NOFOLLOW); try { fsyncSync(fd); } finally { closeSync(fd); }
+    renameSync(stage, path); syncParent(path);
+  }
+  archived<T>(kind: string, id: string): T | undefined {
+    this.ready();
+    if (!/^[a-z][a-z-]{0,39}$/.test(kind) || !/^[A-Za-z0-9_-]{1,80}$/.test(id)) throw new ProtocolError();
+    const path = this.options.path + ".archive/" + createHash("sha256").update(kind + "\0" + id).digest("hex") + ".json";
+    if (!existsSync(path)) return undefined;
+    privateParent(path); privateFile(path, MAX_WIRE_BYTES + 4096);
+    const parsed = JSON.parse(readFileSync(path, "utf8")), { tag, ...body } = parsed;
+    if (body.version !== 1 || body.identity !== this.options.identity || body.kind !== kind || body.id !== id ||
+      !equal(tag, PrivateStore.mac(this.options, "archive", canonical(body)))) fail();
+    this.validateState?.([{ kind, id, value: body.value }]);
+    return structuredClone(body.value) as T;
+  }
+
+  retireArchive(limit: number, trash: (path: string) => void): number {
+    this.ready(); const root = this.options.path + ".archive";
+    if (!existsSync(root)) return 0;
+    privateParent(root + "/entry"); const entries = readdirSync(root);
+    if (entries.length > 4096) fail();
+    const resolved = new Set<string>();
+    for (const name of entries) {
+      if (/^\.partial-[a-f0-9-]{36}$/.test(name)) { privateFile(root + "/" + name, MAX_WIRE_BYTES + 4096); continue; }
+      if (!/^[a-f0-9]{64}\.json$/.test(name)) fail(); privateFile(root + "/" + name, MAX_WIRE_BYTES + 4096);
+      const body = JSON.parse(readFileSync(root + "/" + name, "utf8")); this.archived(body.kind, body.id);
+      if (["reconciliation", "client-resolution"].includes(body.kind)) resolved.add(body.value.request.body.operationId);
+    }
+    let retired = 0;
+    for (const name of entries) {
+      if (retired >= limit) break;
+      if (/^\.partial-[a-f0-9-]{36}$/.test(name)) { const path = root + "/" + name; if (Date.now() - lstatSync(path).mtimeMs >= 86_400_000) { trash(path); retired++; } continue; }
+      if (!/^[a-f0-9]{64}\.json$/.test(name)) fail();
+      const path = root + "/" + name; privateFile(path, MAX_WIRE_BYTES + 4096);
+      const body = JSON.parse(readFileSync(path, "utf8"));
+      this.archived(body.kind, body.id);
+      const value = body.value, request = value?.request?.body;
+      if (!request || request.expiresAt + 86_400_000 > Date.now()) continue;
+      const state = value.receipt?.body?.state ?? value.status?.receipt?.body?.state;
+      // UNKNOWN is retired only with independently authenticated resolution evidence in this archive.
+      if (state !== "succeeded" && state !== "failed" && !resolved.has(request.operationId)) continue;
+      trash(path); retired++;
+    }
+    return retired;
+  }
+
   /** A failed security-state publication cannot leave this process authorized to continue. */
   quarantine(): void { this.faulted = true; }
   /** Keep the single-writer owner alive until an actual nonmutating resource settles. */
@@ -294,7 +456,7 @@ export class PrivateStore {
     if (this.pending || this.resources) throw new ProtocolError("Cannot close state while execution is active.");
     try {
       if (!this.faulted) this.transaction(() => { this.db.prepare("DELETE FROM writer WHERE instance=?").run(this.instance); });
-    } finally { this.db.close(); this.closed = true; }
+    } finally { this.db.close(); this.closed = true; activeStores.delete(resolve(this.options.path)); }
   }
   private ready(validate = true): StateRow[] | undefined {
     if (this.closed || this.faulted) throw new ProtocolError("Durable state unavailable; operator recovery required.");

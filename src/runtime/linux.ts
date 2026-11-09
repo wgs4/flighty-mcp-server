@@ -11,7 +11,7 @@ import { FlightyDatabase } from "../services/database.js";
 import { getActiveReplicaLease } from "../replica/context.js";
 import { ProtocolError } from "../remote/protocol.js";
 import { DurableClient, clientStateValidator } from "./client-state.js";
-import { checkStorage, callersFor, privateKey, publicKey, storageAuthority, type LinuxConfig } from "./config.js";
+import { validateConfig, checkStorage, callersFor, privateKey, publicKey, storageAuthority, type LinuxConfig } from "./config.js";
 import { startIpcServer } from "./ipc.js";
 
 export function receiverOptions(config: LinuxConfig) {
@@ -23,13 +23,15 @@ export function receiverOptions(config: LinuxConfig) {
     limits: { maxDbBytes: config.budget.maxDbBytes } };
 }
 export function linuxStoreOptions(config: LinuxConfig): StoreOptions {
+  validateConfig(config);
   return { ...config.store, authenticationKey: Buffer.from(config.store.authenticationKey, "hex"),
     checkLocation: () => checkStorage(config, [config.receiverRoot, config.inbox, config.quarantine]),
     validateState: mailboxStateValidator(callersFor(config), publicKey(config.macReceiptKey), Date.now) };
 }
 export function linuxClientStoreOptions(config: LinuxConfig): StoreOptions {
+  validateConfig(config);
   return { ...config.clientStore, authenticationKey: Buffer.from(config.clientStore.authenticationKey, "hex"),
-    checkLocation: () => checkStorage(config), validateState: clientStateValidator(callersFor(config), publicKey(config.macReceiptKey)) };
+    checkLocation: () => checkStorage(config), validateState: clientStateValidator(callersFor(config), publicKey(config.macReceiptKey), Date.now, config.operatorPublicKey ? publicKey(config.operatorPublicKey) : undefined) };
 }
 export function provisionLinux(config: LinuxConfig): void {
   // Explicit init only; a partial initialization requires investigation, never automatic reset.

@@ -5,7 +5,7 @@ import { assertFlightCode, assertIsoDate, assertUuid } from "../services/bounds.
 import { parseFlightCode, FlightyApi } from "../services/flighty-api.js";
 import { assertWritesEnabled, type RuntimePolicy } from "../services/policy.js";
 import { generateConfirmCode } from "../services/removal-confirm.js";
-import { digest, canonical, ProtocolError, seal, verifyRequest, type Callers, type Request, type Receipt, type Signed, type SignedRequest } from "./protocol.js";
+import { digest, canonical, ProtocolError, seal, verifyRequest, verifyRetainedRequest, type Callers, type Request, type Receipt, type Signed, type SignedRequest } from "./protocol.js";
 import { sanitizeReceiptError, redactResultSecrets, privateBuildValue } from "./redaction.js";
 import { PrivateStore } from "./store.js";
 
@@ -123,9 +123,9 @@ export class MacExecutor {
     return this.run(req.operationId);
   }
   status(input: SignedRequest): Signed<Receipt> | null {
-    const req = verifyRequest(input, this.deps.callers, this.now(), true);
+    const req = verifyRetainedRequest(input, this.deps.callers, this.now());
     this.maintenance();
-    const op = this.deps.store.get<StoredOperation>("operation", req.operationId);
+    const op = this.deps.store.get<StoredOperation>("operation", req.operationId) ?? this.deps.store.archived<StoredOperation>("operation", req.operationId);
     if (!op) return null;
     if (digest(req) !== digest(op.request.body)) throw new ProtocolError("Operation binding rejected.");
     return op.receipt;
@@ -449,7 +449,14 @@ export class MacExecutor {
   }
   private prune(): void {
     const now = this.now();
-    for (const { id, value } of this.deps.store.list<StoredOperation>("operation")) if (!["dispatched", "unknown"].includes(value.receipt.body.state) && !this.activeOperations.has(id) && value.request.body.expiresAt + RETENTION_MS <= now) this.deps.store.delete("operation", id);
+    for (const { id, value } of this.deps.store.list<StoredOperation>("operation")) if (!["dispatched", "unknown"].includes(value.receipt.body.state) && !this.activeOperations.has(id) && value.request.body.expiresAt + RETENTION_MS <= now) { this.deps.store.archive("operation", id); this.deps.store.delete("operation", id); }
+    for (const { id, value } of this.deps.store.list<StoredOperation>("operation")) {
+      if (value.receipt.body.state !== "unknown" || value.request.body.expiresAt + RETENTION_MS > now || this.deps.store.get("fence", value.request.body.account)) continue;
+      const audit = this.deps.store.list<import("./recovery.js").ReconciliationAudit>("reconciliation").find(row => row.value.request.body.operationId === id);
+      if (!audit) continue;
+      this.deps.store.archive("operation", id); this.deps.store.archive("reconciliation", audit.id);
+      this.deps.store.delete("operation", id); this.deps.store.delete("reconciliation", audit.id);
+    }
     for (const { id, value } of this.deps.store.list<Preview>("preview")) if (value.expiresAt <= now) this.deps.store.delete("preview", id);
   }
 }

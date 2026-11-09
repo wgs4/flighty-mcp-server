@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { executorStateValidator, RETENTION_MS } from "../src/remote/state.js";
-import { ProtocolError, verifyReceipt } from "../src/remote/protocol.js";
+import { ProtocolError, verifyReceipt, verifyRequest } from "../src/remote/protocol.js";
 import { capturedApiFactory } from "../src/remote/executor.js";
 import { sanitizeReceiptError } from "../src/remote/redaction.js";
 import { fixture, FLIGHT, AIRLINE, type Fixture } from "./remote-fixture.js";
@@ -76,7 +76,8 @@ describe("Q6 authenticated reads and no-op publication", () => {
     if (change === "key") (f.callers.linux as any).publicKey = f.other.publicKey;
     if (change === "account") (f.callers.linux as any).account = "different-account";
     if (change === "capability") (f.callers.linux as any).capabilities = ["follow"];
-    expect(() => validate(rows)).toThrow(ProtocolError);
+    if (change === "capability") { expect(() => validate(rows)).not.toThrow(); expect(() => verifyRequest(rows[0].value.request, f.callers, f.now)).toThrow(ProtocolError); }
+    else expect(() => validate(rows)).toThrow(ProtocolError);
   });
   it("transaction views isolate mutable callers and exact no-op puts from authenticated state", async () => {
     const f = setup(), request = f.request(add); await f.executor.submit(request);

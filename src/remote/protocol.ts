@@ -24,7 +24,7 @@ export const requestSchema = z.object({
 export type Request = z.infer<typeof requestSchema>;
 export type Signed<T> = { body: T; signature: string };
 export type SignedRequest = Signed<Request>;
-export type CallerPolicy = { publicKey: KeyObject; account: string; capabilities: readonly Capability[] };
+export type CallerPolicy = { publicKey: KeyObject; historicalPublicKeys?: readonly KeyObject[]; account: string; capabilities: readonly Capability[] };
 export type Callers = Readonly<Record<string, CallerPolicy>>;
 export type OperationState = "not-dispatched" | "dispatched" | "succeeded" | "failed" | "unknown";
 export const receiptSchema = z.object({
@@ -104,6 +104,17 @@ export function verifyRequest(input: unknown, callers: Callers, now: number, all
   if (req.payloadDigest !== digest(req.operation) || req.expiresAt <= req.issuedAt ||
       req.expiresAt - req.issuedAt > MAX_LIFETIME_MS || req.issuedAt > now || (!allowExpired && req.expiresAt <= now)) throw new ProtocolError("Request binding or expiry rejected.");
   return req;
+}
+/** Trusted account-bound historical keys authenticate evidence, never current dispatch authority. */
+export function verifyRetainedRequest(input: unknown, callers: Callers, now: number): Request {
+  const envelope = signedEnvelope(input), req = parseSchema(requestSchema, envelope.body);
+  const policy = Object.hasOwn(callers, req.caller) ? callers[req.caller] : undefined;
+  if (!policy || policy.account !== req.account) throw new ProtocolError("Historical caller/account rejected.");
+  for (const key of [policy.publicKey, ...(policy.historicalPublicKeys ?? [])]) {
+    try { return verifyRequest(input, { [req.caller]: { account: policy.account, publicKey: key, capabilities: [req.operation.kind] } }, now, true); }
+    catch { /* Try only explicitly pinned historical keys. */ }
+  }
+  throw new ProtocolError("Historical signature or request binding rejected.");
 }
 export function makeRequest(input: Omit<Request, "version" | "payloadDigest">, key: KeyObject): SignedRequest {
   validateOperation(input.operation);

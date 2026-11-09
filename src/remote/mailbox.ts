@@ -1,6 +1,6 @@
 import type { KeyObject } from "node:crypto";
 import { z } from "zod";
-import { boundedJson, digest, parseWire, parseSchema, receiptSchema, signedEnvelope, ProtocolError, verifyReceipt, verifyRequest, type Callers, type Receipt, type Signed, type SignedRequest } from "./protocol.js";
+import { boundedJson, digest, parseWire, parseSchema, receiptSchema, signedEnvelope, ProtocolError, verifyReceipt, verifyRequest, verifyRetainedRequest, type Callers, type Receipt, type Signed, type SignedRequest } from "./protocol.js";
 import { PrivateStore } from "./store.js";
 
 /** Supplied by the authenticated transport/forced command configuration, never the message body. */
@@ -29,7 +29,7 @@ export class Mailbox {
       if (cmd.verb === "submit" || cmd.verb === "status") {
         if (principal.role !== "caller") throw new ProtocolError("Mailbox role rejected.");
         const signed = cmd.request as SignedRequest;
-        const req = verifyRequest(signed, this.options.callers, this.now(), true);
+        const req = cmd.verb === "status" ? verifyRetainedRequest(signed, this.options.callers, this.now()) : verifyRequest(signed, this.options.callers, this.now(), true);
         if (req.caller !== principal.caller) throw new ProtocolError("Authenticated caller mismatch.");
         let row = this.options.store.get<Queued>("mail", req.operationId);
         if (row && digest(row.request.body) !== digest(req)) throw new ProtocolError("Conflicting operation ID.");

@@ -120,6 +120,7 @@ export async function startIpcServer(config: LinuxConfig, receiver: ReplicaRecei
   const own = lstatSync(bindPath);
   try { linkSync(bindPath, path); } catch (error) { await new Promise<void>(resolve => server.close(() => resolve())); throw error; }
   return { async close() {
+    if (closing) return;
     closing = true; for (const socket of sockets) socket.destroy();
     await new Promise<void>(resolve => server.close(() => resolve()));
     // Node normally removes its own socket. No general stale-socket unlink is attempted.

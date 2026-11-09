@@ -18,11 +18,12 @@ const pins = z.object({ producerId: idSchema, accountId: idSchema, ownerUserId: 
 const budget = z.object({ maxBytes: positive.max(2 * 1024 ** 3), maxEntries: positive.max(8192),
   maxDbBytes: positive.max(128 * 1024 ** 2), transportMs: positive.min(100).max(30_000), acceptanceMs: positive.max(90_000), sqliteTaskMs: positive.max(30_000) }).strict();
 const caller = z.object({ id: idSchema, account: idSchema, publicKey: pem,
-  capabilities: z.array(z.enum(["add", "follow", "remove-preview", "remove-confirm", "request-snapshot"])).min(1).max(5) }).strict();
-export const linuxConfigSchema = z.object({ version: z.literal(1), kind: z.literal("linux"), storage, pins, budget,
+  historicalPublicKeys: z.array(pem).max(16).optional(),
+  capabilities: z.array(z.enum(["add", "follow", "remove-preview", "remove-confirm", "request-snapshot"])).max(5) }).strict();
+export const linuxConfigSchema = z.object({ version: z.literal(1), kind: z.literal("linux"), storage, pins, budget, retirementCommand: path.optional(),
   receiverRoot: path, inbox: path, quarantine: path, socketPath: path, store, clientStore: store,
-  caller: caller.extend({ privateKey: pem }), macReceiptKey: pem }).strict();
-export const macConfigSchema = z.object({ version: z.literal(1), kind: z.literal("mac"), storage, pins, budget,
+  caller: caller.extend({ privateKey: pem }), macReceiptKey: pem, operatorPublicKey: pem.optional() }).strict();
+export const macConfigSchema = z.object({ version: z.literal(1), kind: z.literal("mac"), storage, pins, budget, retirementCommand: path.optional(),
   store, sequenceStore: store, operatorPublicKey: pem, receiptPrivateKey: pem, bindingKey: z.string().regex(/^[a-f0-9]{64}$/),
   snapshotPrivateKey: pem, callers: z.array(caller).min(1).max(8),
   source: z.object({ dbPath: path, authDbPath: path, prefsPlistPath: path, infoPlistPath: path,
@@ -60,10 +61,12 @@ export function readConfig(file: string | undefined, kind: "linux" | "mac"): Con
     const input = JSON.parse(privateRead(file).toString("utf8"));
     const config = kind === "linux" ? linuxConfigSchema.parse(input) : macConfigSchema.parse(input);
     validateConfig(config);
+    if (artifactRoots(config).some(root => file === root || file.startsWith(root + "/"))) throw new ProtocolError("Configuration cannot be stored in retireable application artifacts.");
     return config;
   } catch { throw new ProtocolError("Runtime configuration unavailable or invalid. Explicit private approved configuration required."); }
 }
 export function publicKey(pem: string): KeyObject {
+  if (!/^-----BEGIN PUBLIC KEY-----\r?\n/.test(pem)) throw new ProtocolError("Public verification fields must not contain private keys.");
   const key = createPublicKey(pem);
   if (key.asymmetricKeyType !== "ed25519") throw new ProtocolError();
   return key;
@@ -88,7 +91,12 @@ export function checkStorage(config: Config, paths: string[] = []): void {
 }
 export function callersFor(config: Config): Callers {
   const callers = config.kind === "linux" ? [config.caller] : config.callers;
-  return Object.fromEntries(callers.map(c => [c.id, { account: c.account, capabilities: [...c.capabilities], publicKey: publicKey(c.publicKey) }]));
+  return Object.fromEntries(callers.map(c => [c.id, { account: c.account, capabilities: [...c.capabilities], historicalPublicKeys: (c.historicalPublicKeys ?? []).map(publicKey), publicKey: publicKey(c.publicKey) }]));
+}
+export function artifactRoots(config: Config): string[] {
+  const specs = config.kind === "linux" ? [config.store, config.clientStore] : [config.store, config.sequenceStore];
+  return [...(config.kind === "linux" ? [config.receiverRoot, config.inbox, config.quarantine] : [config.transferParent, config.rawQuarantine]),
+    ...specs.flatMap(s => [s.path + ".archive", s.continuityPath + ".recovery"])];
 }
 export function validateConfig(config: Config): void {
   const paths = config.kind === "linux" ? [config.receiverRoot, config.inbox, config.quarantine, dirname(config.socketPath), dirname(config.store.path), dirname(config.store.continuityPath), dirname(config.clientStore.path), dirname(config.clientStore.continuityPath)] :
@@ -100,9 +108,19 @@ export function validateConfig(config: Config): void {
   if (dirs.some((a, i) => dirs.some((b, j) => i !== j && (a === b || a.startsWith(b + "/"))))) throw new ProtocolError("Runtime storage roles must be disjoint.");
   const privateFiles = config.kind === "linux" ? [config.store.path, config.store.continuityPath, config.clientStore.path, config.clientStore.continuityPath, config.socketPath] : [config.store.path, config.store.continuityPath, config.sequenceStore.path, config.sequenceStore.continuityPath];
   if (new Set(privateFiles).size !== privateFiles.length || privateFiles.some(p => dirs.some(d => p === d || p.startsWith(d + "/")))) throw new ProtocolError();
+  const artifacts = artifactRoots(config);
+  if (artifacts.some((a, i) => artifacts.some((b, j) => i !== j && (a === b || a.startsWith(b + "/")))) || privateFiles.some(p => artifacts.some(root => p === root || p.startsWith(root + "/")))) throw new ProtocolError("Artifact and authority paths must be disjoint.");
+  checkStorage(config, artifacts);
+  if (config.kind === "mac" && Object.entries(config.source).some(([name, p]) => name.endsWith("Path") && typeof p === "string" && artifacts.some(root => p === root || p.startsWith(root + "/")))) throw new ProtocolError("Source files cannot live in retireable artifact storage.");
   const callers = config.kind === "linux" ? [config.caller] : config.callers;
   if (new Set(callers.map(c => c.id)).size !== callers.length || callers.some(c => c.account !== config.pins.accountId)) throw new ProtocolError();
   callersFor(config);
+  if (config.operatorPublicKey) {
+    const operator = publicKey(config.operatorPublicKey);
+    const forbidden = [config.pins.publicKey, ...(config.kind === "linux" ? [config.macReceiptKey] : [createPublicKey(privateKey(config.receiptPrivateKey)).export({ type: "spki", format: "pem" }).toString()]),
+      ...callers.flatMap(c => [c.publicKey, ...(c.historicalPublicKeys ?? [])])];
+    if (forbidden.some(pem => sameKey(operator, publicKey(pem)))) throw new ProtocolError("Operator authority must be independent of application/caller keys.");
+  }
   if (config.kind === "linux") {
     if (config.caller.account !== config.pins.accountId || !sameKey(createPublicKey(privateKey(config.caller.privateKey)), publicKey(config.caller.publicKey))) throw new ProtocolError();
     publicKey(config.macReceiptKey);
