@@ -1,5 +1,9 @@
 # Flighty MCP Server
 
+> **Local wishlist documentation draft (2026-11-08).** Based on source base `42100cc` and two packets under revision. The tools and contracts below describe the intended combined extension; this docs worktree contains no wishlist implementation. Final code reconciliation, integrated verification and independent dual documentation review remain required. This is not release approval or an installation record.
+
+For this fork's source installation, guarded writes, existing-client updates and lifecycle commands, follow [FORK-NOTES.md](FORK-NOTES.md). The earlier hardening assessment and retained dependency advisories are in [SECURITY_REVIEW.md](SECURITY_REVIEW.md).
+
 A zero-config [MCP](https://modelcontextprotocol.io/) server that connects AI assistants to the [Flighty](https://www.flightyapp.com/) flight tracking app. Ask about your flights, check statuses, look up delay forecasts, and add or remove flights — all through natural conversation.
 
 Just install Flighty on your Mac and connect the server. It reads all credentials and configuration directly from the app — no API keys, no tokens, no setup.
@@ -12,13 +16,13 @@ This server gives any MCP-compatible AI assistant (Claude, etc.) full read/write
 - **"What's my next flight?"** — returns the soonest upcoming flight first
 - **"How often is AA179 delayed?"** — historical on-time performance with percentage breakdowns
 - **"Show my flight stats for 2025"** — total flights, miles, top airlines, top routes
-- **"Add DL10 on April 20"** — adds the flight to your Flighty account, syncs to all devices within seconds
+- **"Add DL10 on April 20"** — adds the flight to your Flighty account, requests cross-device account sync
 - **"Follow UA194 on December 25"** — track someone else's flight (e.g. to pick them up), syncs to all devices
-- **"Remove that flight"** — deletes it from your account across all devices
-- **"Are any friends flying soon?"** — checks connected friends' upcoming flights
+- **"Remove that flight"** — previews deletion, then requires a one-use confirmation code
+- **"Are any friends flying soon?"** — checks cached shared/followed upcoming flights
 - **"What version of the Flighty tool is this?"** — server info, capabilities, and version
 
-Read operations query Flighty's local SQLite database directly (fast, offline-capable). Write operations call Flighty's API so changes sync to your phone, watch, and widgets. All responses include contextual metadata (sort order, timestamp format) to help AI assistants interpret results correctly.
+Read operations query Flighty's local SQLite database directly (fast, offline-capable). Write operations call Flighty's API so changes sync to your phone, watch, and widgets. Responses include contextual metadata (sort order, timestamp format) to help AI assistants interpret results correctly. Real API behavior and cross-device timing are not certified by synthetic tests.
 
 ## Requirements
 
@@ -29,16 +33,16 @@ Read operations query Flighty's local SQLite database directly (fast, offline-ca
 
 ## Installation
 
-### Claude Desktop (.mcpb) — recommended
+### Claude Desktop (.mcpb)
 
-Download `flighty-mcp-server.mcpb` from the [dist/](dist/) folder and double-click it. Claude Desktop installs it automatically. No configuration needed.
+Do not install committed `dist/*.mcpb` bundles for this fork. Use the reviewed source-build procedure in [FORK-NOTES.md](FORK-NOTES.md); optional packing has not been verified.
 
 ### Claude Code
 
 ```bash
-git clone https://github.com/CPLX/flighty-mcp-server.git
+git clone https://github.com/wgs4/flighty-mcp-server.git
 cd flighty-mcp-server
-npm install
+npm ci --ignore-scripts
 npm run build
 ```
 
@@ -74,7 +78,7 @@ Restart the client after adding the config.
 
 ## Read-Only Mode
 
-By default the server exposes 15 tools, including three that modify your Flighty account: `flighty_add_flight`, `flighty_follow_flight`, and `flighty_remove_flight`. If you only want Claude to read your flight data, you can disable the write tools so they don't appear in `tools/list` at all — the safest way to cap the blast radius.
+With both wishlist reads integrated, the server exposes 17 tools by default (14 reads and 3 writes; baseline: 15/12), including three that modify your Flighty account: `flighty_add_flight`, `flighty_follow_flight`, and `flighty_remove_flight`. If you only want Claude to read your flight data, you can disable the write tools so they don't appear in `tools/list` at all — the safest way to cap the blast radius.
 
 **Claude Desktop (`.mcpb`):** during install, check the **Read-Only Mode** box. You can toggle it later from the extension's settings.
 
@@ -92,7 +96,7 @@ By default the server exposes 15 tools, including three that modify your Flighty
 }
 ```
 
-Accepted truthy values: `1`, `true`, `yes` (case-insensitive). Anything else (or unset) leaves write tools enabled. `flighty_about` reports the current mode.
+After trimming, case-insensitive `1/true/yes/on` enables read-only mode; `0/false/no/off`, empty or unset enables writes. Other values refuse startup. Read-only removes exactly `flighty_add_flight`, `flighty_follow_flight` and `flighty_remove_flight`, leaving 14 tools in the combined extension; API methods also reject writes. Restart the server to change policy. `flighty_about` reports the mode. God mode (writes enabled) remains the default.
 
 ## Friend-Share Installs
 
@@ -114,7 +118,7 @@ You can find the right userId by querying `SELECT userId, COUNT(*) FROM UserFlig
 
 ## Tools
 
-15 tools organized into four categories (12 read + 3 write; write tools are hidden when Read-Only Mode is on).
+Combined extension: 17 tools (14 read, including about, plus 3 writes). These counts require both new read tools; the source baseline has 15/12. Read-only hides exactly the three write tools.
 
 ### Flight Management
 
@@ -132,16 +136,18 @@ You can find the right userId by querying `SELECT userId, COUNT(*) FROM UserFlig
 
 | Tool | Description |
 |------|-------------|
-| `flighty_get_flight_status` | Current status (scheduled/delayed/in_air/landed/cancelled), gate, delay, weather |
+| `flighty_get_flight_status` | Cached status, milestone phase, gate, delay and weather |
 | `flighty_get_delay_forecast` | Historical on-time stats: % early, on-time, late, cancelled, diverted |
 | `flighty_get_flight_stats` | Aggregate stats: total flights, miles, circumnavigations, top airlines and routes |
-| `flighty_get_connections` | Layover info for connecting flights: airports, duration, minimum connection time |
+| `flighty_get_connections` | Existing owner-passenger cached connection list |
+| `flighty_get_tracking_status` | Exact eligible cached UUID: associations, runway landing and taxi milestones |
+| `flighty_check_connection` | Proposed explicit UUID pair: cached gate layover, tail comparison and conditional risk |
 
 ### Social and Reference
 
 | Tool | Description |
 |------|-------------|
-| `flighty_list_friend_flights` | Connected friends' flights, filterable by name, upcoming, or year |
+| `flighty_list_friend_flights` | Cached shared passenger and owner-followed rows; membership does not verify friendship |
 | `flighty_search_airports` | Search airports by IATA/ICAO code, city, or name |
 | `flighty_search_airlines` | Search airlines by IATA/ICAO code, name, or alliance |
 
@@ -176,7 +182,7 @@ Includes both auto-detected commercial flights and manually-entered flights (pri
 
 Returns flights departing within 24 hours in either direction from now. Captures in-progress flights, recently landed flights (baggage claim, layovers), and flights about to depart.
 
-**No parameters.** Sorted by departure time ascending (earliest first).
+**Parameters:** `limit` (1–200, default 50), `offset` (0–100000, default 0). Sorted by departure time ascending (earliest first).
 
 ---
 
@@ -211,9 +217,9 @@ Returns the operational status of a flight that is already in the user's Flighty
 **Parameters:**
 - `flight_number` (string) — a flight in the user's database, e.g., "UA194"
 
-**Returns:** Status ("scheduled", "delayed", "in_air", "landed", "cancelled"), departure/arrival delay in minutes, gate assignments, baggage belt, weather conditions, aircraft type, and tail number.
+**Returns:** Existing gate-time/status fields plus `phase` and `phase_reason`. In the extension, `status` supports `scheduled`, `delayed`, `taxi_out`, `in_air`, `landed`, `cancelled`, `unknown`. `in_air` requires cached actual runway departure; `landed` includes actual touchdown. `phase` distinguishes `taxi_in` from `at_gate`. Gate departure alone means taxi-out, not airborne. Flight-number lookup remains owner-passenger scoped; use the exact UUID tracking tool for eligible shared/followed rows.
 
-Data freshness depends on the Flighty app's last sync — this does not make live API calls for status.
+Status is cached and can be stale. A database-level sync marker does not establish per-flight freshness; this tool makes no live status API calls.
 
 ---
 
@@ -263,9 +269,11 @@ Includes both auto-detected commercial flights and manually-entered flights (e.g
 
 ### flighty_get_connections
 
+Existing owner-passenger connection list. This is separate from the explicit-pair checker below.
+
 Layover information for connecting flight pairs. Sorted by first leg departure time descending.
 
-**No parameters.**
+**Parameters:** `limit` (1–200, default 50), `offset` (0–100000, default 0).
 
 **Returns:** For each connection: inbound flight (first leg, e.g., "AA1449"), origin airport, connection airport, outbound flight (second leg, e.g., "AA1166"), destination airport, arrival/departure times, layover duration in minutes, and minimum connection time.
 
@@ -273,7 +281,7 @@ Layover information for connecting flight pairs. Sorted by first leg departure t
 
 ### flighty_list_friend_flights
 
-Flights from your Flighty-connected friends. Same sort behavior as `list_flights` — upcoming sorted soonest first, otherwise most recent first.
+Cached shared passenger and owner-followed flights. A local membership or `Profile` name does not verify friendship. Manually followed rows keep `friend_name: null`; a name filter cannot discover their passenger. Same sort behavior as `list_flights` — upcoming sorted soonest first, otherwise most recent first.
 
 **Parameters:**
 - `friend_name` (string, optional) — partial match on name
@@ -286,7 +294,7 @@ Flights from your Flighty-connected friends. Same sort behavior as `list_flights
 
 ### flighty_add_flight
 
-Adds a flight to your Flighty account via the Flighty API. The flight syncs to all your devices (phone, watch, widgets) within seconds.
+Adds a flight to your Flighty account via the Flighty API. The request changes your remote account; cross-device propagation depends on Flighty and was not tested against a real account.
 
 **Parameters:**
 - `flight_code` (string) — e.g., "DL10", "UA194". The 2-character airline prefix is parsed automatically
@@ -314,8 +322,73 @@ Permanently removes a flight from your Flighty account across all devices.
 
 **Parameters:**
 - `flight_id` (string) — the flight UUID (from `list_flights` or `add_flight` results)
+- `confirm_code` (string, optional) — code returned by the first preview call
 
-**Warning:** This cannot be undone. You would need to re-add the flight.
+**Confirmation:** First call returns a preview and `confirm_code`. Repeat with the same `flight_id` and code within five minutes. The one-use code is process-local and bound to the preview and available owner identity. Restart or changed details invalidate it; it is consumed before the request, including failure. There is no automatic retry. Removal is permanent across devices; inspect account state before attempting another preview after a failed request.
+
+---
+
+### flighty_get_tracking_status (draft extension)
+
+Required input: `flight_id`, one exact cached UUID. Entirely synthetic example:
+
+```json
+{"flight_id":"11111111-1111-4111-8111-111111111111"}
+```
+
+No flight-number fallback. Eligibility includes the resolved owner's passenger/followed memberships and cached non-owner passenger memberships in `Flight`/`ManualFlight`. Deleted/unlinked rows and other users' followed rows are excluded. No eligible record returns `result: null` with a reason.
+
+`result` contains `flight`, `associations`, `identity_ambiguous`, `attribution_notice`, timestamp diagnostics and `timing`. Associations retain `user_id`, booking/seat fields, `tracking_source` (`owner_passenger`, `owner_followed`, `cached_shared_passenger`), `friendship_status: "unverified"`, `passenger_name`, `passenger_name_source` (`profile` or `unknown`) and `passenger_name_unknown_reason`. Multiple associations do not select a traveler; common booking fields become null and remain per association. `Profile.fullName` is cached attribution, not verified friendship or proof of travel. Owner-followed rows never borrow the owner's name; `friend_name` remains null when the passenger is unknown.
+
+`timing` includes `phase`, `phase_reason`, `phase_basis`, `calculated_at` and `timestamp_basis: "UTC"`:
+
+| Phase | Cached actual evidence |
+| --- | --- |
+| `scheduled` | No actual milestone; compatible future schedule |
+| `taxi_out` | Gate departure (pushback) |
+| `airborne` | Runway departure |
+| `taxi_in` | Runway arrival (touchdown) |
+| `at_gate` | Gate arrival |
+| `cancelled` | Cached cancellation |
+| `unknown` | Missing, invalid, future or contradictory evidence prevents classification |
+
+`minutes_to_landing` uses `arrivalScheduleRunwayEstimated`, then explicitly labelled `arrivalScheduleRunwayOriginal`. Read `landing_at`, `landing_time_basis`, `landing_countdown_state` and `landing_countdown_reason` together. States are `estimated`, `scheduled`, `landed`, `overdue`, `unknown`, `cancelled`. A scheduled countdown is time until scheduled landing, not predicted flight duration. A passed ETA without actual touchdown is overdue with a null countdown, including ETA equal to calculation time. Cancellation or unusable timing also gives null; valid actual touchdown supplies zero. Gate ETA never substitutes for landing.
+
+`wheels_down_at`, `taxi_in_elapsed_minutes` and `taxi_in_completed_minutes` describe cached touchdown and elapsed/completed taxi-in intervals, with `taxi_in_reason` for unavailable values. Separate `gate_eta`, `gate_arrival_at`, `gate_time_basis`, `minutes_to_gate` and `gate_countdown_reason` describe gate timing. An expired gate ETA does not prove arrival. Stale milestones cannot prove the aircraft is still taxiing; there is no taxi route, percentage or fresh prediction. `timestamp_issues` and `timestamp_conflicts` diagnose invalid chronology rather than manufacture progress.
+
+---
+
+### flighty_check_connection (draft extension)
+
+Required distinct UUIDs, both checked for eligible cached membership using the tracking rules above. Entirely synthetic example:
+
+```json
+{"inbound_flight_id":"11111111-1111-4111-8111-111111111111","outbound_flight_id":"22222222-2222-4222-8222-222222222222"}
+```
+
+No eligible leg returns `result: null` with a reason. Both legs and exact-pair cached minimum are read in one SQLite snapshot. This is `pair_kind: "proposed_explicit_pair"`, with `traveler_identity: "not_established_by_pair_check"`; each leg retains its associations and ambiguity. Membership on both flights does not prove the same person is traveling.
+
+Airport continuity uses stable IDs, otherwise unambiguous IATA codes; missing identity stays unknown. `arrival_gate_at` and `departure_gate_at` select chronologically valid actual, estimated, then labelled scheduled gate times and expose `arrival_gate_time_basis` / `departure_gate_time_basis`. Contradictory current predictions must not silently fall back to a stale schedule. `layover_minutes` is outbound gate departure minus inbound gate arrival, not runway-to-runway; missing times are null and negative margins remain negative.
+
+`min_connection_time_minutes`, `min_connection_time_basis` and `min_connection_time_reason` use only a valid unambiguous non-deleted exact ordered `Connection` pair with matching known transfer-airport context. Unknown, invalid or conflicting context/MCT remains null; there is no invented default. `same_tail` is null if either tail is absent/invalid; otherwise it compares normalized cached assignments. A match does not guarantee the aircraft assignment, boarding or a protected connection.
+
+`risk` is `cancelled`, `airport_mismatch`, `unknown`, `missed`, `below_minimum` or `meets_cached_minimum`, with `risk_reason`. Invalid actual chronology yields unknown. A negative selected margin can be labelled missed on its cached bases, not as proof of a passenger's outcome. An already-departed outbound leaves boarding unknown. Meeting cached MCT is no safe-connection guarantee. Boarding cutoff, walking, security, immigration, traveler identity and current data freshness remain unknown. Calculation time is in `calculated_at` (UTC).
+
+The existing `flighty_get_connections` automatic owner-passenger list remains separate; it does not gain the explicit-pair check's contract.
+
+---
+
+### Freshness on tool results (draft extension)
+
+Server-authored `queried_at` is the local handling timestamp (or early error construction time), not an exact SQLite snapshot time or remote sync time. JSON results carry `freshness`; plaintext, empty and error results also receive a freshness notice. Errors preserve `isError`. The metadata remains outside removal previews so a changing clock or sync marker alone cannot invalidate confirmation.
+
+`freshness` includes `queried_at`, `queried_at_meaning`, `last_synced_at`, `sync_age_seconds`, `sync_age_minutes`, `status` (`known`, `unknown`, `not_applicable`), `source`, `scope`, `scope_note`, `unknown_reason_code`, `unknown_reason`, `is_future_marker` and `cache_note`. `SyncInfo.lastSync` is a database-level marker, not an identified account's or individual flight's refresh guarantee. Numeric values/strings have unverified epoch/units and return unknown (`unverified_numeric_sync_format`), null sync time and null ages. No Unix/Apple epoch is guessed. Only safely parsed explicit-timezone ISO markers can supply a time; future, invalid, missing or ambiguous markers remain unknown. File modification time and query time never replace sync time.
+
+Revision requirement: complete bounded marker scans use the chronological maximum only if every nonempty marker is safely parseable; mixed unknown formats or scan overflow must stay unknown regardless of row order. This correction and final `scope` literal still require reconciliation with integrated code. The draft packet's `account_database_sync` literal is being revised to describe database-level scope without asserting account identification. About/reference results use `not_applicable` / `static_or_reference_data`; error/validation results use unknown / `error_or_validation`, without querying sync state or adding owner/credential dependencies. Reference catalog reads retain their existing database dependency.
+
+Re-querying reads the latest committed local cache and does not sync or reset `last_synced_at`. No true refresh action or new API use is included. Background helpers may update the cache without a visible app window; Mac update cadence and per-flight freshness are not guaranteed. Keeping the UI open does not guarantee real-time data.
+
+No live aircraft telemetry source has been verified: `cruising_speed_kmh` is a static aircraft specification and airport coordinates are not aircraft position. Live altitude, ground speed, heading and aircraft coordinates remain deferred. Flighty's business page lists API inquiries, but no usable telemetry or forced-refresh contract has been verified for this extension. This does not establish that such APIs do not exist.
 
 ---
 
@@ -340,7 +413,7 @@ This server opens that database in read-only mode to answer queries. Queries `UN
 
 For write operations (add/remove flights), the server makes the same API calls the Flighty app itself makes. Added flights get full enrichment from Flighty's servers — gate assignments, weather, delay forecasts, codeshare data — and sync to all devices. No manual configuration is needed.
 
-All tool responses include a `note` field with contextual metadata (sort order, timestamp format) to help AI assistants interpret results correctly. All timestamps are UTC.
+All tool responses include a `note` field with contextual metadata (sort order, timestamp format) to help AI assistants interpret results correctly. Flight timestamps are UTC; unverified sync markers remain unknown rather than being assigned a timezone or epoch.
 
 ## Architecture
 
@@ -366,7 +439,7 @@ src/
 
 - **macOS only** — relies on the Flighty macOS app's sandboxed data
 - **Flighty app must be installed and signed in** — the server reads its local databases for both flight data and authentication
-- **Read data freshness** — flight status data is as fresh as the Flighty app's last sync, not real-time
+- **Read data freshness** — cached status may be stale; a database sync marker does not guarantee any individual flight was updated
 - **Write operations require network** — add/remove flights call the Flighty API
 - **Flighty API is private** — this server uses Flighty's undocumented API, which could change in future app updates
 - **Build token is read from the installed app** — updates automatically when the app updates, but if Flighty changes where it stores the token, the server will need updating

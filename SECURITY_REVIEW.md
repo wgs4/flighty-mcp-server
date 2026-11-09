@@ -1,4 +1,14 @@
-# Security review and final hardening assessment
+# Security review and hardening assessment
+
+## Local wishlist extension: review pending
+
+This early docs draft is based on `42100cc` and two source packets under revision. The earlier hardening assessment below applies to its cited source, not wishlist acceptance. Initial independent reviews found MEDIUM tracking/connection and freshness-aggregation blockers; corrections, final integrated verification and dual documentation review remain required. No wishlist release approval or installation is claimed.
+
+The intended extension adds two cache-only reads (`flighty_get_tracking_status`, `flighty_check_connection`): 17 default / 14 read-only, removing exactly the same three writes. Default writes, full booking-data access, owner fallback, trust notices and guarded removal remain intentional. Cached shared membership/Profile names do not verify friendship or a common traveler. Query time, database sync markers and per-flight freshness remain distinct; numeric sync formats are unverified. No refresh, new API use, verified aircraft telemetry or safe-connection guarantee is added.
+
+Reported pre-fix packet checks passed 219 tracking tests and 172 freshness tests plus standalone full stdio; reviewer probes nevertheless exposed blockers. These do not certify the revised combined tree or real API/database/schema behavior. All prior dependency advisories and residual LOWs remain; see [DEFERRED.md](docs/DEFERRED.md) for pending corrections and limits. No clean audit or dependency remediation is claimed.
+
+## Earlier hardening assessment (before wishlist)
 
 Assessment date: **2026-11-08**. The original static review is preserved below as a dated historical baseline. Its read-only default, ticket-data redaction, friend-tool restriction and mandatory-owner-override recommendations were **superseded by explicit owner decisions**. They are not the fork's deployment requirements or final verdict. Writes, full booking data, local token discovery and labeled owner fallback are intentional.
 
