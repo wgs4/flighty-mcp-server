@@ -27,6 +27,15 @@ describe("authenticated Mac executor", () => {
     const changed = f.request({ ...add, date: "2027-01-02" }, { operationId: req.body.operationId });
     await expect(f.executor.submit(changed)).rejects.toThrow(/conflict/);
   });
+  it("rejects concurrent conflicting input under one operation ID", async () => {
+    const f = setup(), req = f.request(add), conflict = f.request({ ...add, date: "2027-01-02" }, { operationId: req.body.operationId });
+    const results = await Promise.allSettled([f.executor.submit(req), f.executor.submit(conflict)]);
+    expect(results.map(r => r.status).sort()).toEqual(["fulfilled", "rejected"]);
+    expect(f.api.subscribeFlight).toHaveBeenCalledTimes(1);
+  });
+  it("prevents multiple recovery owners on the same store", () => {
+    const f = setup(); expect(() => new MacExecutor(f.deps)).toThrow(/already active/);
+  });
   it("keeps existing airline candidate search/disambiguation and follow behavior", async () => {
     const f = setup();
     vi.mocked(f.db.lookupAirlines).mockReturnValue([{ id: AIRLINE, iata: "UA", name: "First" }, { id: OTHER, iata: "UA", name: "Second" }]);
@@ -95,11 +104,25 @@ describe("authenticated Mac executor", () => {
     const r = await f.executor.submit(f.request({ kind: "remove-confirm", flight_id: FLIGHT, confirm_code: p.confirm_code }));
     expect(r.body.state).toBe("failed"); expect(f.api.deleteFlight).not.toHaveBeenCalled();
   });
+  it("observed record changes permanently invalidate the old preview", async () => {
+    const f = setup(), local = f.local(); f.record = local; const p = await preview(f);
+    f.record = { ...local, flight: { ...local.flight, seat_number: "changed" } };
+    const confirm = { kind: "remove-confirm", flight_id: FLIGHT, confirm_code: p.confirm_code } as const;
+    expect((await f.executor.submit(f.request(confirm))).body.state).toBe("failed"); f.record = local;
+    expect((await f.executor.submit(f.request(confirm))).body.state).toBe("failed"); expect(f.api.deleteFlight).not.toHaveBeenCalled();
+  });
   it("excludes volatile telemetry/copy times from removal binding", async () => {
     const f = setup(), local = f.local(); f.record = local; const p = await preview(f);
     f.record = { ...local, flight: { ...local.flight, arrival_weather: "updated weather", delay_forecast_mean_min: 3, queried_at: "new time" } as typeof local.flight };
     const r = await f.executor.submit(f.request({ kind: "remove-confirm", flight_id: FLIGHT, confirm_code: p.confirm_code }));
     expect(r.body.state).toBe("succeeded"); expect(f.api.deleteFlight).toHaveBeenCalledTimes(1);
+  });
+  it("a new preview replaces the caller's earlier preview and retains a consumed-code tombstone", async () => {
+    const f = setup(), first = await preview(f), second = await preview(f);
+    expect(first.confirm_code).not.toBe(second.confirm_code);
+    expect((await f.executor.submit(f.request({ kind: "remove-confirm", flight_id: FLIGHT, confirm_code: first.confirm_code }))).body.state).toBe("failed");
+    expect((await f.executor.submit(f.request({ kind: "remove-confirm", flight_id: FLIGHT, confirm_code: second.confirm_code }))).body.state).toBe("succeeded");
+    const row = f.store.get<{ consumed: boolean }>("preview", second.confirm_code); expect(row!.consumed).toBe(true);
   });
   it("rejects wrong caller/exact UUID and expired confirmation", async () => {
     const f = setup(), p = await preview(f);
@@ -132,7 +155,7 @@ describe("authenticated Mac executor", () => {
   });
   it("caps optional removal previews and airline candidate scans", async () => {
     const f = setup();
-    for (let i = 0; i < 32; i++) expect((await f.executor.submit(f.request({ kind: "remove-preview", flight_id: FLIGHT }))).body.state).toBe("succeeded");
+    for (let i = 0; i < 32; i++) expect((await f.executor.submit(f.request({ kind: "remove-preview", flight_id: `bbbbbbbb-bbbb-4bbb-8bbb-${String(i).padStart(12, "0")}` }))).body.state).toBe("succeeded");
     expect((await f.executor.submit(f.request({ kind: "remove-preview", flight_id: FLIGHT }))).body.state).toBe("failed");
     expect(f.store.list("preview")).toHaveLength(32);
     vi.mocked(f.db.lookupAirlines).mockReturnValue(Array.from({ length: 33 }, () => ({ id: AIRLINE, iata: "UA", name: "Synthetic" })));
@@ -156,7 +179,18 @@ describe("authenticated Mac executor", () => {
   it("snapshot callback receives current captured authority and returns only a snapshot ID", async () => {
     const f = setup(); const r = await f.executor.submit(f.request({ kind: "request-snapshot" }));
     expect(r.body.state).toBe("succeeded"); expect(r.body.result).toEqual({ status: "snapshot_requested", snapshot_id: "synthetic-snapshot" });
-    expect(f.deps.requestSnapshot).toHaveBeenCalledWith(f.context); expect(f.api.subscribeFlight).not.toHaveBeenCalled();
+    expect(f.deps.requestSnapshot).toHaveBeenCalledWith(f.context, expect.any(AbortSignal)); expect(f.api.subscribeFlight).not.toHaveBeenCalled();
+  });
+  it("bounds an injected stalled mutation and records unknown without replay", async () => {
+    const f = setup(); vi.useFakeTimers();
+    try {
+      f.api.subscribeFlight.mockImplementationOnce(() => new Promise(() => {}));
+      const req = f.request(add), pending = f.executor.submit(req);
+      await vi.advanceTimersByTimeAsync(15_001);
+      expect((await pending).body.state).toBe("unknown");
+      expect((await f.executor.submit(req)).body.state).toBe("unknown");
+      expect(f.api.subscribeFlight).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
   });
   it("fresh captured API never reads discovery and uses captured sync URL for deletion", async () => {
     const f = setup(); const fetchImpl = vi.fn(async () => new Response(null, { status: 200 }));

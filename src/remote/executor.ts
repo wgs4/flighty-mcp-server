@@ -12,7 +12,7 @@ import { PrivateStore } from "./store.js";
 export type CredentialContext = Readonly<{ account: string; session: string; authToken: string; buildToken: string; syncUrl: string | null }>;
 export type ExecutorDeps = {
   store: PrivateStore; callers: Callers; receiptKey: KeyObject; bindingKey: Buffer;
-  captureContext: () => Promise<CredentialContext | null>;
+  captureContext: (signal: AbortSignal) => Promise<CredentialContext | null>;
   createApi: (context: CredentialContext) => WriteApi;
   /** Reopen current local source per call. The adapter must bind owner to context.account. */
   openDatabase: (context: CredentialContext) => {
@@ -22,13 +22,13 @@ export type ExecutorDeps = {
     close: () => void;
   };
   checkSource: () => void;
-  requestSnapshot: (context: CredentialContext) => Promise<{ snapshotId: string }>;
+  requestSnapshot: (context: CredentialContext, signal: AbortSignal) => Promise<{ snapshotId: string }>;
   policy: RuntimePolicy; now?: () => number;
   /** Fixture crash hook: throws outside recovery so persisted boundary can be restarted. */
   boundary?: (name: "queued" | "preview" | "dispatch" | "response" | "receipt") => void;
 };
 type StoredOperation = { request: SignedRequest; contextHash: string; receipt: Signed<Receipt>; retainUntil: number };
-type Preview = { flightId: string; caller: string; account: string; capability: "remove-confirm"; contextHash: string; localHash: string; expiresAt: number };
+type Preview = { flightId: string; caller: string; account: string; capability: "remove-confirm"; contextHash: string; localHash: string; expiresAt: number; consumed: boolean };
 const RETENTION_MS = 24 * 60 * 60_000;
 const MAX_PREVIEWS = 32;
 
@@ -54,6 +54,7 @@ export class MacExecutor {
   constructor(private readonly deps: ExecutorDeps) {
     if (deps.bindingKey.length < 32) throw new ProtocolError("Private binding key is too short.");
     this.now = deps.now ?? Date.now;
+    deps.store.claimConsumer("mac-executor");
     // A previous process may have crossed the HTTP boundary. Never replay its operations.
     deps.store.transaction(() => {
       this.prune();
@@ -129,7 +130,12 @@ export class MacExecutor {
           let code = "";
           this.deps.store.transaction(() => {
             this.prune();
-            if (this.deps.store.list("preview").length >= MAX_PREVIEWS) throw new ProtocolError();
+            for (const { id, value } of this.deps.store.list<Preview>("preview")) {
+              if (!value.consumed && value.flightId === target.flightId.toLowerCase() && value.caller === req.caller) {
+                this.deps.store.put("preview", id, { ...value, consumed: true });
+              }
+            }
+            if (this.deps.store.list<Preview>("preview").filter(row => !row.value.consumed).length >= MAX_PREVIEWS) throw new ProtocolError();
             for (let n = 0; n < 8; n++) {
               const candidate = generateConfirmCode(randomBytes(8));
               if (!this.deps.store.get("preview", candidate)) { code = candidate; break; }
@@ -137,7 +143,7 @@ export class MacExecutor {
             if (!code) throw new ProtocolError();
             this.deps.store.put("preview", code, { flightId: target.flightId.toLowerCase(), caller: req.caller,
               account: ctx.account, capability: "remove-confirm", contextHash: stored.contextHash,
-              localHash: digest(substantiveRemoval(target)), expiresAt: Math.min(this.now() + 300_000, req.expiresAt) } satisfies Preview);
+              localHash: digest(substantiveRemoval(target)), expiresAt: Math.min(this.now() + 300_000, req.expiresAt), consumed: false } satisfies Preview);
             finish("succeeded", { status: "confirmation_required", flight_id: target.flightId, confirm_code: code,
               expires_in_seconds: Math.max(0, Math.floor((Math.min(this.now() + 300_000, req.expiresAt) - this.now()) / 1000)),
               local_details: target.localDetails, local_record: target.localRecord, local_identity: target.localIdentity,
@@ -159,7 +165,7 @@ export class MacExecutor {
             const stepApi: WriteApi = {
               searchFlight: async (...args) => {
                 const current = await this.sameContext(req, stored.contextHash);
-                return this.deps.createApi(current).searchFlight(...args);
+                return this.step(() => this.deps.createApi(current).searchFlight(...args));
               },
               subscribeFlight: async () => { throw new ProtocolError(); }, followFlight: async () => { throw new ProtocolError(); }, deleteFlight: async () => { throw new ProtocolError(); },
             };
@@ -185,28 +191,38 @@ export class MacExecutor {
           if (op.kind === "remove-confirm") {
             const preview = this.deps.store.get<Preview>("preview", op.confirm_code.trim());
             const target = this.target(ctx, op.flight_id);
-            if (!preview || preview.expiresAt <= this.now() || preview.flightId !== op.flight_id.toLowerCase() ||
+            if (!preview || preview.consumed || preview.expiresAt <= this.now() || preview.flightId !== op.flight_id.toLowerCase() ||
                 preview.caller !== req.caller || preview.account !== ctx.account || preview.capability !== op.kind ||
                 preview.contextHash !== stored.contextHash || preview.localHash !== digest(substantiveRemoval(target))) throw new ProtocolError();
             // Code consumption and dispatch state commit together before HTTP, including on crashes.
-            this.deps.store.delete("preview", op.confirm_code.trim());
+            this.deps.store.put("preview", op.confirm_code.trim(), { ...preview, consumed: true });
           }
           verifyRequest(stored.request, this.deps.callers, this.now());
           finish("dispatched");
         });
-      } catch { return finish("failed", undefined, "Current context or confirmation rejected. Nothing dispatched."); }
+      } catch {
+        if (op.kind === "remove-confirm") {
+          this.deps.store.transaction(() => {
+            const preview = this.deps.store.get<Preview>("preview", op.confirm_code.trim());
+            if (preview && preview.caller === req.caller && preview.flightId === op.flight_id.toLowerCase()) {
+              this.deps.store.put("preview", op.confirm_code.trim(), { ...preview, consumed: true });
+            }
+          });
+        }
+        return finish("failed", undefined, "Current context or confirmation rejected. Nothing dispatched.");
+      }
       this.deps.boundary?.("dispatch");
       let result: unknown;
       try {
         if (op.kind === "add" || op.kind === "follow") {
-          if (op.kind === "add") await api.subscribeFlight(serverUuid!); else await api.followFlight(serverUuid!);
+          if (op.kind === "add") await this.step(() => api.subscribeFlight(serverUuid!)); else await this.step(() => api.followFlight(serverUuid!));
           result = { status: op.kind === "add" ? "added" : "followed", flight_code: assertFlightCode(op.flight_code), date: op.date,
             airline: airlineName!, server_flight_uuid: serverUuid!, message: "API accepted the request. Later app/replica reconciliation is not yet verified." };
         } else if (op.kind === "remove-confirm") {
-          await api.deleteFlight(op.flight_id);
+          await this.step(() => api.deleteFlight(op.flight_id));
           result = { status: "removed", flight_id: op.flight_id, message: "API accepted removal. Later app/replica reconciliation is not yet verified." };
         } else {
-          const response = await this.deps.requestSnapshot(ctx);
+          const response = await this.step(signal => this.deps.requestSnapshot(ctx, signal));
           if (!/^[A-Za-z0-9_-]{1,80}$/.test(response.snapshotId)) throw new ProtocolError();
           result = { status: "snapshot_requested", snapshot_id: response.snapshotId };
         }
@@ -217,10 +233,23 @@ export class MacExecutor {
       return receipt;
     });
   }
+  private async step<T>(fn: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new ProtocolError("Executor step timed out."));
+      }, 15_000);
+      timer.unref?.();
+    });
+    try { return await Promise.race([fn(controller.signal), deadline]); }
+    finally { clearTimeout(timer); }
+  }
   private async context(req: Request): Promise<CredentialContext> {
     this.deps.checkSource();
     assertWritesEnabled(this.deps.policy);
-    const ctx = await this.deps.captureContext();
+    const ctx = await this.step(signal => this.deps.captureContext(signal));
     if (!ctx || !ctx.account || !ctx.session || !ctx.authToken || !ctx.buildToken ||
         [ctx.account, ctx.session, ctx.authToken, ctx.buildToken].some(v => typeof v !== "string" || v.length > 16_384) ||
         !(ctx.syncUrl === null || (typeof ctx.syncUrl === "string" && ctx.syncUrl.length <= 4096))) {
@@ -259,7 +288,7 @@ export class MacExecutor {
   private invalidatePreviews(currentHash?: string): void {
     this.deps.store.transaction(() => {
       for (const { id, value } of this.deps.store.list<Preview>("preview")) {
-        if (!currentHash || value.contextHash !== currentHash) this.deps.store.delete("preview", id);
+        if (!value.consumed && (!currentHash || value.contextHash !== currentHash)) this.deps.store.put("preview", id, { ...value, consumed: true });
       }
     });
   }

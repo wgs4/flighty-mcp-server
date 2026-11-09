@@ -17,6 +17,7 @@ export class PrivateStore {
   private readonly instance = randomUUID();
   private tail: Promise<unknown> = Promise.resolve();
   private closed = false;
+  private readonly consumers = new Set<string>();
   private readonly maxRows: number;
   private readonly checkLocation: () => void;
 
@@ -56,6 +57,12 @@ export class PrivateStore {
       this.db.close();
       throw error;
     }
+  }
+  /** Prevent a second recovery owner from resetting state while this process is dispatching. */
+  claimConsumer(name: string): void {
+    this.ready();
+    if (this.consumers.has(name)) throw new ProtocolError("Store consumer is already active.");
+    this.consumers.add(name);
   }
   get<T>(kind: string, id: string): T | undefined {
     this.ready();
