@@ -10,6 +10,7 @@ import { registerFriendTools } from "./tools/friends.js";
 import { registerReferenceTools } from "./tools/reference.js";
 import { registerStatsTools } from "./tools/stats.js";
 import { registerConnectionTools } from "./tools/connections.js";
+import { registerTrackingTools } from "./tools/tracking.js";
 import { registerWriteTools } from "./tools/write.js";
 import { installToolSafety } from "./services/tool-safety.js";
 import {
@@ -48,6 +49,7 @@ registerFriendTools(server, db);
 registerReferenceTools(server, db);
 registerStatsTools(server, db);
 registerConnectionTools(server, db);
+registerTrackingTools(server, db);
 if (!readOnly) {
   registerWriteTools(server, db, api);
 }
@@ -84,6 +86,8 @@ server.registerTool(
           "flighty_get_delay_forecast — historical on-time performance",
           "flighty_get_flight_stats — aggregate stats (miles, airlines, routes)",
           "flighty_get_connections — layover and connection info",
+          "flighty_get_tracking_status — exact UUID, cached runway/gate phases, countdowns and passenger provenance",
+          "flighty_check_connection — check a proposed pair of eligible cached flight UUIDs without assuming traveler identity",
           "flighty_list_friend_flights — connected friends' flights",
           "flighty_search_airports — airport lookup by code, city, or name",
           "flighty_search_airlines — airline lookup by code, name, or alliance",

@@ -26,7 +26,7 @@ Same filtering as flighty_list_flights:
 - upcoming_only=true: future flights only, sorted soonest first — the first result is the friend's next flight
 - year=2025: flights from that year, sorted descending
 
-All timestamps are UTC. Returns the same flight schema as flighty_list_flights, plus a friend_name field.
+All timestamps are UTC. Returns the same flight schema as flighty_list_flights, plus friend_name, tracking_source, passenger_name_source and passenger_name_unknown_reason. A followed owner row never uses the owner's Profile name as its passenger. Missing friend Profile names remain unknown; multiple rows for one UUID are separate associations, not one traveler. Use flighty_get_tracking_status to inspect all associations for an exact UUID.
 
 IMPORTANT: Always present results as a formatted markdown table or bulleted list — never paste the raw JSON into your response.`,
       inputSchema: {
