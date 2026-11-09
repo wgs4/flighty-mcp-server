@@ -23,3 +23,15 @@ The retained upstream production lock has npm audit findings. Independent review
 
 ## Runtime and package validation limits
 Node 26 was tested. The declared minimum Node 24 was not separately tested. Source builds and extension staging are verified; optional binary MCPB packing requires a separately selected, version-matched packer and was not exercised. No real Flighty API or account behavior is tested by this fork's synthetic verification.
+
+## Resolved before integration: P2-CODEX-02 marker suppression
+External marker strings no longer suppress trust or owner notices. Wrapping uses private object identity, JSON metadata is server-assigned, and plain-text/error notices are unconditional. Actual MCP hostile-marker regressions passed both P2 fix reviews and integrated review. This LOW is resolved, not deferred.
+
+## Retained input-range difference
+P1/P2 review noted read dates/years accept 1970–2100 while write dates accept 1900–2200. Both validate real dates. This was recorded as a cross-packet consistency observation rather than a new security finding; integration intentionally retained the ranges. Any alignment needs a separate capability decision and review.
+
+## Resolved baseline LOWs: L1–L4
+L1 shell/eager plist handling is resolved by absolute `/usr/bin/plutil` argument arrays and lazy build-token access. L2 input/resource validation is addressed by calendar-date/UUID/year/string/selector checks, pagination and API deadlines/search-body caps; this does not promise a total output/process-memory cap. L3 clean locked-source packaging and L4 missing MIT notice are addressed by fresh compilation, locked script-disabled installs and LICENSE inclusion. Source maps remain the separate P3 LOW above; actual optional MCPB packing and minimum Node 24 remain unverified.
+
+## Audit snapshot bookkeeping
+P3 recorded 10 production package findings (1 critical, 6 high, 3 moderate) and one additional development-only LOW in the full install. The lock was retained by explicit PM decision. No fresh audit or dependency remediation is claimed here. Advisory references and stdio reachability qualifications are in [SECURITY_REVIEW.md](../SECURITY_REVIEW.md).

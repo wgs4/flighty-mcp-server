@@ -6,10 +6,9 @@ Use Node.js **24 or newer**, including its built-in `node:sqlite`, and npm. No g
 npm ci --ignore-scripts
 npm run build
 npm test
-npm start
 ```
 
-`npm start` runs the normal server. Use the verifier below for testing, so no real Flighty data or account is used. Never install or test the committed `dist/*.mcpb`.
+`npm start` runs the normal server and may read the real local Flighty installation. Use the verifier below for synthetic testing. Never install or test the committed `dist/*.mcpb`.
 
 The build compiles into a fresh temporary directory and replaces `build/` only after a successful compile. Old output stays recoverable under `.cache/flighty-build/`. It cannot leak stale files into a successful build. `npm run clean` uses `trash`; it preserves the output if that utility is unavailable. Git remains the source backup.
 
@@ -18,10 +17,10 @@ The build compiles into a fresh temporary directory and replaces `build/` only a
 For final acceptance, run the executable verifier against the installed build:
 
 ```sh
-node tests/verify-stdio.mjs --entry /absolute/install/build/index.js --fixture-directory /absolute/job/fixture
+node tests/verify-stdio.mjs --entry /path/to/flighty-live/build/index.js --fixture-directory /absolute/job/fixture
 ```
 
-It creates a uniquely named synthetic database below the requested fixture directory, starts that entry point over MCP stdio with `FLIGHTY_DB_PATH`, checks all reads, normalized policy values, bad-policy startup rejection, and mocked removal preview/confirm/replay. P1 must supply the policy and confirmation implementation for all checks to pass. `--checks reads` selects the baseline inventory/read checks. Fixture cleanup uses `trash`; generated files are retained if trash is unavailable.
+It creates a uniquely named synthetic database below the requested fixture directory, starts that entry point over MCP stdio with `FLIGHTY_DB_PATH`, checks all reads, normalized policy values, bad-policy startup rejection, and mocked removal preview/confirm/replay. The integrated implementation passes all five check groups, including passenger, followed and uncached UUID removal; expiry, identity/preview binding and failed-request consumption also have unit/integration coverage. `--checks reads` selects the baseline inventory/read checks. Fixture cleanup uses `trash`; generated files are retained if trash is unavailable.
 
 To retain a reusable fixture without running verification:
 
@@ -44,3 +43,7 @@ npm run bundle -- --packer /absolute/path/to/mcpb --packer-version X.Y.Z
 ```
 
 Stages and prior extension output remain under `.cache/flighty-bundle/`; the new bundle defaults to `artifacts/flighty-mcp-server.mcpb`. Each stage starts empty, uses `npm ci --omit=dev --ignore-scripts`, and includes `LICENSE`. Use `--output /absolute/path/new.mcpb` to choose another destination. Normal builds and source installs do not invoke this optional packaging step.
+
+The owner moved installation to a separate live checkout, represented publicly as `/path/to/flighty-live`. Preserve its built entry path and existing `flighty` registrations in Claude Code CLI user scope, Codex and agy. Update only to the exact final reviewed SHA after documentation acceptance; the frozen source candidate SHA is not an installed-release claim. The PM records the actual private path and installed SHA. Restart existing server processes and start new client sessions after updating. See [FORK-NOTES.md](../FORK-NOTES.md) for policy, unregister/restore commands and the future-update review process.
+
+The owner reports the app installed, signed in and database present. Synthetic verification neither accesses nor certifies that real installation or API/account behavior. Node 26 was tested; the declared minimum Node 24 and optional binary MCPB packing were not separately exercised.
