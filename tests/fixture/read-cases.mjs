@@ -21,8 +21,9 @@ export const READ_CASES = [
     assert.equal(body.results[0].layover_minutes, 120);
   }],
   ["flighty_list_friend_flights", {}, (body) => {
-    assert.equal(body.count, 1);
-    assert.equal(body.results[0].friend_name, "Synthetic Friend");
+    assert.equal(body.count, 2);
+    assert.equal(body.results.find(row => row.id === IDS.friendFlight).friend_name, "Synthetic Friend");
+    assert.equal(body.results.find(row => row.id === IDS.followed).friend_name, null);
   }],
   ["flighty_search_airports", { query: "AAA" }, (body) => assert.equal(body.results[0].iata, "AAA")],
   ["flighty_search_airlines", { query: "ZZ" }, (body) => assert.equal(body.results[0].name, "Synthetic Airline")],

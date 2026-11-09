@@ -74,14 +74,14 @@ describe("flighty_follow_flight", () => {
   it("follows a flight successfully", async () => {
     const mockDb = {
       lookupAirlines: () => [{
-        id: "airline-uuid",
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         name: "United Airlines",
         iata: "UA",
       }],
     };
     const followFlight = vi.fn(async () => {});
     const mockApi = {
-      searchFlight: async () => "flight-server-uuid",
+      searchFlight: async () => "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
       followFlight,
     };
 
@@ -92,17 +92,17 @@ describe("flighty_follow_flight", () => {
     assert.equal(result.isError, undefined);
     const body = JSON.parse(result.content[0].text);
     assert.equal(body.status, "followed");
-    assert.equal(body.server_flight_uuid, "flight-server-uuid");
+    assert.equal(body.server_flight_uuid, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
     assert.equal(body.airline, "United Airlines");
     assert.equal(body.flight_code, "UA194");
     assert.equal(followFlight.mock.calls.length, 1);
-    assert.equal(followFlight.mock.calls[0][0], "flight-server-uuid");
+    assert.equal(followFlight.mock.calls[0][0], "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
   });
 
   it("returns error when flight not found", async () => {
     const mockDb = {
       lookupAirlines: () => [{
-        id: "airline-uuid",
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         name: "United Airlines",
         iata: "UA",
       }],
@@ -137,13 +137,13 @@ describe("flighty_follow_flight", () => {
   it("returns error when API throws", async () => {
     const mockDb = {
       lookupAirlines: () => [{
-        id: "airline-uuid",
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         name: "United Airlines",
         iata: "UA",
       }],
     };
     const mockApi = {
-      searchFlight: async () => "flight-uuid",
+      searchFlight: async () => "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2",
       followFlight: async () => {
         throw new Error("Network error");
       },
@@ -154,18 +154,19 @@ describe("flighty_follow_flight", () => {
     const result = await handler({ flight_code: "UA194", date: "2026-06-15" });
 
     assert.equal(result.isError, true);
-    assert.ok(result.content[0].text.includes("Network error"));
+    assert.ok(result.content[0].text.includes("The request failed."));
+    assert.ok(!result.content[0].text.includes("Network error"));
   });
 
   it("tries each airline that shares an IATA code", async () => {
     const mockDb = {
       lookupAirlines: () => [
-        { id: "first-airline", name: "First Airline", iata: "ZZ" },
-        { id: "second-airline", name: "Second Airline", iata: "ZZ" },
+        { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", name: "First Airline", iata: "ZZ" },
+        { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", name: "Second Airline", iata: "ZZ" },
       ],
     };
     const searchFlight = vi.fn(async (airlineId: string) =>
-      airlineId === "second-airline" ? "flight-server-uuid" : null
+      airlineId === "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2" ? "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" : null
     );
     const followFlight = vi.fn(async () => {});
 
@@ -177,8 +178,8 @@ describe("flighty_follow_flight", () => {
 
     assert.equal(result.isError, undefined);
     assert.equal(searchFlight.mock.calls.length, 2);
-    assert.equal(searchFlight.mock.calls[0][0], "first-airline");
-    assert.equal(searchFlight.mock.calls[1][0], "second-airline");
+    assert.equal(searchFlight.mock.calls[0][0], "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1");
+    assert.equal(searchFlight.mock.calls[1][0], "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2");
     assert.equal(followFlight.mock.calls.length, 1);
     assert.equal(JSON.parse(result.content[0].text).airline, "Second Airline");
   });
@@ -188,14 +189,14 @@ describe("flighty_add_flight", () => {
   it("adds a flight successfully", async () => {
     const mockDb = {
       lookupAirlines: () => [{
-        id: "airline-uuid",
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         name: "Delta Air Lines",
         iata: "DL",
       }],
     };
     const subscribeFlight = vi.fn(async () => {});
     const mockApi = {
-      searchFlight: async () => "flight-uuid-123",
+      searchFlight: async () => "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1",
       subscribeFlight,
     };
 
@@ -206,19 +207,19 @@ describe("flighty_add_flight", () => {
     assert.equal(result.isError, undefined);
     const body = JSON.parse(result.content[0].text);
     assert.equal(body.status, "added");
-    assert.equal(body.server_flight_uuid, "flight-uuid-123");
+    assert.equal(body.server_flight_uuid, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1");
     assert.equal(body.airline, "Delta Air Lines");
     assert.equal(subscribeFlight.mock.calls.length, 1);
     assert.equal(
       subscribeFlight.mock.calls[0][0],
-      "flight-uuid-123"
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1"
     );
   });
 
   it("returns error when flight not found", async () => {
     const mockDb = {
       lookupAirlines: () => [{
-        id: "airline-uuid",
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         name: "Delta Air Lines",
         iata: "DL",
       }],
@@ -241,12 +242,12 @@ describe("flighty_add_flight", () => {
   it("tries each airline that shares an IATA code", async () => {
     const mockDb = {
       lookupAirlines: () => [
-        { id: "first-airline", name: "First Airline", iata: "ZZ" },
-        { id: "second-airline", name: "Second Airline", iata: "ZZ" },
+        { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1", name: "First Airline", iata: "ZZ" },
+        { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2", name: "Second Airline", iata: "ZZ" },
       ],
     };
     const searchFlight = vi.fn(async (airlineId: string) =>
-      airlineId === "second-airline" ? "flight-uuid-123" : null
+      airlineId === "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2" ? "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1" : null
     );
     const subscribeFlight = vi.fn(async () => {});
 
@@ -258,8 +259,8 @@ describe("flighty_add_flight", () => {
 
     assert.equal(result.isError, undefined);
     assert.equal(searchFlight.mock.calls.length, 2);
-    assert.equal(searchFlight.mock.calls[0][0], "first-airline");
-    assert.equal(searchFlight.mock.calls[1][0], "second-airline");
+    assert.equal(searchFlight.mock.calls[0][0], "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1");
+    assert.equal(searchFlight.mock.calls[1][0], "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2");
     assert.equal(subscribeFlight.mock.calls.length, 1);
     assert.equal(JSON.parse(result.content[0].text).airline, "Second Airline");
   });

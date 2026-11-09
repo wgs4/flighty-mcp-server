@@ -11,6 +11,8 @@ export const IDS = Object.freeze({
   manual: "44444444-4444-4444-8444-444444444444",
   friendFlight: "55555555-5555-4555-8555-555555555555",
   airline: "66666666-6666-4666-8666-666666666666",
+  uncached: "77777777-7777-4777-8777-777777777777",
+  followed: "88888888-8888-4888-8888-888888888888",
 });
 export const SYNTHETIC_TOKEN = `fixture.${Buffer.from(JSON.stringify({ sub: IDS.owner })).toString("base64url")}.not-a-real-signature`;
 export const SYNC_URL = "https://sync.flightyapp.com/synthetic-fixture";
@@ -72,10 +74,11 @@ export function createFixture(parentDirectory) {
       IDS.airline, "Synthetic Airline", "ZZ", "ZZZ", "Fixture Alliance", "https://example.invalid", "SYNTHETIC", "000", 100,
     );
     const now = Math.floor(Date.now() / 1000);
-    for (const [table, id, number, departure, arrival, depTime, owner] of [
+    for (const [table, id, number, departure, arrival, depTime, owner, passenger = 1] of [
       ["Flight", IDS.flight, "101", "airport-a", "airport-b", now - 3600, IDS.owner],
       ["ManualFlight", IDS.manual, "102", "airport-b", "airport-c", now + 10800, IDS.owner],
       ["Flight", IDS.friendFlight, "103", "airport-a", "airport-c", now + 7200, IDS.friend],
+      ["Flight", IDS.followed, "104", "airport-a", "airport-c", now + 14400, IDS.owner, 0],
     ]) {
       main.prepare(`INSERT INTO ${table} (id, number, airlineId, departureAirportId, scheduledArrivalAirportId,
         departureScheduleGateOriginal, arrivalScheduleGateOriginal, departureGate, arrivalGate, distance, isCancelled,
@@ -83,9 +86,10 @@ export function createFixture(parentDirectory) {
         delayForecastLate15Count, delayForecastLate30Count, delayForecastLate45Count, delayForecastCanceledCount,
         delayForecastDivertedCount) VALUES (?, ?, ?, ?, ?, ?, ?, 'A1', 'B2', 1000, 0, 100, 5, 10, 70, 10, 5, 3, 1, 1)`)
         .run(id, number, IDS.airline, departure, arrival, depTime, depTime + 7200);
-      main.prepare(`INSERT INTO ${table === "Flight" ? "UserFlight" : "UserManualFlight"} VALUES (?, ?, 'synthetic', NULL, 1)`).run(owner, id);
+      main.prepare(`INSERT INTO ${table === "Flight" ? "UserFlight" : "UserManualFlight"} VALUES (?, ?, 'synthetic', NULL, ?)`).run(owner, id, passenger);
     }
     main.prepare("INSERT INTO Ticket VALUES (?, ?, '1A', 'window', 'economy', 'SYNTHETIC-PNR', 'fixture')").run(IDS.flight, IDS.owner);
+    main.prepare("INSERT INTO Ticket VALUES (?, ?, '3B', 'aisle', 'business', 'SYNTHETIC-FOLLOW-PNR', 'fixture')").run(IDS.followed, IDS.owner);
     main.prepare("INSERT INTO Profile VALUES (?, 'Synthetic Friend', 'Synthetic')").run(IDS.friend);
     main.prepare("INSERT INTO Connection VALUES ('synthetic-connection', ?, ?, 'airport-b', 30, NULL)").run(IDS.flight, IDS.manual);
   } finally { main.close(); }

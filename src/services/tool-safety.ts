@@ -123,7 +123,7 @@ export interface McpToolResult {
   [key: string]: unknown;
 }
 
-function buildOwnerIdentityEnvelope(identity: OwnerIdentity) {
+export function buildOwnerIdentityEnvelope(identity: OwnerIdentity) {
   return {
     user_id: identity.userId,
     source: identity.source,

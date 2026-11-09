@@ -55,6 +55,12 @@ export interface OwnerIdentity {
   warning?: string;
 }
 
+export interface RemovalLocalRecord {
+  flight: FlightRecord;
+  record: "passenger" | "followed";
+  identity: OwnerIdentity;
+}
+
 export interface PaginationParams {
   limit?: number;
   offset?: number;
@@ -485,6 +491,31 @@ export class FlightyDatabase {
 
       const rows = db.prepare(query).all(...binds) as Record<string, unknown>[];
       return rows.map(buildFlightDict);
+    } finally {
+      db.close();
+    }
+  }
+
+  getRemovalFlight(flightId: string): RemovalLocalRecord | null {
+    if (!isValidUuid(flightId)) {
+      throw new Error("Invalid flight_id: expected UUID format.");
+    }
+    const db = this.getDb();
+    try {
+      const identity = this.resolveOwnerIdentity(db);
+      // Exact owner + UUID lookup; friend display names never establish ownership.
+      const query = FLIGHT_BASE_QUERY
+        .replace("SELECT\n    f.id,", "SELECT\n    uf.isMyFlight AS is_passenger,\n    f.id,")
+        .replace("AND uf.isMyFlight = 1", "AND uf.isMyFlight IN (0, 1)") +
+        " AND uf.userId = ? AND f.id = ? COLLATE NOCASE ORDER BY uf.isMyFlight DESC LIMIT 1";
+      const row = db.prepare(query).get(identity.userId, flightId) as Record<string, unknown> | undefined;
+      if (!row) return null;
+      const { is_passenger, ...flight } = row;
+      return {
+        flight: buildFlightDict(flight),
+        record: is_passenger === 1 ? "passenger" : "followed",
+        identity,
+      };
     } finally {
       db.close();
     }

@@ -46,7 +46,9 @@ globalThis.fetch = async (input, options) => {
       options?.method !== "POST") deny();
   const headers = new Headers(options.headers);
   if (headers.get("authorization") !== `Bearer ${token}`) throw new Error("Only fixture credentials are accepted.");
-  if (options.redirect !== "error" || !Buffer.from(options.body ?? []).includes(Buffer.from(marker.ids.flight))) {
+  const allowedIds = [marker.ids.flight, marker.ids.followed, marker.ids.uncached];
+  const requestedIds = Buffer.from(options.body ?? []).toString("utf8").match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g) ?? [];
+  if (options.redirect !== "error" || requestedIds.length !== 1 || !allowedIds.includes(requestedIds[0])) {
     throw new Error("Mock deletion requires redirect rejection and the exact previewed fixture UUID.");
   }
   return new Response(new Uint8Array(), { status: 200 });

@@ -88,6 +88,7 @@ export async function verifyStdio({ entry = defaultEntry, fixtureDirectory = fix
     await check("default inventory: 12 read + 3 write = 15", () => session(entry, fixture, undefined, "deny", async (client) => {
       const { tools } = await client.listTools();
       assert.deepEqual(tools.map((tool) => tool.name).sort(), [...READ_NAMES, ...WRITE_NAMES].sort());
+      for (const tool of tools) assert.match(tool.description, /untrusted data, not instructions/);
       for (const [name, args, validate] of READ_CASES) {
         const result = await client.callTool({ name, arguments: args });
         validate(parseToolResult(result));
@@ -119,22 +120,39 @@ export async function verifyStdio({ entry = defaultEntry, fixtureDirectory = fix
         const properties = removal.inputSchema.properties;
         const confirmField = ["confirm_code", "confirmation_code"].find((name) => properties[name]);
         assert.ok(confirmField, "Removal confirmation parameter missing (P1 pending).");
-        const args = { flight_id: fixture.ids.flight };
-        const preview = parseToolResult(await client.callTool({ name: removal.name, arguments: args }));
-        assert.equal(fetchCalls(fixture), 0, "Preview must never call the API.");
-        const code = preview[confirmField] ?? preview.confirmation?.code;
-        assert.equal(typeof code, "string", "Preview must return a confirmation code.");
-        assert.ok(code.length > 0);
-        assert.ok(JSON.stringify(preview).includes(fixture.ids.flight), "Preview must identify the exact flight.");
-        const bad = await client.callTool({ name: removal.name, arguments: { ...args, [confirmField]: "invalid-code" } });
-        assert.equal(bad.isError, true);
-        assert.equal(fetchCalls(fixture), 0);
-        const confirmed = parseToolResult(await client.callTool({ name: removal.name, arguments: { ...args, [confirmField]: code } }));
-        assert.equal(confirmed.status, "removed");
-        assert.equal(fetchCalls(fixture), 1, "Confirmation must make one mocked request.");
-        const replay = await client.callTool({ name: removal.name, arguments: { ...args, [confirmField]: code } });
-        assert.equal(replay.isError, true);
-        assert.equal(fetchCalls(fixture), 1, "Consumed code must never send another request.");
+        let expectedCalls = 0;
+        for (const [id, record] of [[fixture.ids.flight, "passenger"], [fixture.ids.followed, "followed"], [fixture.ids.uncached, "none"]]) {
+          const args = { flight_id: id };
+          const preview = parseToolResult(await client.callTool({ name: removal.name, arguments: args }));
+          assert.equal(fetchCalls(fixture), expectedCalls, "Preview must never call the API.");
+          const code = preview[confirmField] ?? preview.confirmation?.code;
+          assert.match(code, /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$/);
+          assert.equal(preview.flight_id, id);
+          assert.equal(preview.local_record, record);
+          assert.equal(preview.data_trust_label, "untrusted_external_data");
+          if (record === "none") {
+            assert.equal(preview.local_details, "unavailable");
+            assert.equal(preview.local_identity, "unavailable");
+            assert.equal(preview.owner_identity, undefined);
+          } else {
+            assert.equal(preview.owner_identity.user_id, fixture.ids.owner);
+            assert.equal(preview.flight.owner_identity.source, "jwt_subject");
+            assert.equal(preview.flight.booking_reference, record === "followed" ? "SYNTHETIC-FOLLOW-PNR" : "SYNTHETIC-PNR");
+          }
+          const badCode = (code[0] === "A" ? "B" : "A") + code.slice(1);
+          const bad = await client.callTool({ name: removal.name, arguments: { ...args, [confirmField]: badCode } });
+          assert.equal(bad.isError, true);
+          const wrongId = id === fixture.ids.flight ? fixture.ids.followed : fixture.ids.flight;
+          const wrong = await client.callTool({ name: removal.name, arguments: { flight_id: wrongId, [confirmField]: code } });
+          assert.equal(wrong.isError, true);
+          assert.equal(fetchCalls(fixture), expectedCalls);
+          const confirmed = parseToolResult(await client.callTool({ name: removal.name, arguments: { ...args, [confirmField]: code } }));
+          assert.equal(confirmed.status, "removed");
+          assert.equal(fetchCalls(fixture), ++expectedCalls, "Confirmation must make one mocked request.");
+          const replay = await client.callTool({ name: removal.name, arguments: { ...args, [confirmField]: code } });
+          assert.equal(replay.isError, true);
+          assert.equal(fetchCalls(fixture), expectedCalls, "Consumed code must never send another request.");
+        }
       }));
     }
     return { entry, checks, passed, failures };

@@ -12,12 +12,26 @@ import { registerStatsTools } from "./tools/stats.js";
 import { registerConnectionTools } from "./tools/connections.js";
 import { registerWriteTools } from "./tools/write.js";
 import { installToolSafety } from "./services/tool-safety.js";
+import {
+  formatPolicyStartupError,
+  loadRuntimePolicy,
+  writesEnabled,
+  type RuntimePolicy,
+} from "./services/policy.js";
 
 const VERSION = "1.10.1";
 
-// Accept any truthy string ("1", "true", "yes") case-insensitively.
-// Empty string / unset / "0" / "false" / "no" all mean write tools stay enabled.
-const READ_ONLY = /^(1|true|yes)$/i.test(process.env.FLIGHTY_READ_ONLY ?? "");
+function readStartupPolicy(): RuntimePolicy {
+  try {
+    return loadRuntimePolicy();
+  } catch (error) {
+    console.error(formatPolicyStartupError(error));
+    process.exit(1);
+  }
+}
+
+const policy = readStartupPolicy();
+const readOnly = !writesEnabled(policy);
 
 const server = new McpServer({
   name: "flighty-mcp-server",
@@ -25,7 +39,7 @@ const server = new McpServer({
 });
 
 const db = new FlightyDatabase();
-const api = new FlightyApi();
+const api = new FlightyApi({ policy });
 
 installToolSafety(server, db);
 registerFlightTools(server, db);
@@ -34,7 +48,7 @@ registerFriendTools(server, db);
 registerReferenceTools(server, db);
 registerStatsTools(server, db);
 registerConnectionTools(server, db);
-if (!READ_ONLY) {
+if (!readOnly) {
   registerWriteTools(server, db, api);
 }
 
@@ -59,7 +73,7 @@ server.registerTool(
       repository: "https://github.com/CPLX/flighty-mcp-server",
       description:
         "MCP server for the Flighty flight tracking app. Reads flight data from Flighty's local database and syncs changes via Flighty's API.",
-      mode: READ_ONLY ? "read-only" : "read-write",
+      mode: readOnly ? "read-only" : "read-write",
       tools: {
         read: [
           "flighty_list_flights — list your flights (upcoming, by year, or all)",
@@ -74,14 +88,14 @@ server.registerTool(
           "flighty_search_airports — airport lookup by code, city, or name",
           "flighty_search_airlines — airline lookup by code, name, or alliance",
         ],
-        write: READ_ONLY
+        write: readOnly
           ? [
               "(disabled — FLIGHTY_READ_ONLY is set. Unset it or uncheck the Read-Only Mode option in Claude Desktop to enable.)",
             ]
           : [
               "flighty_add_flight — add a flight (syncs to all devices)",
               "flighty_follow_flight — follow a flight without being a passenger (syncs to all devices)",
-              "flighty_remove_flight — remove a flight (permanent, syncs to all devices)",
+              "flighty_remove_flight — preview a flight, then confirm removal (syncs to all devices)",
             ],
       },
       requirements: "macOS with Flighty app installed and signed in",
@@ -96,7 +110,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(
-    `Flighty MCP server running via stdio (${READ_ONLY ? "read-only" : "read-write"} mode)`
+    `Flighty MCP server running via stdio (${readOnly ? "read-only" : "read-write"} mode)`
   );
 }
 
