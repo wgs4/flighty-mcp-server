@@ -863,11 +863,13 @@ export class ReplicaReceiver {
             "Cannot open database on a released replica lease."
           );
         }
+        this.assertReady();
         try { return new DatabaseSync(dbPath, { readOnly: true, allowExtension: false }); }
         catch (error) { throw publicReplicaError(error); }
       },
       computeFreshness: (opts) => {
         if (released) throw createReplicaError("INVALID_CONFIG", "Cannot use a released replica lease.");
+        this.assertReady();
         return buildReplicaFreshnessMetadata({
           manifest: selectedRec.manifest,
           generationId: genId,

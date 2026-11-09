@@ -76,3 +76,12 @@ it("whole acceptance budget rejects before publication rather than multiplying p
   expect(() => withSqliteBudget(1, 1, () => r.receiver.acceptBundle(bundle.bundleDir))).toThrow();
   expect(r.receiver.getStateSnapshot().highwaterSequence).toBe(0);
 });
+
+it("leased body and freshness fail closed if mount identity changes during an async invocation", async () => {
+  const { f, r } = setup(); const bundle = await f.bundle(); r.receiver.acceptBundle(bundle.bundleDir);
+  const lease = r.receiver.acquireLease(), inode = f.linux.storage.mountInode;
+  try {
+    f.linux.storage.mountInode = inode + 1;
+    expect(() => lease.openDatabase()).toThrow(); expect(() => lease.computeFreshness()).toThrow();
+  } finally { f.linux.storage.mountInode = inode; lease.release(); }
+});
